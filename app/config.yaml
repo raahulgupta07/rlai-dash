@@ -1,6 +1,6 @@
 chat:
   quick_prompts:
     dash:
-      - "Tell me about yourself"
-      - "Who won the most races in 2019?"
-      - "Who won the most F1 World Championships?"
+      - "What's our current MRR?"
+      - "Which plan has the highest churn rate?"
+      - "Show me the revenue trend by month"

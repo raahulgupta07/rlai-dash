@@ -1,10 +1,10 @@
 # Dash
 
-Dash is a **self-learning data agent** that grounds its answers in **6 layers of context** and improves with every run.
+A **self-learning data agent** that lives in slack. It grounds answers in 6 layers of context and improves with every query. Chat with Dash via Slack or the [AgentOS](https://os.agno.com) web UI.
 
-Inspired by [OpenAI's in-house data agent](https://openai.com/index/inside-our-in-house-data-agent/).
+> Inspired by [OpenAI's in-house data agent](https://openai.com/index/inside-our-in-house-data-agent/).
 
-## Get Started
+## Quick Start
 
 ```sh
 # Clone the repo
@@ -17,24 +17,67 @@ cp example.env .env
 # Start the application
 docker compose up -d --build
 
-# Load sample data and knowledge
-docker exec -it dash-api python -m dash.scripts.load_data
-docker exec -it dash-api python -m dash.scripts.load_knowledge
+# Generate sample data and load knowledge
+docker exec -it dash-api python scripts/generate_data.py
+docker exec -it dash-api python scripts/load_knowledge.py
 ```
 
-Confirm dash is running at [http://localhost:8000/docs](http://localhost:8000/docs).
+Confirm Dash is running at [http://localhost:8000/docs](http://localhost:8000/docs).
 
-## Connect to the Web UI
+### Connect to the Web UI
 
 1. Open [os.agno.com](https://os.agno.com) and login
 2. Add OS → Local → `http://localhost:8000`
 3. Click "Connect"
 
-**Try it** (sample F1 dataset):
+**Try it** (SaaS metrics dataset):
 
-- Who won the most F1 World Championships?
-- How many races has Lewis Hamilton won?
-- Compare Ferrari vs Mercedes points 2015-2020
+- What's our current MRR?
+- Which plan has the highest churn rate?
+- Show me revenue trends by plan over the last 6 months
+- Which customers are at risk of churning?
+
+## Slack
+
+Slack gives Dash two capabilities: receiving messages from users in Slack threads, and proactively posting to channels.
+
+See [docs/SLACK_CONNECT.md](docs/SLACK_CONNECT.md) for the full setup guide with the app manifest.
+
+### 1. Get a public URL
+
+For local development, use [ngrok](https://ngrok.com/download/mac-os):
+
+```sh
+ngrok http 8000
+```
+
+Copy the `https://` URL (e.g. `https://abc123.ngrok-free.app`).
+
+### 2. Create app from manifest
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App → From a manifest**
+2. Select your workspace, switch to **JSON**
+3. Paste the manifest from [docs/SLACK_CONNECT.md](docs/SLACK_CONNECT.md) — replace `YOUR_URL_HERE` with your URL
+4. Click **Create**
+
+### 3. Install and get credentials
+
+1. **Install to Workspace** and authorize
+2. Copy **Bot User OAuth Token** (`xoxb-...`) → `SLACK_TOKEN`
+3. Go to **Basic Information → App Credentials**, copy **Signing Secret** → `SLACK_SIGNING_SECRET`
+
+### 4. Add to `.env` and restart
+
+```env
+SLACK_TOKEN="xoxb-your-bot-token"
+SLACK_SIGNING_SECRET="your-signing-secret"
+```
+
+```sh
+docker compose up -d --build
+```
+
+Thread timestamps map to session IDs, so each Slack thread gets its own conversation context.
 
 ## Why Text-to-SQL Breaks in Practice
 
@@ -106,50 +149,79 @@ Optionally save as Knowledge
 Dash reasons about what makes an answer useful, not just technically correct.
 
 **Question:**
-Who won the most races in 2019?
+What's our churn rate by plan?
 
-| Typical SQL Agent | Dash |
+| Basic SQL Agent | Dash |
 |------------------|------|
-| `Hamilton: 11` | Lewis Hamilton dominated 2019 with **11 wins out of 21 races**, more than double Bottas’s 4 wins. This performance secured his sixth world championship. |
+| `Starter: 12%, Pro: 7%, Enterprise: 4%` | Starter has 12% monthly churn — 3x higher than Enterprise (4%). Usage drops 60% in the week before cancellation, suggesting a usage-based early warning system could help. |
+
+## Data Model (SaaS Metrics)
+
+Synthetic B2B SaaS dataset (~500 customers, 2 years of data):
+
+| Table | Description |
+|-------|-------------|
+| `customers` | Company info, industry, size, acquisition source, status |
+| `subscriptions` | Plan, MRR, seats, billing cycle, lifecycle status |
+| `plan_changes` | Upgrades, downgrades, cancellations with MRR impact |
+| `invoices` | Billing records, payment status, billing periods |
+| `usage_metrics` | Daily API calls, active users, storage, reports |
+| `support_tickets` | Priority, category, resolution time, satisfaction |
 
 ## Deploy to Railway
 
-```sh
-railway login
+Railway deployment uses `.env.production` to keep production credentials separate from local dev.
 
+### First-time setup
+
+```sh
+# Create .env.production with your production values
+cp example.env .env.production
+# Edit .env.production — set OPENAI_API_KEY, SLACK_TOKEN, etc.
+
+# Login and deploy
+railway login
 ./scripts/railway_up.sh
 ```
 
-### Production Operations
+### Sync environment variables
 
-**Load data and knowledge:**
+After updating `.env.production`, sync to Railway:
+
 ```sh
-railway run python -m dash.scripts.load_data
-railway run python -m dash.scripts.load_knowledge
+./scripts/railway_env.sh
 ```
 
-**View logs:**
+This reads `.env.production` and sets each variable on the Railway service. Safe to run repeatedly — overwrites existing values. Handles multiline values (PEM keys) correctly.
+
+### Redeploy after code changes
 
 ```sh
+./scripts/railway_redeploy.sh
+```
+
+### Production operations
+
+```sh
+# Load data and knowledge
+railway run python scripts/generate_data.py
+railway run python scripts/load_knowledge.py
+
+# View logs
 railway logs --service dash
-```
 
-**Run commands in production:**
+# CLI mode
+railway run python -m dash
 
-```sh
-railway run python -m dash  # CLI mode
-```
-
-**Redeploy after changes:**
-
-```sh
-railway up --service dash -d
-```
-
-**Open dashboard:**
-```sh
+# Open dashboard
 railway open
 ```
+
+### Secure your deployment
+
+1. Set `RUNTIME_ENV=prd` in `.env.production`
+2. Set `JWT_VERIFICATION_KEY` from [os.agno.com](https://os.agno.com) → Settings
+3. Connect at os.agno.com → Add OS → your deployed URL
 
 ## Adding Knowledge
 
@@ -164,34 +236,34 @@ knowledge/
 
 ### Table Metadata
 
-```
+```json
 {
-  "table_name": "orders",
-  "table_description": "Customer orders with denormalized line items",
-  "use_cases": ["Revenue reporting", "Customer analytics"],
+  "table_name": "customers",
+  "table_description": "B2B SaaS customer accounts with company info and lifecycle status",
+  "use_cases": ["Churn analysis", "Cohort segmentation", "Acquisition reporting"],
   "data_quality_notes": [
     "created_at is UTC",
-    "status values: pending, completed, refunded",
-    "amount stored in cents"
+    "status values: active, churned, suspended",
+    "company_size is self-reported"
   ]
 }
 ```
 
 ### Query Patterns
 
-```
--- <query name>monthly_revenue</query name>
+```sql
+-- <query name>monthly_mrr</query name>
 -- <query description>
--- Monthly revenue calculation.
--- Converts cents to dollars.
--- Excludes refunded orders.
+-- Monthly MRR calculation.
+-- Sums active subscription MRR.
+-- Excludes cancelled subscriptions.
 -- </query description>
 -- <query>
 SELECT
-    DATE_TRUNC('month', created_at) AS month,
-    SUM(amount) / 100.0 AS revenue_dollars
-FROM orders
-WHERE status = 'completed'
+    DATE_TRUNC('month', started_at) AS month,
+    SUM(mrr) AS total_mrr
+FROM subscriptions
+WHERE ended_at IS NULL
 GROUP BY 1
 ORDER BY 1 DESC
 -- </query>
@@ -199,7 +271,7 @@ ORDER BY 1 DESC
 
 ### Business Rules
 
-```
+```json
 {
   "metrics": [
     {
@@ -209,8 +281,8 @@ ORDER BY 1 DESC
   ],
   "common_gotchas": [
     {
-      "issue": "Revenue double counting",
-      "solution": "Filter to completed orders only"
+      "issue": "Active subscription detection",
+      "solution": "Filter on ended_at IS NULL, not status column"
     }
   ]
 }
@@ -219,8 +291,8 @@ ORDER BY 1 DESC
 ### Load Knowledge
 
 ```sh
-python -m dash.scripts.load_knowledge            # Upsert changes
-python -m dash.scripts.load_knowledge --recreate # Fresh start
+python scripts/load_knowledge.py            # Upsert changes
+python scripts/load_knowledge.py --recreate  # Fresh start
 ```
 
 ## Local Development
@@ -228,21 +300,69 @@ python -m dash.scripts.load_knowledge --recreate # Fresh start
 ```sh
 ./scripts/venv_setup.sh && source .venv/bin/activate
 docker compose up -d dash-db
-python -m dash.scripts.load_data
+python scripts/generate_data.py
+python scripts/load_knowledge.py
 python -m dash  # CLI mode
+```
+
+## Architecture
+
+```
+AgentOS (app/main.py)  [scheduler=True, tracing=True]
+ ├── FastAPI / Uvicorn
+ ├── Slack Interface (optional — requires SLACK_TOKEN + SLACK_SIGNING_SECRET)
+ └── Dash Team (dash/team.py, coordinate mode)
+     ├─ Analyst (dash/agents/analyst.py)
+     │  ├─ SQLTools         → PostgreSQL
+     │  ├─ introspect_schema
+     │  ├─ save_validated_query
+     │  └─ ReasoningTools
+     ├─ Engineer (dash/agents/engineer.py)
+     │  ├─ SQLTools         → PostgreSQL
+     │  ├─ introspect_schema
+     │  └─ ReasoningTools
+     │
+     Leader tools: SlackTools (optional — requires SLACK_TOKEN)
+     Knowledge:    dash_knowledge (table schemas, queries, business rules)
+     Learnings:    dash_learnings (error patterns, type gotchas, fixes)
 ```
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | OpenAI API key |
-| `EXA_API_KEY` | No | Web search for external knowledge |
-| `DB_*` | No | Database config (defaults to localhost) |
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `OPENAI_API_KEY` | Yes | — | OpenAI API key |
+| `SLACK_TOKEN` | No | `""` | Slack bot token (interface + tools) |
+| `SLACK_SIGNING_SECRET` | No | `""` | Slack signing secret (interface only) |
+| `DB_HOST` | No | `localhost` | PostgreSQL host |
+| `DB_PORT` | No | `5432` | PostgreSQL port |
+| `DB_USER` | No | `ai` | PostgreSQL user |
+| `DB_PASS` | No | `ai` | PostgreSQL password |
+| `DB_DATABASE` | No | `ai` | PostgreSQL database |
+| `PORT` | No | `8000` | API port |
+| `RUNTIME_ENV` | No | `prd` | `dev` enables hot reload |
+| `AGENTOS_URL` | No | `http://127.0.0.1:8000` | Scheduler callback URL (production) |
+| `JWT_VERIFICATION_KEY` | Production | — | RBAC public key from os.agno.com |
+
+## Evaluations
+
+Four eval categories using Agno's eval framework:
+
+| Category | Eval Type | What It Tests |
+|----------|-----------|---------------|
+| accuracy | AccuracyEval (1-10) | Correct data and meaningful insights |
+| routing | ReliabilityEval | Team routes to correct agent/tools |
+| security | AgentAsJudgeEval (binary) | No credential or secret leaks |
+| governance | AgentAsJudgeEval (binary) | Refuses destructive SQL operations |
+
+```sh
+python -m evals                      # Run all evals
+python -m evals --category accuracy  # Run specific category
+python -m evals --verbose            # Show response details
+```
 
 ## Learn More
 
 - [OpenAI's In-House Data Agent](https://openai.com/index/inside-our-in-house-data-agent/) — the inspiration
 - [Self-Improving SQL Agent](https://www.ashpreetbedi.com/articles/sql-agent) — deep dive on an earlier architecture
 - [Agno Docs](https://docs.agno.com)
-- [Discord](https://agno.com/discord)

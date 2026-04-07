@@ -2,26 +2,22 @@
 Load Knowledge - Loads table metadata, queries, and business rules into knowledge base.
 
 Usage:
-    python -m dash.scripts.load_knowledge             # Upsert (update existing)
-    python -m dash.scripts.load_knowledge --recreate  # Drop and reload all
+    python scripts/load_knowledge.py             # Upsert (update existing)
+    python scripts/load_knowledge.py --recreate  # Drop and reload all
 """
-
-import argparse
 
 from dash.paths import KNOWLEDGE_DIR
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Load knowledge into vector database")
-    parser.add_argument(
-        "--recreate",
-        action="store_true",
-        help="Drop existing knowledge and reload from scratch",
-    )
-    args = parser.parse_args()
 
-    from dash.agent import dash_knowledge
+def load_knowledge(recreate: bool = False) -> None:
+    """Load knowledge files into the vector database.
 
-    if args.recreate:
+    Args:
+        recreate: Drop existing knowledge and reload from scratch.
+    """
+    from dash.settings import dash_knowledge
+
+    if recreate:
         print("Recreating knowledge base (dropping existing data)...\n")
         if dash_knowledge.vector_db:
             dash_knowledge.vector_db.drop()
@@ -42,3 +38,16 @@ if __name__ == "__main__":
             dash_knowledge.insert(name=f"knowledge-{subdir}", path=str(path))
 
     print("\nDone!")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Load knowledge into vector database")
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Drop existing knowledge and reload from scratch",
+    )
+    args = parser.parse_args()
+    load_knowledge(recreate=args.recreate)

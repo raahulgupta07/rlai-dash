@@ -1,0 +1,89 @@
+"""
+Dash Team
+=========
+
+A self-learning data agent that provides insights, not just query results.
+The leader routes requests to specialized agents:
+Analyst for SQL/data queries, Engineer for schema/pipeline operations.
+
+Test:
+    python -m dash
+"""
+
+from agno.learn import LearnedKnowledgeConfig, LearningMachine, LearningMode
+from agno.team import Team, TeamMode
+
+from dash.agents.analyst import analyst
+from dash.agents.engineer import engineer
+from dash.instructions import build_leader_instructions
+from dash.settings import MODEL, SLACK_TOKEN, agent_db, dash_knowledge, dash_learnings
+
+# ---------------------------------------------------------------------------
+# Team Leader Tools (Slack — leader-only)
+# ---------------------------------------------------------------------------
+leader_tools: list = []
+if SLACK_TOKEN:
+    from agno.tools.slack import SlackTools
+
+    leader_tools.append(
+        SlackTools(
+            enable_send_message=True,
+            enable_list_channels=True,
+            enable_send_message_thread=True,
+            enable_get_channel_info=True,
+            enable_get_thread=True,
+            enable_get_user_info=True,
+            enable_search_messages=True,
+        )
+    )
+
+# ---------------------------------------------------------------------------
+# Create Team
+# ---------------------------------------------------------------------------
+dash = Team(
+    id="dash",
+    name="Dash",
+    mode=TeamMode.coordinate,
+    model=MODEL,
+    members=[analyst, engineer],
+    db=agent_db,
+    instructions=build_leader_instructions(),
+    tools=leader_tools,
+    knowledge=dash_knowledge,
+    search_knowledge=True,
+    # Learning (shared knowledge base with members)
+    learning=LearningMachine(
+        knowledge=dash_learnings,
+        learned_knowledge=LearnedKnowledgeConfig(mode=LearningMode.AGENTIC),
+    ),
+    add_learnings_to_context=True,
+    # Member coordination
+    share_member_interactions=True,
+    # Memory
+    enable_agentic_memory=True,
+    # Session
+    search_past_sessions=True,
+    num_past_sessions_to_search=5,
+    read_chat_history=True,
+    add_history_to_context=True,
+    num_history_runs=5,
+    # Context
+    add_datetime_to_context=True,
+    markdown=True,
+)
+
+# ---------------------------------------------------------------------------
+# Run Team
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    test_cases = [
+        "Hey, what can you do?",
+        "What's our current MRR?",
+        "Which plan has the highest churn rate?",
+        "Show me the schema for the customers table",
+        "Create a view for monthly MRR by plan",
+    ]
+    for idx, prompt in enumerate(test_cases, start=1):
+        print(f"\n--- Dash test case {idx}/{len(test_cases)} ---")
+        print(f"Prompt: {prompt}")
+        dash.print_response(prompt, stream=True)

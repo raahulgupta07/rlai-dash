@@ -1,5 +1,6 @@
-"""Dash - A self-learning data agent with 6 layers of context."""
+"""Dash - A self-learning data agent that provides insights, not just query results."""
 
-from dash.agent import dash, dash_knowledge, dash_learnings
+from dash.settings import dash_knowledge, dash_learnings
+from dash.team import dash
 
 __all__ = ["dash", "dash_knowledge", "dash_learnings"]

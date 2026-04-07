@@ -28,6 +28,7 @@ def load_table_metadata(tables_dir: Path | None = None) -> list[dict[str, Any]]:
                 {
                     "table_name": table["table_name"],
                     "description": table.get("table_description", ""),
+                    "columns": table.get("table_columns", []),
                     "use_cases": table.get("use_cases", []),
                     "data_quality_notes": table.get("data_quality_notes", [])[:MAX_QUALITY_NOTES],
                 }
@@ -51,6 +52,12 @@ def format_semantic_model(model: dict[str, Any]) -> str:
         lines.append(f"### {table['table_name']}")
         if table.get("description"):
             lines.append(table["description"])
+        if table.get("columns"):
+            lines.append("**Columns:**")
+            for col in table["columns"]:
+                col_type = col.get("type", "")
+                col_desc = col.get("description", "")
+                lines.append(f"  - `{col['name']}` ({col_type}) — {col_desc}")
         if table.get("use_cases"):
             lines.append(f"**Use cases:** {', '.join(table['use_cases'])}")
         if table.get("data_quality_notes"):
