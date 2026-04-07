@@ -8,7 +8,7 @@ Each Slack thread maps to a session ID, so every thread gets its own conversatio
 
 ## Prerequisites
 
-- Dash running (locally via `docker compose up -d --build` or deployed to Railway)
+- Dash running locally (`docker compose up -d --build`) or deployed to a public URL
 - A Slack workspace where you can install apps
 
 ## Step 1: Get a Public URL
