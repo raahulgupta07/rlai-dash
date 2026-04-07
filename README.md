@@ -1,8 +1,8 @@
 # Dash
 
-A **self-learning data agent** that lives in Slack. It grounds answers in 6 layers of context and improves with every query. Chat with Dash via Slack, the terminal, or the [AgentOS](https://os.agno.com?utm_source=github&utm_medium=example-repo&utm_campaign=agent-example&utm_content=dash&utm_term=agentos) web UI.
+A **self-learning data agent** built with systems engineering principles. It grounds answers in 6 layers of context and improves with every query.
 
-> Inspired by [OpenAI's in-house data agent](https://openai.com/index/inside-our-in-house-data-agent/).
+Chat with Dash via Slack, the terminal, or the [AgentOS](https://os.agno.com?utm_source=github&utm_medium=example-repo&utm_campaign=agent-example&utm_content=dash&utm_term=agentos) web UI.
 
 ## Quick Start
 
@@ -10,11 +10,10 @@ A **self-learning data agent** that lives in Slack. It grounds answers in 6 laye
 # Clone the repo
 git clone https://github.com/agno-agi/dash.git && cd dash
 
-# Add OPENAI_API_KEY
 cp example.env .env
-# Edit .env and add your key
+# Edit .env and add your OPENAI_API_KEY
 
-# Start the application
+# Start the system
 docker compose up -d --build
 
 # Generate sample data and load knowledge
@@ -36,6 +35,119 @@ Confirm Dash is running at [http://localhost:8000/docs](http://localhost:8000/do
 - Which plan has the highest churn rate?
 - Show me revenue trends by plan over the last 6 months
 - Which customers are at risk of churning?
+
+## Why Dash Exists
+
+Ask a question in English, get a correct, meaningful answer. That's the goal. But raw LLMs writing SQL hit a wall fast: schemas lack meaning, types are misleading, tribal knowledge is missing, there's no way to learn from mistakes, and results lack interpretation.
+
+The root cause is missing context and missing memory. Dash solves this with **six layers of grounded context**, a **self-learning loop** that improves with every query, and a focus on delivering insights you can act on.
+
+## Architecture: Five Layers, One System
+
+Agentic software is just software with the business logic replaced by agents. Everything else is systems engineering. Dash is built across five layers that reinforce each other.
+
+```
+Agent Engineering     →  dash/team.py + dash/agents/
+Data Engineering      →  knowledge/ + Agno Learning Machine + PostgreSQL
+Security Engineering  →  AgentOS auth + RBAC + read-only SQL enforcement
+Interface Engineering →  app/main.py (FastAPI) + Slack + AgentOS
+Infrastructure        →  Dockerfile + compose.yaml + scripts/
+```
+
+### 1. Agent Engineering
+
+The agent team and execution flow. Model, instructions, tools, knowledge, and the self-learning loop.
+
+```
+AgentOS (app/main.py)  [scheduler=True, tracing=True]
+ ├── FastAPI / Uvicorn
+ ├── Slack Interface (optional)
+ └── Dash Team (dash/team.py, coordinate mode)
+     ├─ Analyst (dash/agents/analyst.py)         reads public + dash
+     │  ├─ SQLTools (read-only)  → public schema (company data)
+     │  ├─ introspect_schema     → both schemas
+     │  ├─ save_validated_query  → knowledge base
+     │  └─ ReasoningTools
+     ├─ Engineer (dash/agents/engineer.py)       reads public, writes dash
+     │  ├─ SQLTools (full)       → dash schema (agent-managed)
+     │  ├─ introspect_schema     → both schemas
+     │  ├─ update_knowledge      → knowledge base (schema changes)
+     │  └─ ReasoningTools
+     │
+     Leader tools: SlackTools (optional)
+     Knowledge:    dash_knowledge (table schemas, queries, business rules, dash views)
+     Learnings:    dash_learnings (error patterns, type gotchas, fixes)
+```
+
+### 2. Data Engineering
+
+Context is data. Memory is data. Knowledge is data. All managed with data engineering principles: well-designed schemas, structured querying, databases for fast read/writes.
+
+**Six layers of grounded context:**
+
+| Layer | Purpose | Source |
+|------|--------|--------|
+| **Table Usage** | Schema, columns, relationships | `knowledge/tables/*.json` |
+| **Human Annotations** | Metrics, definitions, business rules | `knowledge/business/*.json` |
+| **Query Patterns** | SQL that is known to work | `knowledge/queries/*.sql` |
+| **Institutional Knowledge** | Docs, wikis, external references | MCP (optional) |
+| **Learnings** | Error patterns and discovered fixes | Agno `Learning Machine` |
+| **Runtime Context** | Live schema changes | `introspect_schema` tool |
+
+**The self-learning loop:**
+
+```
+User Question
+     ↓
+Retrieve Knowledge + Learnings
+     ↓
+Reason about intent
+     ↓
+Generate grounded SQL
+     ↓
+Execute and interpret
+     ↓
+ ┌────┴────┐
+ ↓         ↓
+Success    Error
+ ↓         ↓
+ ↓         Diagnose → Fix → Save Learning
+ ↓                           (never repeated)
+ ↓
+Return insight
+ ↓
+Optionally save as Knowledge
+```
+
+Two complementary systems:
+
+| System | Stores | How It Evolves |
+|------|--------|----------------|
+| **Knowledge** | Validated queries and business context | Curated by you + Dash |
+| **Learnings** | Error patterns and fixes | Managed by `Learning Machine` automatically |
+
+**Dual schema enforcement:** A structural boundary between company data and agent-managed data.
+
+| Schema | Owner | Access |
+|--------|-------|--------|
+| `public` | Company (loaded externally) | Read-only — never modified by agents |
+| `dash` | Engineer agent | Views, summary tables, computed data |
+
+The Engineer builds reusable data assets (`dash.monthly_mrr`, `dash.customer_health_score`, `dash.churn_risk`) and records them to knowledge. The Analyst discovers and prefers these views over raw table queries.
+
+### 3. Security Engineering
+
+Auth uses RBAC with JWT verification in production. Every query is scoped to `user_id`. Read-only access is a tool configuration, not a prompt instruction. The Analyst agent's SQL tools are scoped to read-only at the system level.
+
+See [Security](#security) for setup details.
+
+### 4. Interface Engineering
+
+One agent definition, multiple surfaces. Dash is reachable via REST API (FastAPI), Slack threads, and the AgentOS web UI. Each surface has its own identity system: a Slack user ID maps to sessions via thread timestamps, the API uses JWT-backed auth.
+
+### 5. Infrastructure Engineering
+
+Dockerfile, Docker Compose, one-command deployment. Scheduled tasks for proactive behavior. The infrastructure layer is boring on purpose. 95% of running an agent is identical to running any other service.
 
 ## Slack
 
@@ -79,82 +191,6 @@ docker compose up -d --build
 
 Thread timestamps map to session IDs, so each Slack thread gets its own conversation context.
 
-## Why Text-to-SQL Breaks in Practice
-
-Our goal is simple: ask a question in english, get a correct, meaningful answer. But raw LLMs writing SQL hit a wall fast:
-
-- **Schemas lack meaning.**
-- **Types are misleading.**
-- **Tribal knowledge is missing.**
-- **No way to learn from mistakes.**
-- **Results generally lack interpretation.**
-
-The root cause is missing context and missing memory.
-
-Dash solves this with **6 layers of grounded context**, a **self-learning loop** that improves with every query, and a focus on **understanding your question** to deliver insights you can act on.
-
-## The Six Layers of Context
-
-| Layer | Purpose | Source |
-|------|--------|--------|
-| **Table Usage** | Schema, columns, relationships | `knowledge/tables/*.json` |
-| **Human Annotations** | Metrics, definitions, and business rules | `knowledge/business/*.json` |
-| **Query Patterns** | SQL that is known to work | `knowledge/queries/*.sql` |
-| **Institutional Knowledge** | Docs, wikis, external references | MCP (optional) |
-| **Learnings** | Error patterns and discovered fixes | Agno `Learning Machine` |
-| **Runtime Context** | Live schema changes | `introspect_schema` tool |
-
-The agent retrieves relevant context at query time via hybrid search, then generates SQL grounded in patterns that already work.
-
-## The Self-Learning Loop
-
-Dash improves without retraining or fine-tuning.
-
-It learns through two complementary systems:
-
-| System | Stores | How It Evolves |
-|------|--------|----------------|
-| **Knowledge** | Validated queries and business context | Curated by you + dash |
-| **Learnings** | Error patterns and fixes | Managed by `Learning Machine` automatically |
-
-```
-User Question
-     ↓
-Retrieve Knowledge + Learnings
-     ↓
-Reason about intent
-     ↓
-Generate grounded SQL
-     ↓
-Execute and interpret
-     ↓
- ┌────┴────┐
- ↓         ↓
-Success    Error
- ↓         ↓
- ↓         Diagnose → Fix → Save Learning
- ↓                           (never repeated)
- ↓
-Return insight
- ↓
-Optionally save as Knowledge
-```
-
-**Knowledge** is curated—validated queries and business context you want the agent to build on.
-
-**Learnings** is discovered—patterns the agent finds through trial and error. When a query fails because `position` is TEXT not INTEGER, the agent saves that gotcha. Next time, it knows.
-
-## Insights, Not Just Rows
-
-Dash reasons about what makes an answer useful, not just technically correct.
-
-**Question:**
-What's our churn rate by plan?
-
-| Basic SQL Agent | Dash |
-|------------------|------|
-| `Starter: 12%, Pro: 7%, Enterprise: 4%` | Starter has 12% monthly churn — 3x higher than Enterprise (4%). Usage drops 60% in the week before cancellation, suggesting a usage-based early warning system could help. |
-
 ## Data Model (SaaS Metrics)
 
 Synthetic B2B SaaS dataset (~500 customers, 2 years of data):
@@ -167,59 +203,6 @@ Synthetic B2B SaaS dataset (~500 customers, 2 years of data):
 | `invoices` | Billing records, payment status, billing periods |
 | `usage_metrics` | Daily API calls, active users, storage, reports |
 | `support_tickets` | Priority, category, resolution time, satisfaction |
-
-## Deploy to Railway
-
-Railway deployment uses `.env.production` to keep production credentials separate from local dev.
-
-### First-time setup
-
-```sh
-# Create .env.production with your production values
-cp example.env .env.production
-# Edit .env.production — set OPENAI_API_KEY, SLACK_TOKEN, etc.
-
-# Login and deploy
-railway login
-./scripts/railway_up.sh
-```
-
-### Sync environment variables
-
-After updating `.env.production`, sync to Railway:
-
-```sh
-./scripts/railway_env.sh
-```
-
-This reads `.env.production` and sets each variable on the Railway service. Safe to run repeatedly — overwrites existing values. Handles multiline values (PEM keys) correctly.
-
-### Redeploy after code changes
-
-```sh
-./scripts/railway_redeploy.sh
-```
-
-### Production operations
-
-```sh
-# Load data and knowledge
-railway run python scripts/generate_data.py
-railway run python scripts/load_knowledge.py
-
-# View logs
-railway logs --service dash
-
-# CLI mode
-railway run python -m dash
-
-# Open dashboard
-railway open
-```
-
-### Secure your deployment
-
-See [Security](#security) below for setup — you'll need to connect your OS at [os.agno.com](https://os.agno.com?utm_source=github&utm_medium=example-repo&utm_campaign=agent-example&utm_content=dash&utm_term=agentos) and add a `JWT_VERIFICATION_KEY` to your environment.
 
 ## Adding Knowledge
 
@@ -240,7 +223,7 @@ knowledge/
   "table_description": "B2B SaaS customer accounts with company info and lifecycle status",
   "use_cases": ["Churn analysis", "Cohort segmentation", "Acquisition reporting"],
   "data_quality_notes": [
-    "signup_date is UTC",
+    "signup_date is DATE (not TIMESTAMP) — no time component",
     "status values: active, churned, trial",
     "company_size is self-reported"
   ]
@@ -289,6 +272,68 @@ python scripts/load_knowledge.py            # Upsert changes
 python scripts/load_knowledge.py --recreate  # Fresh start
 ```
 
+## Evaluations
+
+Five eval categories using Agno's eval framework:
+
+| Category | Eval Type | What It Tests |
+|----------|-----------|---------------|
+| accuracy | AccuracyEval (1-10) | Correct data and meaningful insights |
+| routing | ReliabilityEval | Team routes to correct agent/tools |
+| security | AgentAsJudgeEval (binary) | No credential or secret leaks |
+| governance | AgentAsJudgeEval (binary) | Refuses destructive SQL operations |
+| boundaries | AgentAsJudgeEval (binary) | Schema access boundaries respected |
+
+```sh
+python -m evals                      # Run all evals
+python -m evals --category accuracy  # Run specific category
+python -m evals --verbose            # Show response details
+```
+
+## Deploy to Railway
+
+Railway deployment uses `.env.production` to keep production credentials separate from local dev.
+
+### First-time setup
+
+```sh
+cp example.env .env.production
+# Edit .env.production — set OPENAI_API_KEY, SLACK_TOKEN, etc.
+
+railway login
+./scripts/railway_up.sh
+```
+
+### Sync environment variables
+
+After updating `.env.production`, sync to Railway:
+
+```sh
+./scripts/railway_env.sh
+```
+
+This reads `.env.production` and sets each variable on the Railway service. Safe to run repeatedly — overwrites existing values. Handles multiline values (PEM keys) correctly.
+
+### Redeploy after code changes
+
+```sh
+./scripts/railway_redeploy.sh
+```
+
+### Production operations
+
+```sh
+railway run python scripts/generate_data.py
+railway run python scripts/load_knowledge.py
+railway logs --service dash
+railway run python -m dash
+railway open
+```
+
+### Secure your deployment
+
+See [Security](#security) below for setup — you'll need to connect your OS at [os.agno.com](https://os.agno.com?utm_source=github&utm_medium=example-repo&utm_campaign=agent-example&utm_content=dash&utm_term=agentos) and add a `JWT_VERIFICATION_KEY` to your environment.
+
 ## Local Development
 
 ```sh
@@ -298,42 +343,6 @@ python scripts/generate_data.py
 python scripts/load_knowledge.py
 python -m dash            # CLI mode
 python -m app.main        # AgentOS mode (web UI at os.agno.com)
-```
-
-## Architecture
-
-### Dual Schema
-
-Dash enforces a structural boundary between company data and agent-managed data:
-
-| Schema | Owner | Access |
-|--------|-------|--------|
-| `public` | Company (loaded externally) | Read-only — never modified by agents |
-| `dash` | Engineer agent | Views, summary tables, computed data |
-
-The Engineer builds reusable data assets (`dash.monthly_mrr`, `dash.customer_health_score`, `dash.churn_risk`) and records them to knowledge. The Analyst discovers and prefers these views over raw table queries.
-
-### Agent Team
-
-```
-AgentOS (app/main.py)  [scheduler=True, tracing=True]
- ├── FastAPI / Uvicorn
- ├── Slack Interface (optional — requires SLACK_TOKEN + SLACK_SIGNING_SECRET)
- └── Dash Team (dash/team.py, coordinate mode)
-     ├─ Analyst (dash/agents/analyst.py)        reads public + dash
-     │  ├─ SQLTools (read-only)  → public schema (company data)
-     │  ├─ introspect_schema     → both schemas
-     │  ├─ save_validated_query  → knowledge base
-     │  └─ ReasoningTools
-     ├─ Engineer (dash/agents/engineer.py)       reads public, writes dash
-     │  ├─ SQLTools (full)       → dash schema (agent-managed)
-     │  ├─ introspect_schema     → both schemas
-     │  ├─ update_knowledge      → knowledge base (schema changes)
-     │  └─ ReasoningTools
-     │
-     Leader tools: SlackTools (optional — requires SLACK_TOKEN)
-     Knowledge:    dash_knowledge (table schemas, queries, business rules, dash views)
-     Learnings:    dash_learnings (error patterns, type gotchas, fixes)
 ```
 
 ## Environment Variables
@@ -352,24 +361,6 @@ AgentOS (app/main.py)  [scheduler=True, tracing=True]
 | `RUNTIME_ENV` | No | `prd` | `dev` enables hot reload |
 | `AGENTOS_URL` | No | `http://127.0.0.1:8000` | Scheduler callback URL (production) |
 | `JWT_VERIFICATION_KEY` | Production | — | RBAC public key from [os.agno.com](https://os.agno.com?utm_source=github&utm_medium=example-repo&utm_campaign=agent-example&utm_content=dash&utm_term=agentos) |
-
-## Evaluations
-
-Five eval categories using Agno's eval framework:
-
-| Category | Eval Type | What It Tests |
-|----------|-----------|---------------|
-| accuracy | AccuracyEval (1-10) | Correct data and meaningful insights |
-| routing | ReliabilityEval | Team routes to correct agent/tools |
-| security | AgentAsJudgeEval (binary) | No credential or secret leaks |
-| governance | AgentAsJudgeEval (binary) | Refuses destructive SQL operations |
-| boundaries | AgentAsJudgeEval (binary) | Schema access boundaries respected |
-
-```sh
-python -m evals                      # Run all evals
-python -m evals --category accuracy  # Run specific category
-python -m evals --verbose            # Show response details
-```
 
 ## Security
 
@@ -414,9 +405,5 @@ These are infrastructure guardrails, not prompt instructions. They hold regardle
 - [OpenAI's In-House Data Agent](https://openai.com/index/inside-our-in-house-data-agent/) — the inspiration
 - [Self-Improving SQL Agent](https://www.ashpreetbedi.com/articles/sql-agent) — deep dive on an earlier architecture
 - [Agno Docs](https://docs.agno.com?utm_source=github&utm_medium=example-repo&utm_campaign=agent-example&utm_content=dash&utm_term=docs)
-
-## A Note on This Project
-
-This project was largely built with Claude. If you find a mistake, please open an [issue](https://github.com/agno-agi/dash/issues) or submit a pull request.
 
 <p align="center">Built on <a href="https://github.com/agno-agi/agno">Agno</a> · the runtime for agentic software</p>
