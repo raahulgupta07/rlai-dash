@@ -151,76 +151,15 @@ Dockerfile, Docker Compose, one-command deployment. Scheduled tasks for proactiv
 
 ## Slack
 
-Slack gives Dash two capabilities: receiving messages from users in Slack threads, and proactively posting to channels.
+Dash can receive Slack DMs, @mentions, and thread replies, and can also post to channels proactively.
 
-See [docs/SLACK_CONNECT.md](docs/SLACK_CONNECT.md) for the full setup guide with the app manifest.
+Quick setup:
+1. Run Dash and give it a public URL (ngrok locally, or your Railway domain).
+2. Follow [docs/SLACK_CONNECT.md](docs/SLACK_CONNECT.md) to create and install the Slack app from the manifest.
+3. Set `SLACK_TOKEN` and `SLACK_SIGNING_SECRET`, then restart Dash.
+4. In Slack, confirm Event Subscriptions is verified and send a DM or `@mention` to test it.
 
-### 1. Get your URL
-
-**Production** (Railway or other host): use your deployed URL (e.g. `https://dash-production-xxxx.up.railway.app`).
-
-**Local development**: use [ngrok](https://ngrok.com/download/mac-os) to get a public URL:
-
-```sh
-# Docker Compose (Quick Start)
-ngrok http 8000
-
-# Bare AgentOS (python -m app.main)
-ngrok http 7777
-```
-
-Copy the `https://` URL (e.g. `https://abc123.ngrok-free.app`).
-
-### 2. Create app from manifest
-
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App → From a manifest**
-2. Select your workspace, switch to **JSON**
-3. Paste the manifest from [docs/SLACK_CONNECT.md](docs/SLACK_CONNECT.md) — replace `YOUR_URL_HERE` with your URL
-4. Click **Create**
-
-### 3. Install and get credentials
-
-1. **Install to Workspace** and authorize
-2. Copy **Bot User OAuth Token** (`xoxb-...`) → `SLACK_TOKEN`
-3. Go to **Basic Information → App Credentials**, copy **Signing Secret** → `SLACK_SIGNING_SECRET`
-
-### 4. Add credentials and restart
-
-**Local development:**
-
-```env
-SLACK_TOKEN="xoxb-your-bot-token"
-SLACK_SIGNING_SECRET="your-signing-secret"
-```
-
-```sh
-docker compose up -d --build
-```
-
-**Railway:**
-
-```sh
-# Add to .env.production, then sync and redeploy
-./scripts/railway_env.sh
-./scripts/railway_redeploy.sh
-```
-
-### 5. Verify Event Subscriptions
-
-Slack verifies your endpoint with a `challenge` request when the app is created. If your server wasn't running at that time, the verification fails and events won't be delivered.
-
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → your Dash app → **Event Subscriptions**
-2. If the Request URL shows "Your URL didn't respond", click **Retry**
-3. Confirm it shows **Verified** with a green checkmark
-4. Click **Save Changes**
-
-### 6. Test
-
-- **@mention** Dash in any channel it's been added to: `@Dash What's our MRR?`
-- **DM** the Dash bot directly
-- **Thread replies** continue the conversation with full context
-
-Thread timestamps map to session IDs, so each Slack thread gets its own conversation context.
+Each Slack thread maps to one Dash session. For the manifest, ngrok commands, Railway deployment, permissions, and troubleshooting, see [docs/SLACK_CONNECT.md](docs/SLACK_CONNECT.md).
 
 ## Data Model (SaaS Metrics)
 
