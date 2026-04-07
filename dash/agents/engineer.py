@@ -31,7 +31,7 @@ engineer = Agent(
         learned_knowledge=LearnedKnowledgeConfig(mode=LearningMode.AGENTIC),
     ),
     add_learnings_to_context=True,
-    tools=build_engineer_tools(),
+    tools=build_engineer_tools(dash_knowledge),
     add_datetime_to_context=True,
     add_history_to_context=True,
     num_history_runs=5,

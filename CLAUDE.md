@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Dash is a self-learning data agent that delivers **insights, not just SQL results**. It uses a team of specialists (Analyst + Engineer) coordinated by a leader to handle data queries, schema management, and pipeline operations. Built on Agno. Runs in Slack, the terminal, or the AgentOS web UI.
+Dash is a self-learning data agent that delivers **insights, not just SQL results**. It uses a team of specialists (Analyst + Engineer) coordinated by a leader to handle data queries and build computed data assets. Built on Agno. Runs in Slack, the terminal, or the AgentOS web UI.
 
 ## Structure
 
@@ -13,15 +13,16 @@ dash/
 ├── instructions.py        # Instruction builders per agent role
 ├── paths.py               # Path constants
 ├── agents/
-│   ├── analyst.py         # SQL queries, data analysis, insights
-│   └── engineer.py        # Schema, views, pipelines, data loading
+│   ├── analyst.py         # SQL queries, data analysis, insights (read-only)
+│   └── engineer.py        # Views, summary tables, computed data (dash schema)
 ├── context/               # Runtime prompt builders (reads knowledge/)
 │   ├── semantic_model.py  # Table metadata → system prompt
 │   └── business_rules.py  # Business rules → system prompt
 └── tools/
-    ├── build.py           # Tool assembly per agent role
-    ├── introspect.py      # Runtime schema inspection
-    └── save_query.py      # Save validated queries
+    ├── build.py           # Tool assembly per agent role (schema boundaries)
+    ├── introspect.py      # Runtime schema inspection (both schemas)
+    ├── save_query.py      # Save validated queries to knowledge
+    └── update_knowledge.py # Record schema changes to knowledge
 
 knowledge/                 # Data files loaded into vector DB (1:1 mapping)
 ├── tables/                # Table metadata JSON files (SaaS metrics)
@@ -33,7 +34,7 @@ app/
 └── config.yaml            # Quick prompts
 
 db/
-├── session.py             # PostgreSQL + PgVector knowledge factory
+├── session.py             # PostgreSQL + PgVector + dual schema (public/dash)
 └── url.py                 # Database URL builder
 
 evals/                     # Evaluation framework (Agno eval classes)
@@ -84,13 +85,20 @@ python -m evals --verbose            # Show response details
 
 ## Architecture
 
+**Dual Schema:**
+
+| Schema | Owner | Access |
+|--------|-------|--------|
+| `public` | Company (loaded externally) | Read-only — never modified by agents |
+| `dash` | Engineer agent | Views, summary tables, computed data |
+
 **Team (Coordinate Mode):**
 
-| Agent | Role | Tools |
-|-------|------|-------|
-| **Dash (Leader)** | Routes requests, synthesizes insights | SlackTools (optional) |
-| **Analyst** | SQL generation, execution, data quality | SQLTools, introspect_schema, save_validated_query, ReasoningTools |
-| **Engineer** | Schema migrations, views, pipelines, data loading | SQLTools, introspect_schema, ReasoningTools |
+| Agent | Role | Tools | Schema Access |
+|-------|------|-------|---------------|
+| **Dash (Leader)** | Routes requests, synthesizes insights | SlackTools (optional) | — |
+| **Analyst** | SQL queries, data analysis, insights | SQLTools (read-only), introspect_schema, save_validated_query, ReasoningTools | Reads public + dash |
+| **Engineer** | Views, summary tables, computed data | SQLTools (dash schema), introspect_schema, update_knowledge, ReasoningTools | Reads public, writes dash |
 
 **Interfaces:**
 
@@ -99,16 +107,18 @@ python -m evals --verbose            # Show response details
 | **Slack** | `SLACK_TOKEN` + `SLACK_SIGNING_SECRET` | Receives messages via `/slack/events`, streams responses to threads |
 | **AgentOS** | Always | Web UI at os.agno.com |
 
-**Two Learning Systems:**
+**Knowledge Flow:**
 
 | System | What It Stores | How It Evolves |
 |--------|---------------|----------------|
-| **Knowledge** | Validated queries, table metadata, business rules | Curated via knowledge files |
+| **Knowledge** | Table metadata, validated queries, business rules, **dash schema objects** | Curated files + Engineer's `update_knowledge` calls |
 | **Learnings** | Error patterns, type gotchas, discovered fixes | Managed by LearningMachine (AGENTIC) |
+
+When the Engineer creates a view (e.g., `dash.monthly_mrr`), it calls `update_knowledge` to record the schema, columns, use cases, and example queries. The Analyst discovers these via knowledge search and prefers them over raw table queries.
 
 ## Data Model (SaaS Metrics)
 
-Synthetic B2B SaaS dataset (~500 customers, 2 years of data):
+Synthetic B2B SaaS dataset (~500 customers, 2 years of data) in `public` schema:
 
 | Table | Description |
 |-------|-------------|

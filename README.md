@@ -307,23 +307,37 @@ python -m dash  # CLI mode
 
 ## Architecture
 
+### Dual Schema
+
+Dash enforces a structural boundary between company data and agent-managed data:
+
+| Schema | Owner | Access |
+|--------|-------|--------|
+| `public` | Company (loaded externally) | Read-only — never modified by agents |
+| `dash` | Engineer agent | Views, summary tables, computed data |
+
+The Engineer builds reusable data assets (`dash.monthly_mrr`, `dash.customer_health_score`, `dash.churn_risk`) and records them to knowledge. The Analyst discovers and prefers these views over raw table queries.
+
+### Agent Team
+
 ```
 AgentOS (app/main.py)  [scheduler=True, tracing=True]
  ├── FastAPI / Uvicorn
  ├── Slack Interface (optional — requires SLACK_TOKEN + SLACK_SIGNING_SECRET)
  └── Dash Team (dash/team.py, coordinate mode)
-     ├─ Analyst (dash/agents/analyst.py)
-     │  ├─ SQLTools         → PostgreSQL
-     │  ├─ introspect_schema
-     │  ├─ save_validated_query
+     ├─ Analyst (dash/agents/analyst.py)        reads public + dash
+     │  ├─ SQLTools (read-only)  → public schema (company data)
+     │  ├─ introspect_schema     → both schemas
+     │  ├─ save_validated_query  → knowledge base
      │  └─ ReasoningTools
-     ├─ Engineer (dash/agents/engineer.py)
-     │  ├─ SQLTools         → PostgreSQL
-     │  ├─ introspect_schema
+     ├─ Engineer (dash/agents/engineer.py)       reads public, writes dash
+     │  ├─ SQLTools (full)       → dash schema (agent-managed)
+     │  ├─ introspect_schema     → both schemas
+     │  ├─ update_knowledge      → knowledge base (schema changes)
      │  └─ ReasoningTools
      │
      Leader tools: SlackTools (optional — requires SLACK_TOKEN)
-     Knowledge:    dash_knowledge (table schemas, queries, business rules)
+     Knowledge:    dash_knowledge (table schemas, queries, business rules, dash views)
      Learnings:    dash_learnings (error patterns, type gotchas, fixes)
 ```
 

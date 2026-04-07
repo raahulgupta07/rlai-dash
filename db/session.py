@@ -3,16 +3,43 @@ Database Session
 ================
 
 PostgreSQL database connection for AgentOS.
+
+Two schemas:
+- ``public``: Company data (loaded externally). Read-only for agents.
+- ``dash``: Agent-managed data (views, summary tables). Owned by Engineer.
 """
 
 from agno.db.postgres import PostgresDb
 from agno.knowledge import Knowledge
 from agno.knowledge.embedder.openai import OpenAIEmbedder
 from agno.vectordb.pgvector import PgVector, SearchType
+from sqlalchemy import Engine, create_engine, text
 
 from db.url import db_url
 
 DB_ID = "dash-db"
+
+# PostgreSQL schema for agent-managed tables (views, summaries, computed data).
+# Company data stays in "public". Agno framework tables use the default schema.
+DASH_SCHEMA = "dash"
+
+
+def get_sql_engine() -> Engine:
+    """Create a SQLAlchemy engine scoped to the dash schema.
+
+    Bootstraps by creating the schema if it doesn't exist, then returns
+    an engine with search_path=dash,public so the Engineer can read company
+    data in public and write to dash.
+    """
+    bootstrap = create_engine(db_url)
+    with bootstrap.connect() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {DASH_SCHEMA}"))
+        conn.commit()
+    bootstrap.dispose()
+    return create_engine(
+        db_url,
+        connect_args={"options": f"-c search_path={DASH_SCHEMA},public"},
+    )
 
 
 def get_postgres_db(contents_table: str | None = None) -> PostgresDb:
