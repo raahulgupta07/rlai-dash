@@ -15,6 +15,7 @@ dependencies = [
   "pandas",
   "pgvector",
   "psycopg[binary]",
+  "openpyxl",
   "slack-sdk",
 ]
 

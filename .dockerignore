@@ -26,3 +26,8 @@ venv*
 aienv*
 
 .ipynb_checkpoints
+
+# SvelteKit caches
+frontend/.svelte-kit
+frontend/node_modules
+frontend/build

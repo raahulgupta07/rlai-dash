@@ -163,14 +163,19 @@ def get_improvement_plan(
     queries_content: str,
 ) -> ImprovementPlan:
     """Call GPT-5.4 to analyze failures and suggest improvements."""
+    import os
+
     from openai import OpenAI
 
-    client = OpenAI()
+    client = OpenAI(
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
+    )
 
     prompt = _build_analysis_prompt(results, instructions_content, metrics_content, queries_content)
 
     response = client.chat.completions.create(
-        model="gpt-5.4",
+        model="openai/gpt-5.4-mini",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},

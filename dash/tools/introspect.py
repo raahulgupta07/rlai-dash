@@ -12,13 +12,14 @@ from sqlalchemy.exc import DatabaseError, OperationalError
 
 from db.session import DASH_SCHEMA
 
-SCHEMAS = ["public", DASH_SCHEMA]
 MAX_SAMPLE_ROWS = 20
 
 
-def create_introspect_schema_tool(db_url: str, engine: Engine | None = None):
+def create_introspect_schema_tool(db_url: str, engine: Engine | None = None, user_schema: str | None = None):
     """Create introspect_schema tool with database connection."""
     _engine = engine or create_engine(db_url)
+    # Project mode = only project schema, no public
+    SCHEMAS = [user_schema] if user_schema else ["public", DASH_SCHEMA]
 
     @tool
     def introspect_schema(
@@ -48,6 +49,7 @@ def create_introspect_schema_tool(db_url: str, engine: Engine | None = None):
                 # List all tables and views across schemas (single connection)
                 lines: list[str] = []
                 with _engine.connect() as conn:
+                    conn.execute(text("SET LOCAL statement_timeout = '10s'"))
                     for s in schemas:
                         tables = insp.get_table_names(schema=s)
                         views = insp.get_view_names(schema=s)
@@ -116,6 +118,7 @@ def create_introspect_schema_tool(db_url: str, engine: Engine | None = None):
                 lines.append("### Sample")
                 try:
                     with _engine.connect() as conn:
+                        conn.execute(text("SET LOCAL statement_timeout = '10s'"))
                         result = conn.execute(
                             text(f'SELECT * FROM "{found_schema}"."{table_name}" LIMIT :lim'),
                             {"lim": sample_limit},

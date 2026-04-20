@@ -14,6 +14,7 @@ import re
 from agno.db.postgres import PostgresDb
 from agno.knowledge import Knowledge
 from agno.knowledge.embedder.openai import OpenAIEmbedder
+from os import getenv as _getenv
 from agno.vectordb.pgvector import PgVector, SearchType
 from sqlalchemy import Engine, create_engine, event, text
 
@@ -86,6 +87,8 @@ def get_sql_engine() -> Engine:
         connect_args={"options": f"-c search_path={DASH_SCHEMA},public"},
         pool_size=10,
         max_overflow=20,
+        pool_recycle=3600,
+        pool_pre_ping=True,
     )
     event.listen(_dash_engine, "before_cursor_execute", _guard_public_schema)
     return _dash_engine
@@ -102,9 +105,11 @@ def get_readonly_engine() -> Engine:
         return _readonly_engine
     _readonly_engine = create_engine(
         db_url,
-        connect_args={"options": "-c default_transaction_read_only=on"},
+        connect_args={"options": "-c default_transaction_read_only=on -c statement_timeout=30000"},
         pool_size=10,
         max_overflow=20,
+        pool_recycle=3600,
+        pool_pre_ping=True,
     )
     return _readonly_engine
 
@@ -123,6 +128,147 @@ def get_postgres_db(contents_table: str | None = None) -> PostgresDb:
     return PostgresDb(id=DB_ID, db_url=db_url)
 
 
+# ---------------------------------------------------------------------------
+# Per-user schema management
+# ---------------------------------------------------------------------------
+_user_engines: dict[str, Engine] = {}
+_user_ro_engines: dict[str, Engine] = {}
+
+
+def _sanitize_user_id(user_id: str) -> str:
+    """Sanitize user_id for use as PostgreSQL schema name."""
+    safe = re.sub(r"[^a-z0-9_]", "_", str(user_id).lower())
+    return f"user_{safe}"[:63]
+
+
+def create_user_schema(user_id: str) -> str:
+    """Create a per-user PostgreSQL schema. Returns the schema name."""
+    schema = _sanitize_user_id(user_id)
+    bootstrap = create_engine(db_url)
+    with bootstrap.connect() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        conn.commit()
+    bootstrap.dispose()
+    return schema
+
+
+def get_user_engine(user_id: str) -> Engine:
+    """SQLAlchemy engine scoped to user's schema (cached).
+
+    search_path = user_{id}, public — user data first, shared data second.
+    Public schema write guard applied.
+    """
+    schema = _sanitize_user_id(user_id)
+    if schema in _user_engines:
+        return _user_engines[schema]
+
+    create_user_schema(user_id)
+    eng = create_engine(
+        db_url,
+        connect_args={"options": f'-c search_path="{schema}",public'},
+        pool_size=5,
+        max_overflow=10,
+        pool_recycle=3600,
+        pool_pre_ping=True,
+    )
+    event.listen(eng, "before_cursor_execute", _guard_public_schema)
+    _user_engines[schema] = eng
+    return eng
+
+
+def get_user_readonly_engine(user_id: str) -> Engine:
+    """Read-only engine scoped to user's schema (cached)."""
+    schema = _sanitize_user_id(user_id)
+    if schema in _user_ro_engines:
+        return _user_ro_engines[schema]
+
+    create_user_schema(user_id)
+    eng = create_engine(
+        db_url,
+        connect_args={"options": f'-c search_path="{schema}",public -c default_transaction_read_only=on -c statement_timeout=30000'},
+        pool_size=5,
+        max_overflow=10,
+        pool_recycle=3600,
+        pool_pre_ping=True,
+    )
+    _user_ro_engines[schema] = eng
+    return eng
+
+
+def create_user_knowledge(user_id: str) -> Knowledge:
+    """Create a per-user Knowledge instance with PgVector hybrid search."""
+    schema = _sanitize_user_id(user_id)
+    return create_knowledge(f"Knowledge ({user_id})", f"{schema}_knowledge")
+
+
+def create_user_learnings(user_id: str) -> Knowledge:
+    """Create a per-user Learnings instance."""
+    schema = _sanitize_user_id(user_id)
+    return create_knowledge(f"Learnings ({user_id})", f"{schema}_learnings")
+
+
+# ---------------------------------------------------------------------------
+# Per-project schema management
+# ---------------------------------------------------------------------------
+_project_engines: dict[str, Engine] = {}
+_project_ro_engines: dict[str, Engine] = {}
+
+
+def create_project_schema(slug: str) -> str:
+    """Create a project PostgreSQL schema. Returns the schema name."""
+    safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
+    bootstrap = create_engine(db_url)
+    with bootstrap.connect() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{safe}"'))
+        conn.commit()
+    bootstrap.dispose()
+    return safe
+
+
+def get_project_engine(slug: str) -> Engine:
+    """Engine scoped to project schema (cached)."""
+    safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
+    if safe in _project_engines:
+        return _project_engines[safe]
+    create_project_schema(slug)
+    eng = create_engine(
+        db_url,
+        connect_args={"options": f'-c search_path="{safe}"'},
+        pool_size=5, max_overflow=10,
+        pool_recycle=3600, pool_pre_ping=True,
+    )
+    _project_engines[safe] = eng
+    return eng
+
+
+def get_project_readonly_engine(slug: str) -> Engine:
+    """Read-only engine scoped to project schema ONLY (cached)."""
+    safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
+    if safe in _project_ro_engines:
+        return _project_ro_engines[safe]
+    create_project_schema(slug)
+    eng = create_engine(
+        db_url,
+        connect_args={"options": f'-c search_path="{safe}" -c default_transaction_read_only=on -c statement_timeout=30000'},
+        pool_size=5, max_overflow=10,
+        pool_recycle=3600, pool_pre_ping=True,
+    )
+    _project_ro_engines[safe] = eng
+    return eng
+
+
+def create_project_knowledge(slug: str) -> Knowledge:
+    """Per-project Knowledge with PgVector."""
+    safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
+    return create_knowledge(f"Knowledge ({slug})", f"{safe}_knowledge")
+
+
+def create_project_learnings(slug: str) -> Knowledge:
+    """Per-project Learnings."""
+    safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
+    return create_knowledge(f"Learnings ({slug})", f"{safe}_learnings")
+
+
 def create_knowledge(name: str, table_name: str) -> Knowledge:
     """Create a Knowledge instance with PgVector hybrid search.
 
@@ -139,7 +285,11 @@ def create_knowledge(name: str, table_name: str) -> Knowledge:
             db_url=db_url,
             table_name=table_name,
             search_type=SearchType.hybrid,
-            embedder=OpenAIEmbedder(id="text-embedding-3-small"),
+            embedder=OpenAIEmbedder(
+                id="openai/text-embedding-3-small",
+                api_key=_getenv("OPENROUTER_API_KEY"),
+                base_url="https://openrouter.ai/api/v1",
+            ),
         ),
         contents_db=get_postgres_db(contents_table=f"{table_name}_contents"),
     )

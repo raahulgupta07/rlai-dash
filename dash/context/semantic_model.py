@@ -31,6 +31,14 @@ def load_table_metadata(tables_dir: Path | None = None) -> list[dict[str, Any]]:
                     "columns": table.get("table_columns", []),
                     "use_cases": table.get("use_cases", []),
                     "data_quality_notes": table.get("data_quality_notes", [])[:MAX_QUALITY_NOTES],
+                    # Codex-enriched knowledge fields
+                    "table_purpose": table.get("table_purpose", ""),
+                    "grain": table.get("grain", ""),
+                    "primary_keys": table.get("primary_keys", []),
+                    "foreign_keys": table.get("foreign_keys", []),
+                    "usage_patterns": table.get("usage_patterns", []),
+                    "alternate_tables": table.get("alternate_tables", ""),
+                    "freshness": table.get("freshness", ""),
                 }
             )
         except (json.JSONDecodeError, KeyError, OSError) as e:
@@ -52,12 +60,34 @@ def format_semantic_model(model: dict[str, Any]) -> str:
         lines.append(f"### {table['table_name']}")
         if table.get("description"):
             lines.append(table["description"])
+        if table.get("table_purpose"):
+            lines.append(f"**Purpose:** {table['table_purpose']}")
+        if table.get("grain"):
+            lines.append(f"**Grain:** {table['grain']}")
+        if table.get("primary_keys"):
+            lines.append(f"**Primary keys:** {', '.join(table['primary_keys'])}")
+        if table.get("foreign_keys"):
+            fk_parts = []
+            for fk in table["foreign_keys"]:
+                if isinstance(fk, dict):
+                    fk_parts.append(f"`{fk.get('column', '')}` → `{fk.get('references', '')}` ({fk.get('relationship', '')})")
+                else:
+                    fk_parts.append(str(fk))
+            lines.append(f"**Foreign keys:** {'; '.join(fk_parts)}")
         if table.get("columns"):
             lines.append("**Columns:**")
             for col in table["columns"]:
                 col_type = col.get("type", "")
                 col_desc = col.get("description", "")
                 lines.append(f"  - `{col['name']}` ({col_type}) — {col_desc}")
+        if table.get("usage_patterns"):
+            lines.append("**Usage patterns:**")
+            for p in table["usage_patterns"]:
+                lines.append(f"  - {p}")
+        if table.get("alternate_tables"):
+            lines.append(f"**Alternate tables:** {table['alternate_tables']}")
+        if table.get("freshness"):
+            lines.append(f"**Freshness:** {table['freshness']}")
         if table.get("use_cases"):
             lines.append(f"**Use cases:** {', '.join(table['use_cases'])}")
         if table.get("data_quality_notes"):

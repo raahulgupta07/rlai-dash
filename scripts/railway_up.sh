@@ -10,7 +10,7 @@
 #    Prerequisites:
 #      - Railway CLI installed
 #      - Logged in via `railway login`
-#      - OPENAI_API_KEY set in environment
+#      - OPENROUTER_API_KEY set in environment
 #
 ############################################################################
 
@@ -48,8 +48,8 @@ if ! command -v railway &> /dev/null; then
     exit 1
 fi
 
-if [[ -z "$OPENAI_API_KEY" ]]; then
-    echo "OPENAI_API_KEY not set. Add to .env.production or export it."
+if [[ -z "$OPENROUTER_API_KEY" ]]; then
+    echo "OPENROUTER_API_KEY not set. Add to .env.production or export it."
     exit 1
 fi
 
@@ -92,7 +92,7 @@ railway add -s dash \
     -v "DB_DATABASE=${DB_DATABASE:-ai}" \
     -v "DB_DRIVER=postgresql+psycopg" \
     -v "WAIT_FOR_DB=True" \
-    -v "OPENAI_API_KEY=${OPENAI_API_KEY}" \
+    -v "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" \
     -v "PORT=8000" \
     "${OPTIONAL_VARS[@]}"
 

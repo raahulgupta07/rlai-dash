@@ -57,10 +57,20 @@ ENV/
 Thumbs.db
 
 # =========================
+# Frontend
+# =========================
+node_modules/
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+
+# =========================
 # Project-specific
 # =========================
 tmp
 .claude
+.local
+knowledge/
 
 # Optional: local PyPI creds (uncomment if you ever create it)
 # .pypirc

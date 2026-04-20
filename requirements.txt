@@ -45,6 +45,8 @@ mdurl==0.1.2
 multidict==6.7.1
 numpy==2.4.4
 openai==2.30.0
+et-xmlfile==2.0.0
+openpyxl==3.1.5
 openinference-instrumentation==0.1.46
 openinference-instrumentation-agno==0.1.29
 openinference-semantic-conventions==0.1.28
@@ -96,3 +98,12 @@ websockets==16.0
 wrapt==1.17.3
 yarl==1.23.0
 zipp==3.23.0
+markdown==3.7
+lxml>=5.0
+Pillow>=10.0
+XlsxWriter>=3.0
+python-pptx==1.0.2
+python-docx==1.1.2
+PyMuPDF==1.25.3
+bcrypt==4.2.1
+slowapi==0.1.9

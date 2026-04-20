@@ -1,18 +1,25 @@
 services:
   dash-db:
-    image: agnohq/pgvector:18
+    image: pgvector/pgvector:pg18-trixie
     container_name: dash-db
-    restart: unless-stopped
+    restart: always
     environment:
       POSTGRES_USER: ${DB_USER:-ai}
       POSTGRES_PASSWORD: ${DB_PASS:-ai}
       POSTGRES_DB: ${DB_DATABASE:-ai}
     volumes:
       - pgdata:/var/lib/postgresql
-    ports:
-      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - dash
+    deploy:
+      resources:
+        limits:
+          memory: 2G
 
   dash-api:
     build:
@@ -20,38 +27,75 @@ services:
       dockerfile: Dockerfile
     image: ${IMAGE_NAME:-dash}:${IMAGE_TAG:-latest}
     container_name: dash-api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-1}
+    restart: always
     ports:
-      - "8000:8000"
-    volumes:
-      - .:/app
+      - "8001:8000"
     environment:
-      - RUNTIME_ENV=dev
+      # Core
+      - RUNTIME_ENV=prd
+      - PYTHONPATH=/app
       - AGNO_DEBUG=True
       - AGENTOS_URL=http://127.0.0.1:8000
-      - PYTHONPATH=/app
-      # Database
+      # Database (DB_HOST is always dash-db inside Docker)
       - DB_HOST=dash-db
       - DB_PORT=5432
       - DB_USER=${DB_USER:-ai}
       - DB_PASS=${DB_PASS:-ai}
       - DB_DATABASE=${DB_DATABASE:-ai}
-      - WAIT_FOR_DB=True
-      # API keys
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      # Slack
+      # Required
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - SUPER_ADMIN=${SUPER_ADMIN:-admin}
+      - SUPER_ADMIN_PASS=${SUPER_ADMIN_PASS:-admin}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - DOMAIN=${DOMAIN:-localhost}
+      # Optional — Keycloak SSO
+      - KEYCLOAK_URL=${KEYCLOAK_URL:-}
+      - KEYCLOAK_REALM=${KEYCLOAK_REALM:-dash}
+      - KEYCLOAK_CLIENT_ID=${KEYCLOAK_CLIENT_ID:-dash-app}
+      - KEYCLOAK_CLIENT_SECRET=${KEYCLOAK_CLIENT_SECRET:-}
+      # Optional — Slack
       - SLACK_TOKEN=${SLACK_TOKEN:-}
       - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET:-}
+    volumes:
+      - knowledge_data:/app/knowledge
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     depends_on:
-      - dash-db
+      dash-db:
+        condition: service_healthy
     networks:
       - dash
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: dash-caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dash-api
+    networks:
+      - dash
 
 networks:
   dash:
 
 volumes:
   pgdata:
+  knowledge_data:
+  caddy_data:
+  caddy_config:

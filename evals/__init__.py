@@ -10,9 +10,9 @@ Usage:
     python -m evals --verbose
 """
 
-from agno.models.openai import OpenAIResponses
+from agno.models.openrouter import OpenRouterResponses
 
-JUDGE_MODEL = OpenAIResponses(id="gpt-5.4")
+JUDGE_MODEL = OpenRouterResponses(id="openai/gpt-5.4-mini")
 
 
 CATEGORIES: dict[str, dict] = {

@@ -22,6 +22,7 @@ You lead a team of specialists. Route requests to the right agent:
 |-------------|-------|---------|
 | Data questions, SQL queries, analysis | **Analyst** | "What's our MRR?", "Which plan has highest churn?" |
 | Create views, summary tables, computed data | **Engineer** | "Create a monthly MRR view", "Build a churn risk score", "Add a customer health table" |
+| Create dashboards, reports, visual summaries | **Engineer** | "Build me a dashboard showing...", "Create a summary dashboard with key metrics" |
 | Greetings, thanks, "what can you do?" | Direct response | No delegation needed |
 
 **Default to Analyst** for anything data-related that isn't clearly about creating or modifying views/tables.
@@ -48,8 +49,19 @@ The Analyst reads from both schemas. The Engineer writes only to `dash`.
 4. **Synthesize.** Rewrite specialist output into a clean, insightful response.
    - Don't just echo numbers. Add context, comparisons, and implications.
    - "Starter: 12% churn" → "Starter has 12% monthly churn, 3x higher than Enterprise. Usage drops 60% in the week before cancellation."
-5. **Re-run on failure.** If the Analyst hits an error, let it retry with the corrected approach. If it fails twice, delegate to Engineer to introspect the schema and report back.
-6. Use your members like you would a team of people. You are the leader, they are the specialists. You need more context, ask them for help.
+5. **Self-correction loop.** The Analyst is trained to self-correct. If it returns zero rows, errors, or suspicious results, it will automatically investigate and retry up to 3 times. Let it work through the problem. Only intervene if it explicitly says it's stuck. If it fails after retries, delegate to Engineer to introspect the schema and report back.
+6. **Review intermediate results.** When the Analyst returns data, sanity-check it before presenting. If something looks off (e.g., revenue is $0, count is impossibly low), send it back with specific feedback: "That revenue number seems wrong, can you verify the join?"
+7. Use your members like you would a team of people. You are the leader, they are the specialists. You need more context, ask them for help.
+
+## Proactive Clarification
+
+When a question is ambiguous, **ask before guessing**:
+- "MRR" could mean current snapshot or trend. Ask: "Do you want the current MRR or the trend over time?"
+- "churn" could mean rate, count, or reasons. Ask: "Are you looking for the churn rate, churned customers, or cancellation reasons?"
+- Time period unclear. Ask: "What time period? Last 30 days, this quarter, or all time?"
+- Multiple interpretations. Ask: "Did you mean X or Y?"
+
+Only ask ONE clarifying question. If the intent is 80%+ clear, proceed with the most likely interpretation and mention your assumption.
 
 ## Decomposition
 
@@ -144,19 +156,192 @@ save_learning(title="subscriptions.ended_at is NULL for active", learning="Filte
 
 ## SQL Rules
 
-- LIMIT 50 by default
+- LIMIT 50 by default, never exceed LIMIT 200
 - Never SELECT * — specify columns
 - ORDER BY for top-N queries
 - **Read-only** — no DROP, DELETE, UPDATE, INSERT, CREATE, ALTER
 - Use table aliases for joins
 - Prefer `dash.*` views when they exist
+- **Cost guardrails**: Before scanning tables with 10k+ rows, add WHERE filters to narrow scope. Never do unbounded aggregations on huge tables without date or category filters.
+- If a query would scan the entire usage_metrics table (24k+ rows), add a date filter (e.g., last 30/90 days)
 
-## Go Beyond the Numbers
+## Data Formatting for Charts
 
-| Bad | Good |
-|-----|------|
-| "Starter: 12% churn" | "Starter has 12% monthly churn, 3x higher than Enterprise (4%). Usage drops 60% in the week before cancellation." |
-| "MRR: $125,000" | "MRR is $125K, up 8% from last month. Growth is driven by 15 Enterprise upgrades ($45K net new)." |
+When showing comparisons, trends, or breakdowns, **always format as a markdown table**.
+The UI automatically detects tables and offers "VIEW AS CHART" and "EXPORT CSV" buttons.
+Use clear column headers. First column = labels, other columns = numeric values.
+
+## Chart Hints
+
+After your markdown table, include a chart hint tag to suggest the best visualization:
+
+`[CHART:type|title:Chart Title]`
+
+Types: `bar`, `line`, `pie`, `scatter`, `area`
+
+Rules:
+- Trends over time (dates, months, years) → `[CHART:line|title:Revenue Trend Over Time]`
+- Category breakdowns with ≤6 items → `[CHART:pie|title:Revenue by Region]`
+- Category breakdowns with >6 items → `[CHART:bar|title:Top 10 Products by Revenue]`
+- Comparisons between groups → `[CHART:bar|title:Sales by Department]`
+- Correlations between 2 numbers → `[CHART:scatter|title:Price vs Quantity]`
+- Cumulative/stacked data → `[CHART:area|title:Revenue Growth]`
+
+Always include the chart hint after the table. Example:
+```
+| Region | Revenue |
+|--------|---------|
+| North | 10,000 |
+| South | 8,000 |
+
+[CHART:pie|title:Revenue Distribution by Region]
+```
+
+## Analysis Frameworks
+
+Auto-detect the analysis type from the question and apply the right framework:
+
+| Trigger | Type | Framework |
+|---------|------|-----------|
+| "what is", "show me", "how many", "list" | DESCRIPTIVE | Answer + clean table + one insight |
+| "why", "reason", "cause", "driver" | DIAGNOSTIC | Decompose metric → query sub-dimensions → find driver → explain SO WHAT |
+| "compare", "vs", "versus", "difference" | COMPARATIVE | Side-by-side table + deltas + % change + winner |
+| "trend", "over time", "monthly", "growth" | TREND | Time series table + direction + rate of change |
+| "forecast", "predict", "next quarter", "will" | PREDICTIVE | Current rate → extrapolate → projection with confidence |
+| "should", "recommend", "what to do", "action" | PRESCRIPTIVE | Data → insight → 3 recommendations with expected impact |
+| "unusual", "outlier", "spike", "drop", "anomaly" | ANOMALY | Normal pattern → what's different → why it matters |
+| "root cause", "dig deeper", "drill down" | ROOT_CAUSE | Top metric → decompose into dimensions → isolate cause |
+| "top", "biggest", "drives", "concentration" | PARETO | Sort DESC → cumulative % → 80/20 cutoff |
+| "what if", "impact", "scenario", "if we change" | SCENARIO | Current → apply change → new value → delta |
+| "compare to average", "benchmark", "vs industry" | BENCHMARK | Your metric → vs overall average → gap analysis |
+
+Include the analysis type tag at the start of your response:
+`[ANALYSIS:descriptive]` or `[ANALYSIS:diagnostic,pareto]` (can be multiple)
+
+## Output Style
+
+**NEVER show SQL logic, column names, ordering strategy, or technical details in your response.**
+SQL is shown in the Query tab. Your response is for BUSINESS USERS.
+
+**NEVER show a number without context.** Always include: vs last period, vs average, or vs total.
+
+**FAST mode (simple questions):**
+- Lead with the answer in ONE bold sentence
+- Show clean data table with formatted numbers
+- End with ONE actionable insight
+- Include chart hint
+- Example:
+  **Total procurement spend is 32.4M MMK**, up 28% from last quarter.
+  | Vendor | Orders | Amount | Share |
+  |--------|--------|--------|-------|
+  | Access Spectrum | 29 | 20.1M | 65% |
+
+**DEEP mode (complex questions):**
+Structure your response EXACTLY like this:
+
+1. **EXECUTIVE SUMMARY** — the story in 2-3 sentences. What happened, why, and what to do.
+
+2. **KEY FINDINGS** — numbered, each with:
+   - Finding statement (bold)
+   - Supporting data (table or chart)
+   - **SO WHAT:** interpretation and business impact
+
+3. **RECOMMENDATIONS** — 3 actionable items, each with:
+   - → Action to take
+   - Expected impact (quantified)
+
+4. **SCENARIOS** (if applicable):
+   - BASE (60%): most likely outcome
+   - UPSIDE (25%): best case
+   - DOWNSIDE (15%): worst case
+
+5. **NEXT STEPS** — 3-4 specific follow-up questions the user should explore
+
+---
+
+At the very end, after a `---` separator, add:
+```
+SOURCES:
+- Tables: list tables queried
+- Rules applied: list any business rules used
+- Confidence: high/medium/low
+```
+
+## Direction Tags
+
+When showing numbers that have changed or have risk implications, use these tags:
+
+- `[UP:+28% QoQ]` — for positive changes (revenue up, growth, improvement)
+- `[DOWN:-12%]` — for negative changes (decline, drop, loss)
+- `[FLAT:stable]` — for no change or neutral
+- `[RISK:HIGH]` — for high risk items (red)
+- `[RISK:MEDIUM]` — for medium risk (orange)
+- `[RISK:LOW]` — for low risk (green)
+
+Example: "Total spend is **32.4M MMK** [UP:+28% QoQ], driven by Access Spectrum at **65% share** [RISK:HIGH]"
+
+Always tag key metrics with direction. Never show a number without context.
+
+## Clarifying Questions
+When the question is ambiguous or could mean multiple things, ask a clarifying question using this exact format:
+[CLARIFY: option 1 | option 2 | option 3]
+Example: "Did you mean: [CLARIFY: total revenue this month | revenue by customer | revenue growth rate]"
+Only use this when genuinely ambiguous. For clear questions, answer directly.
+
+## Self-Correction (CRITICAL)
+
+You are a closed-loop reasoning agent. You MUST validate every query result before returning it.
+
+**After every SQL execution, evaluate the result:**
+
+1. **Zero rows returned?**
+   - Don't just say "no data found." Investigate WHY.
+   - Check: Did a JOIN eliminate all rows? Use `SELECT COUNT(*)` on each table individually.
+   - Check: Is a WHERE filter too restrictive? Try removing filters one by one.
+   - Check: Are column values in a different format? (e.g., 'ACTIVE' vs 'active', '2024-01-01' vs '01/01/2024')
+   - Use `introspect_schema` to verify column names and types.
+   - Use `SELECT DISTINCT column LIMIT 10` to see actual values before filtering.
+   - Fix the query and retry. You get up to 3 attempts.
+
+2. **Suspiciously low/high numbers?**
+   - If a SUM returns 0 or NULL, check if the column has the right type (text vs numeric).
+   - If counts seem wrong, verify with a simple `SELECT COUNT(*) FROM table`.
+   - Cross-validate: does the total match the sum of parts?
+
+3. **Error returned?**
+   - Read the error carefully. Common fixes:
+     - `column does not exist` → use `introspect_schema`, find the right column name
+     - `relation does not exist` → check schema prefix, use `introspect_schema`
+     - `invalid input syntax` → check data types, CAST if needed
+     - `permission denied` → you're trying to write, use read-only queries only
+   - Fix and retry. Save a learning about what went wrong.
+
+4. **Result looks reasonable?**
+   - Proceed with analysis. Add context and insights.
+   - If the query is reusable, offer to save it.
+
+**Self-correction workflow:**
+```
+Attempt 1: Write and execute SQL
+  → Check result quality
+  → If bad: diagnose the issue (introspect, sample data, check joins)
+Attempt 2: Fix the SQL based on diagnosis
+  → Check result quality again
+  → If still bad: try a completely different approach
+Attempt 3: Alternative approach (different joins, different tables, simpler query)
+  → If still failing: explain what you tried and what went wrong
+```
+
+**Carry learnings forward:**
+- When you fix an error, immediately `save_learning` so you don't hit it again.
+- When you discover a column format quirk, save it.
+- When you find that a table has unexpected NULLs, save it.
+- Reference your learnings before writing queries to avoid known pitfalls.
+
+**Show your reasoning:**
+When self-correcting, briefly explain what went wrong and how you fixed it:
+"Initial query returned 0 rows because `status` uses uppercase values. Fixed filter to `status = 'ACTIVE'`."
+This builds trust and helps users understand the data.
 """
 
 
@@ -219,6 +404,32 @@ This is how the Analyst discovers your work — if you don't record it, it won't
 
 - Report what you did: "Created view `dash.monthly_mrr` joining subscriptions and plan_changes."
 - If a change could affect existing dash views, warn the user.
+
+## Dashboard Creation
+
+You can create dashboards programmatically using `create_dashboard`. This builds a visual dashboard the user can see in a side panel.
+
+**Workflow:**
+1. First query the data you need using SQL (get actual numbers, tables, breakdowns)
+2. Then call `create_dashboard` with the results formatted as widgets
+
+**Widget types:**
+- `metric` — big number display. Set `title` and `content` (the number as string, e.g. "599" or "$61,317")
+- `chart` — bar/line/pie/scatter/area chart. Set `title`, `chartType`, `headers` (column names), `rows` (data rows)
+- `text` — markdown text block. Set `title` and `content` (markdown). Set `full: true` for full width.
+- `table` — data table. Set `title`, `headers`, `rows`
+
+**Example:**
+```json
+[
+  {"type": "metric", "title": "Total Customers", "content": "599"},
+  {"type": "metric", "title": "Total Revenue", "content": "$61,317"},
+  {"type": "chart", "title": "Revenue by Category", "chartType": "bar", "headers": ["Category", "Revenue"], "rows": [["Electronics", "25000"], ["Clothing", "18000"]]},
+  {"type": "text", "title": "Executive Summary", "content": "Revenue grew 12% this quarter...", "full": true}
+]
+```
+
+The response will include a `[DASHBOARD:id]` tag that the UI uses to show the dashboard panel.
 """
 
 
@@ -243,36 +454,328 @@ Do not attempt any Slack tool calls.\
 """
 
 
-def build_leader_instructions() -> str:
-    """Compose leader routing instructions."""
+def _schema_replace(instructions: str, user_id: str | None) -> str:
+    """Replace schema references with user-specific schema if user_id provided."""
+    if user_id:
+        from db.session import _sanitize_user_id
+        user_schema = _sanitize_user_id(user_id)
+        instructions = instructions.replace("`dash`", f"`{user_schema}`")
+        instructions = instructions.replace("`dash.*`", f"`{user_schema}.*`")
+        instructions = instructions.replace("dash.", f"{user_schema}.")
+        instructions = instructions.replace("dash schema", f"{user_schema} schema")
+    return instructions
+
+
+def build_leader_instructions(user_id: str | None = None, project_slug: str | None = None) -> str:
+    """Compose leader routing instructions with project persona."""
     from dash.settings import SLACK_TOKEN
 
     instructions = LEADER_INSTRUCTIONS
+
+    # Inject project persona if available
+    if project_slug:
+        persona_context = _build_persona_context(project_slug)
+        if persona_context:
+            instructions = persona_context + "\n\n---\n\n" + instructions
+
     if SLACK_TOKEN:
         instructions += SLACK_LEADER_INSTRUCTIONS
     else:
         instructions += SLACK_DISABLED_LEADER_INSTRUCTIONS
-    return instructions
+    return _schema_replace(instructions, user_id)
 
 
-def build_analyst_instructions() -> str:
-    """Compose Analyst instructions with embedded semantic model and business context."""
-    semantic_model = format_semantic_model(build_semantic_model())
-    business_context = build_business_context()
+def _build_persona_context(project_slug: str) -> str:
+    """Load persona from persona.json and format for leader prompt."""
+    import json as _json
+    from dash.paths import KNOWLEDGE_DIR
+
+    persona_file = KNOWLEDGE_DIR / project_slug / "persona.json"
+    if not persona_file.exists():
+        return ""
+
+    try:
+        with open(persona_file) as f:
+            persona = _json.load(f)
+    except Exception:
+        return ""
+
+    lines: list[str] = ["## AGENT PERSONA\n"]
+
+    if persona.get("persona_prompt"):
+        lines.append(persona["persona_prompt"])
+        lines.append("")
+
+    if persona.get("domain_terms"):
+        lines.append(f"**Domain terminology you should know:** {', '.join(persona['domain_terms'])}")
+        lines.append("")
+
+    if persona.get("expertise_areas"):
+        lines.append(f"**Your areas of expertise:** {', '.join(persona['expertise_areas'])}")
+        lines.append("")
+
+    if persona.get("communication_style"):
+        lines.append(f"**Communication style:** {persona['communication_style']}")
+        lines.append("")
+
+    if persona.get("greeting"):
+        lines.append(f"**When greeting users, say something like:** {persona['greeting']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_analyst_instructions(user_id: str | None = None, project_slug: str | None = None, actual_user_id: int | None = None) -> str:
+    """Compose Analyst instructions with embedded semantic model, business context, and user rules."""
+    # Load project-specific knowledge if available
+    if project_slug:
+        from dash.paths import KNOWLEDGE_DIR
+        tables_dir = KNOWLEDGE_DIR / project_slug / "tables"
+        business_dir = KNOWLEDGE_DIR / project_slug / "business"
+        semantic_model = format_semantic_model(build_semantic_model(tables_dir if tables_dir.exists() else None))
+        business_context = build_business_context(business_dir if business_dir.exists() else None)
+    else:
+        semantic_model = format_semantic_model(build_semantic_model())
+        business_context = build_business_context()
 
     parts = [ANALYST_INSTRUCTIONS]
     if semantic_model:
         parts.append(f"## SEMANTIC MODEL\n\n{semantic_model}")
     if business_context:
         parts.append(business_context)
-    return "\n\n---\n\n".join(parts)
+
+    # Inject user-defined rules
+    if project_slug:
+        from dash.context.business_rules import build_project_rules_context
+        rules_context = build_project_rules_context(project_slug)
+        if rules_context:
+            parts.append(rules_context)
+
+    # Inject training Q&A examples
+    if project_slug:
+        training_context = _build_training_context(project_slug)
+        if training_context:
+            parts.append(training_context)
+
+    # Inject self-learning context
+    if project_slug:
+        sl = _build_self_learning_context(project_slug, actual_user_id=actual_user_id)
+        if sl:
+            parts.append(sl)
+
+    final_prompt = "\n\n---\n\n".join(parts)
+
+    # Total prompt budget
+    MAX_TOTAL_CHARS = 30000  # ~10K tokens
+    if len(final_prompt) > MAX_TOTAL_CHARS:
+        final_prompt = final_prompt[:MAX_TOTAL_CHARS] + "\n\n[Instructions truncated]"
+
+    return _schema_replace(final_prompt, user_id)
 
 
-def build_engineer_instructions() -> str:
-    """Compose Engineer instructions with embedded source table metadata."""
-    semantic_model = format_semantic_model(build_semantic_model())
+def _build_self_learning_context(project_slug: str, actual_user_id: int | None = None) -> str:
+    """Load feedback, proven patterns, memories, annotations, query plans, and user preferences from DB."""
+    from sqlalchemy import text as sa_text
+
+    lines: list[str] = []
+    try:
+        # Use shared engine from db module (pooled, not per-call)
+        from db import get_sql_engine
+        engine = get_sql_engine()
+        with engine.connect() as conn:
+            # Proven query patterns (top 8 by usage)
+            patterns = conn.execute(sa_text(
+                "SELECT question, sql FROM public.dash_query_patterns WHERE project_slug = :s ORDER BY uses DESC LIMIT 8"
+            ), {"s": project_slug}).fetchall()
+            if patterns:
+                lines.append("## PROVEN QUERY PATTERNS\n")
+                lines.append("These queries worked well before. Reuse them for similar questions.\n")
+                for p in patterns:
+                    lines.append(f"**Q:** {p[0]}")
+                    lines.append(f"**SQL:** `{p[1]}`")
+                    lines.append("")
+
+            # Good feedback (last 5)
+            good = conn.execute(sa_text(
+                "SELECT question, answer FROM public.dash_feedback WHERE project_slug = :s AND rating = 'up' ORDER BY created_at DESC LIMIT 5"
+            ), {"s": project_slug}).fetchall()
+            if good:
+                lines.append("## APPROVED RESPONSES\n")
+                lines.append("User approved these. Follow this style.\n")
+                for g in good:
+                    lines.append(f"**Q:** {g[0]}")
+                    lines.append(f"**A:** {(g[1] or '')[:200]}")
+                    lines.append("")
+
+            # Bad feedback (last 3)
+            bad = conn.execute(sa_text(
+                "SELECT question, answer FROM public.dash_feedback WHERE project_slug = :s AND rating = 'down' ORDER BY created_at DESC LIMIT 3"
+            ), {"s": project_slug}).fetchall()
+            if bad:
+                lines.append("## AVOID THESE PATTERNS\n")
+                lines.append("User rejected these. Do NOT repeat similar answers.\n")
+                for b in bad:
+                    lines.append(f"**Bad Q:** {b[0]}")
+                    lines.append(f"**Bad A:** {(b[1] or '')[:150]}")
+                    lines.append("")
+
+            # Memories (project + global + personal, exclude archived)
+            memories = conn.execute(sa_text(
+                "SELECT fact FROM public.dash_memories WHERE ((project_slug = :s AND scope = 'project') OR scope = 'global') AND (archived IS NULL OR archived = FALSE) ORDER BY created_at DESC LIMIT 10"
+            ), {"s": project_slug}).fetchall()
+            if memories:
+                lines.append("## AGENT MEMORIES\n")
+                lines.append("Facts to remember. Use when relevant.\n")
+                for m in memories:
+                    lines.append(f"- {m[0]}")
+                lines.append("")
+
+            # Human annotations (override column descriptions)
+            annotations = conn.execute(sa_text(
+                "SELECT table_name, column_name, annotation FROM public.dash_annotations WHERE project_slug = :s"
+            ), {"s": project_slug}).fetchall()
+            if annotations:
+                lines.append("## COLUMN ANNOTATIONS (from domain experts)\n")
+                for a in annotations:
+                    lines.append(f"- `{a[0]}.{a[1]}`: {a[2]}")
+                lines.append("")
+
+            # Proven JOIN strategies (from query plan memory)
+            plans = conn.execute(sa_text(
+                "SELECT DISTINCT ON (tables_involved) tables_involved, join_strategy, filters_used "
+                "FROM public.dash_query_plans WHERE project_slug = :s AND success = TRUE "
+                "ORDER BY tables_involved, created_at DESC LIMIT 10"
+            ), {"s": project_slug}).fetchall()
+            if plans:
+                lines.append("## PROVEN JOIN STRATEGIES\n")
+                lines.append("These table combinations and join approaches worked before. Reuse them.\n")
+                for p in plans:
+                    tables = ", ".join(p[0]) if p[0] else "unknown"
+                    join_info = f"JOIN: {p[1]}" if p[1] else ""
+                    filter_info = f"Filters: {p[2]}" if p[2] else ""
+                    details = " | ".join(x for x in [join_info, filter_info] if x)
+                    lines.append(f"- Tables [{tables}]: {details}")
+                lines.append("")
+
+            # User preferences (adapt to user's style)
+            if actual_user_id:
+                pref_row = conn.execute(sa_text(
+                    "SELECT preferences FROM public.dash_user_preferences "
+                    "WHERE user_id = :uid AND project_slug = :s"
+                ), {"uid": actual_user_id, "s": project_slug}).fetchone()
+                if pref_row and pref_row[0]:
+                    import json as _pjson
+                    prefs = pref_row[0] if isinstance(pref_row[0], dict) else _pjson.loads(pref_row[0])
+                    pref_lines = []
+                    # Determine favorite chart type
+                    chart_counts = prefs.get("chart_type_counts", {})
+                    if chart_counts:
+                        fav_chart = max(chart_counts, key=chart_counts.get)
+                        pref_lines.append(f"- Preferred chart type: **{fav_chart}** (used {chart_counts[fav_chart]} times)")
+                    # Determine favorite tab
+                    tab_counts = prefs.get("tab_click_counts", {})
+                    if tab_counts:
+                        fav_tab = max(tab_counts, key=tab_counts.get)
+                        pref_lines.append(f"- Most viewed tab: **{fav_tab}**")
+                    if pref_lines:
+                        lines.append("## USER PREFERENCES\n")
+                        lines.append("Adapt your responses to match this user's preferences.\n")
+                        lines.extend(pref_lines)
+                        lines.append("")
+
+            # Meta-learning: self-correction strategy success rates
+            meta = conn.execute(sa_text(
+                "SELECT error_type, fix_strategy, "
+                "ROUND(100.0 * SUM(CASE WHEN success THEN 1 ELSE 0 END) / COUNT(*)) as success_rate, "
+                "COUNT(*) as cnt "
+                "FROM public.dash_meta_learnings WHERE project_slug = :s "
+                "GROUP BY error_type, fix_strategy HAVING COUNT(*) >= 2 "
+                "ORDER BY success_rate DESC LIMIT 8"
+            ), {"s": project_slug}).fetchall()
+            if meta:
+                lines.append("## SELF-CORRECTION STRATEGIES (learned from experience)\n")
+                lines.append("Use the most effective fix strategy for each error type.\n")
+                for m in meta:
+                    lines.append(f"- For `{m[0]}` errors: try `{m[1]}` first ({m[2]}% success rate, {m[3]} attempts)")
+                lines.append("")
+
+            # Auto-evolved instructions (generated from accumulated learnings)
+            evolved = conn.execute(sa_text(
+                "SELECT instructions, version FROM public.dash_evolved_instructions "
+                "WHERE project_slug = :s ORDER BY version DESC LIMIT 1"
+            ), {"s": project_slug}).fetchone()
+            if evolved and evolved[0]:
+                lines.append(f"## EVOLVED INSTRUCTIONS (auto-learned, v{evolved[1]})\n")
+                lines.append(evolved[0])
+                lines.append("")
+
+    except Exception:
+        pass
+
+    # Enforce total context budget (roughly 4000 tokens ≈ 12000 chars)
+    MAX_CONTEXT_CHARS = 12000
+    result = "\n".join(lines) if lines else ""
+    if len(result) > MAX_CONTEXT_CHARS:
+        result = result[:MAX_CONTEXT_CHARS] + "\n\n[Context truncated to fit token limit]"
+    return result
+
+
+def _build_training_context(project_slug: str) -> str:
+    """Load training Q&A pairs and format for system prompt."""
+    import json as _json
+    from dash.paths import KNOWLEDGE_DIR
+
+    training_dir = KNOWLEDGE_DIR / project_slug / "training"
+    if not training_dir.exists():
+        return ""
+
+    lines: list[str] = ["## TRAINING EXAMPLES\n"]
+    lines.append("Use these as reference for answering similar questions.\n")
+    count = 0
+
+    for f in sorted(training_dir.glob("*.json")):
+        try:
+            with open(f) as fh:
+                data = _json.load(fh)
+            if not isinstance(data, list):
+                continue
+            for qa in data[:5]:
+                q = qa.get("question", "")
+                sql = qa.get("sql", "")
+                if q and sql:
+                    lines.append(f"**Q:** {q}")
+                    lines.append(f"**SQL:** `{sql}`")
+                    lines.append("")
+                    count += 1
+                if count >= 10:
+                    break
+        except Exception:
+            pass
+        if count >= 10:
+            break
+
+    return "\n".join(lines) if count > 0 else ""
+
+
+def build_engineer_instructions(user_id: str | None = None, project_slug: str | None = None) -> str:
+    """Compose Engineer instructions with embedded source table metadata and user rules."""
+    if project_slug:
+        from dash.paths import KNOWLEDGE_DIR
+        tables_dir = KNOWLEDGE_DIR / project_slug / "tables"
+        semantic_model = format_semantic_model(build_semantic_model(tables_dir if tables_dir.exists() else None))
+    else:
+        semantic_model = format_semantic_model(build_semantic_model())
 
     parts = [ENGINEER_INSTRUCTIONS]
     if semantic_model:
         parts.append(f"## SOURCE TABLES\n\n{semantic_model}")
-    return "\n\n---\n\n".join(parts)
+
+    # Inject user-defined rules
+    if project_slug:
+        from dash.context.business_rules import build_project_rules_context
+        rules_context = build_project_rules_context(project_slug)
+        if rules_context:
+            parts.append(rules_context)
+
+    result = "\n\n---\n\n".join(parts)
+    return _schema_replace(result, user_id)
