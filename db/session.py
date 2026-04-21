@@ -226,7 +226,8 @@ def create_project_schema(slug: str) -> str:
 
 
 def get_project_engine(slug: str) -> Engine:
-    """Engine scoped to project schema (cached, small pool for multi-tenant)."""
+    """Engine scoped to project schema (cached, NullPool — PgBouncer handles pooling)."""
+    from sqlalchemy.pool import NullPool
     safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
     if safe in _project_engines:
         return _project_engines[safe]
@@ -234,15 +235,15 @@ def get_project_engine(slug: str) -> Engine:
     eng = create_engine(
         db_url,
         connect_args={"options": f'-c search_path="{safe}"'},
-        pool_size=2, max_overflow=3,
-        pool_recycle=1800, pool_pre_ping=True,
+        poolclass=NullPool,
     )
     _project_engines[safe] = eng
     return eng
 
 
 def get_project_readonly_engine(slug: str) -> Engine:
-    """Read-only engine scoped to project schema ONLY (cached, small pool)."""
+    """Read-only engine scoped to project schema ONLY (cached, NullPool)."""
+    from sqlalchemy.pool import NullPool
     safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
     if safe in _project_ro_engines:
         return _project_ro_engines[safe]
@@ -250,8 +251,7 @@ def get_project_readonly_engine(slug: str) -> Engine:
     eng = create_engine(
         db_url,
         connect_args={"options": f'-c search_path="{safe}" -c default_transaction_read_only=on -c statement_timeout=30000'},
-        pool_size=2, max_overflow=3,
-        pool_recycle=1800, pool_pre_ping=True,
+        poolclass=NullPool,
     )
     _project_ro_engines[safe] = eng
     return eng
