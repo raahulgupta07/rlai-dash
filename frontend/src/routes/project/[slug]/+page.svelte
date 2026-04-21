@@ -53,6 +53,32 @@
 
   // Proactive insights
   let insights = $state<{id: number; insight: string; severity: string; tables: string[]; created_at: string}[]>([]);
+  let insightsExpanded = $state(false);
+  let showWorkflowSaveModal = $state(false);
+  let wfSaveName = $state('');
+  let wfSaveDesc = $state('');
+  let wfSaveSteps = $state<{question: string; checked: boolean}[]>([]);
+
+  function openWorkflowSave() {
+    const userMsgs = messages.filter(m => m.role === 'user');
+    wfSaveSteps = userMsgs.map(m => ({ question: m.content, checked: true }));
+    wfSaveName = '';
+    wfSaveDesc = '';
+    showWorkflowSaveModal = true;
+  }
+
+  async function confirmWorkflowSave() {
+    const steps = wfSaveSteps.filter(s => s.checked).map(s => ({ type: 'query', title: s.question.slice(0, 60), question: s.question }));
+    if (!wfSaveName.trim() || steps.length === 0) return;
+    try {
+      await fetch(`/api/projects/${projectSlug}/workflows-db`, {
+        method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: wfSaveName.trim(), description: wfSaveDesc.trim(), steps, source: 'user' })
+      });
+      showWorkflowSaveModal = false;
+      loadWorkflows();
+    } catch {}
+  }
 
   async function loadInsights() {
     try {
@@ -391,6 +417,7 @@
     messages = [...messages, { role: 'assistant', content: '', timestamp: '', status: 'streaming', toolCalls: [], workflowExpanded: true, reasoningUsed: reasoningMode, analysisUsed: analysisType }];
     await scrollToBottom();
 
+    abortController = new AbortController();
     await sendMessage(
       msg, sessionId,
       (token) => {
@@ -509,7 +536,8 @@
       },
       projectSlug,
       reasoningMode,
-      analysisType
+      analysisType,
+      abortController.signal
     );
   }
 
@@ -1610,19 +1638,28 @@
     </div>
   </div>
 
-  <!-- Proactive Insight Cards -->
+  <!-- Proactive Insights (collapsible) -->
   {#if insights.length > 0}
-    <div style="max-width: 1100px; margin: 0 auto; padding: 4px 20px;">
-      <div style="display: flex; flex-direction: column; gap: 3px;">
-        {#each insights as ins}
-          <div style="display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-left: 3px solid {ins.severity === 'critical' ? 'var(--color-error)' : ins.severity === 'warning' ? '#c59000' : 'var(--color-primary)'}; background: {ins.severity === 'critical' ? '#fde8e4' : ins.severity === 'warning' ? '#fff8e1' : '#e8f5e9'};">
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="{ins.severity === 'critical' ? 'var(--color-error)' : ins.severity === 'warning' ? '#c59000' : 'var(--color-primary)'}" stroke-width="2.5" style="flex-shrink: 0;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-            <span style="flex: 1; font-size: 10px; font-family: var(--font-family-display); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{ins.insight}</span>
-            <button onclick={() => send(`Investigate: ${ins.insight}`)} style="font-size: 8px; font-weight: 900; text-transform: uppercase; padding: 2px 6px; border: 1px solid var(--color-on-surface); background: var(--color-surface); cursor: pointer; white-space: nowrap; font-family: var(--font-family-display);" disabled={isStreaming}>ASK</button>
-            <button onclick={() => dismissInsight(ins.id)} style="background: none; border: none; cursor: pointer; font-size: 12px; color: var(--color-on-surface-dim); padding: 0; line-height: 1;">&times;</button>
-          </div>
-        {/each}
-      </div>
+    <div style="max-width: 1100px; margin: 0 auto; padding: 2px 20px;">
+      <button onclick={() => insightsExpanded = !insightsExpanded} style="display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px 8px; background: #fff8e1; border: 1px solid #ffe082; cursor: pointer; font-family: var(--font-family-display); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #c59000;">
+        <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#c59000" stroke-width="3"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        {insights.length} insights found
+        <span style="font-size: 7px; margin-left: auto;">{insightsExpanded ? '▲' : '▼'}</span>
+      </button>
+      {#if insightsExpanded}
+        <div style="display: flex; flex-direction: column; gap: 2px; margin-top: 2px;">
+          {#each insights.slice(0, 3) as ins}
+            <div style="display: flex; align-items: center; gap: 6px; padding: 3px 8px; border-left: 2px solid {ins.severity === 'critical' ? 'var(--color-error)' : ins.severity === 'warning' ? '#c59000' : 'var(--color-primary)'}; background: {ins.severity === 'critical' ? '#fde8e4' : ins.severity === 'warning' ? '#fff8e1' : '#e8f5e9'};">
+              <span style="flex: 1; font-size: 9px; font-family: var(--font-family-display); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{ins.insight}</span>
+              <button onclick={() => send(`Investigate: ${ins.insight}`)} style="font-size: 7px; font-weight: 900; text-transform: uppercase; padding: 1px 5px; border: 1px solid var(--color-on-surface); background: var(--color-surface); cursor: pointer; font-family: var(--font-family-display);" disabled={isStreaming}>ASK</button>
+              <button onclick={() => dismissInsight(ins.id)} style="background: none; border: none; cursor: pointer; font-size: 10px; color: var(--color-on-surface-dim); padding: 0; line-height: 1;">&times;</button>
+            </div>
+          {/each}
+          {#if insights.length > 3}
+            <div style="font-size: 8px; color: var(--color-on-surface-dim); padding: 2px 8px;">+{insights.length - 3} more — dismiss to see others</div>
+          {/if}
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -1638,6 +1675,16 @@
           </button>
           {#if workflowPickerOpen}
             <div class="mode-dropdown" style="min-width: 280px;">
+              <!-- Save current chat as workflow -->
+              {#if messages.filter(m => m.role === 'user').length >= 1}
+                <button class="mode-dropdown-item" onclick={() => { workflowPickerOpen = false; openWorkflowSave(); }} style="border-bottom: 2px solid var(--color-on-surface-dim);">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+                  <div>
+                    <div style="font-weight: 900; color: #7c3aed;">SAVE CURRENT AS WORKFLOW</div>
+                    <span class="mode-dropdown-label">{messages.filter(m => m.role === 'user').length} steps from this chat</span>
+                  </div>
+                </button>
+              {/if}
               {#if workflows.length === 0}
                 <div style="padding: 14px; font-size: 11px; color: var(--color-on-surface-dim); text-align: center;">No workflows yet. Train your project to auto-generate workflows.</div>
               {:else}
@@ -1735,7 +1782,7 @@
             <svg width="12" height="12" viewBox="0 0 24 24" fill="var(--color-error)"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
           </button>
         {:else}
-          <button class="send-btn" onclick={() => send()} disabled={!inputText.trim()} title="Send" style="height: 34px; width: 34px; padding: 0;">
+          <button class="send-btn" onclick={() => send()} disabled={!inputText.trim()} title="Send" style="height: 34px; width: 34px; padding: 0; display: flex; align-items: center; justify-content: center;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>
         {/if}
@@ -1753,35 +1800,65 @@
             <text x="12" y="16" text-anchor="middle" fill="white" font-size="13" font-weight="900" font-family="Arial">P</text>
           </svg>
         </button>
+        <!-- Excel Export button -->
+        <button onclick={async () => {
+          if (messages.length < 2) return;
+          const res = await fetch('/api/export/excel-from-chat', {
+            method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: (projectInfo?.agent_name || 'Agent') + ' Analysis', agent_name: projectInfo?.agent_name || 'Agent' })
+          });
+          if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `${projectInfo?.agent_name || 'analysis'}.xlsx`; a.click(); URL.revokeObjectURL(url); }
+        }} disabled={messages.length < 2} title="Export to Excel" style="height: 34px; width: 34px; padding: 0; border: 2px solid {messages.length >= 2 ? '#217346' : '#ccc'}; background: {messages.length >= 2 ? '#21734610' : 'none'}; cursor: {messages.length >= 2 ? 'pointer' : 'default'}; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
+          <svg width="18" height="18" viewBox="0 0 24 24">
+            <rect x="2" y="2" width="20" height="20" rx="4" fill="#217346"/>
+            <text x="12" y="16" text-anchor="middle" fill="white" font-size="13" font-weight="900" font-family="Arial">X</text>
+          </svg>
+        </button>
       </div>
     </div>
     <div style="text-align: center; font-size: 9px; color: var(--color-on-surface-dim); padding: 0 20px 8px; text-transform: uppercase; letter-spacing: 0.1em;">
-      <button onclick={async () => {
-        if (messages.length < 2) return;
-        const res = await fetch('/api/export/report-from-chat', {
-          method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: projectInfo?.agent_name + ' Report' })
-        });
-        if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `report-${Date.now()}.pdf`; a.click(); URL.revokeObjectURL(url); }
-      }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-on-surface-dim); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline;">GENERATE REPORT</button>
-      <button onclick={async () => {
-        const res = await fetch('/api/export/pptx-from-chat', {
-          method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: projectInfo?.agent_name + ' Analysis' })
-        });
-        if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `${projectInfo?.agent_name || 'analysis'}-${Date.now()}.pptx`; a.click(); URL.revokeObjectURL(url); }
-      }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-on-surface-dim); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline; margin-left: 6px;">CREATE PPTX</button>
-      <button onclick={async () => {
-        const res = await fetch('/api/export/slides-from-chat', {
-          method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: projectInfo?.agent_name + ' Analysis', agent_name: projectInfo?.agent_name || 'Agent' })
-        });
-        if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); window.open(url, '_blank'); }
-      }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-primary); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline; margin-left: 6px; font-weight: 900;">PRESENT</button>
-      <span style="margin-left: 8px;">{projectInfo?.agent_name?.toUpperCase() || 'AGENT'} CAN MAKE MISTAKES.</span>
+      <span>{projectInfo?.agent_name?.toUpperCase() || 'AGENT'} CAN MAKE MISTAKES. VERIFY CRITICAL INFORMATION.</span>
     </div>
   </div>
 </div>
+
+<!-- Save Workflow Modal -->
+{#if showWorkflowSaveModal}
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div style="position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; display: flex; align-items: center; justify-content: center;" onclick={(e) => { if (e.target === e.currentTarget) showWorkflowSaveModal = false; }}>
+  <div style="background: var(--color-surface); border: 3px solid var(--color-on-surface); width: 450px; max-height: 80vh; overflow-y: auto; box-shadow: 6px 6px 0 rgba(0,0,0,0.3);">
+    <div style="padding: 10px 16px; background: #7c3aed; color: #fff; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; display: flex; justify-content: space-between; align-items: center;">
+      <span>SAVE AS WORKFLOW</span>
+      <button onclick={() => showWorkflowSaveModal = false} style="background: none; border: none; color: #fff; cursor: pointer; font-size: 14px;">✕</button>
+    </div>
+    <div style="padding: 16px;">
+      <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; color: var(--color-on-surface-dim); margin-bottom: 4px;">WORKFLOW NAME</div>
+      <input type="text" bind:value={wfSaveName} placeholder="e.g. Monthly Revenue Deep Dive" style="width: 100%; padding: 8px 12px; border: 2px solid var(--color-on-surface); font-family: var(--font-family-display); font-size: 13px; background: var(--color-surface-dim); margin-bottom: 12px;" />
+
+      <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; color: var(--color-on-surface-dim); margin-bottom: 4px;">DESCRIPTION</div>
+      <input type="text" bind:value={wfSaveDesc} placeholder="What this workflow analyzes..." style="width: 100%; padding: 8px 12px; border: 2px solid var(--color-on-surface); font-family: var(--font-family-display); font-size: 12px; background: var(--color-surface-dim); margin-bottom: 12px;" />
+
+      <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; color: var(--color-on-surface-dim); margin-bottom: 6px;">STEPS (uncheck to exclude)</div>
+      <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 16px;">
+        {#each wfSaveSteps as step, si}
+          <label style="display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; background: {step.checked ? '#f3e8ff' : 'var(--color-surface-dim)'}; border: 1px solid {step.checked ? '#7c3aed' : 'var(--color-on-surface-dim)'}; cursor: pointer;">
+            <input type="checkbox" bind:checked={step.checked} style="margin-top: 2px;" />
+            <div>
+              <div style="font-size: 9px; font-weight: 900; color: #7c3aed;">STEP {si + 1}</div>
+              <div style="font-size: 11px; color: var(--color-on-surface);">{step.question}</div>
+            </div>
+          </label>
+        {/each}
+      </div>
+
+      <div style="display: flex; gap: 8px; justify-content: flex-end;">
+        <button onclick={() => showWorkflowSaveModal = false} style="padding: 8px 16px; font-size: 11px; font-weight: 900; border: 2px solid var(--color-on-surface); background: none; cursor: pointer; font-family: var(--font-family-display); text-transform: uppercase;">CANCEL</button>
+        <button onclick={confirmWorkflowSave} disabled={!wfSaveName.trim() || wfSaveSteps.filter(s => s.checked).length === 0} style="padding: 8px 16px; font-size: 11px; font-weight: 900; border: 2px solid #7c3aed; background: #7c3aed; color: #fff; cursor: pointer; font-family: var(--font-family-display); text-transform: uppercase;">SAVE WORKFLOW</button>
+      </div>
+    </div>
+  </div>
+</div>
+{/if}
 
 <!-- Save Presentation Modal -->
 {#if showSaveModal}
