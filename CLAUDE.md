@@ -4,7 +4,11 @@
 
 Dash is a **production-ready, multi-tenant, self-learning data notebook** — like NotebookLM for databases. Each user creates projects (data agents), uploads data, and chats with AI agents that auto-train, self-learn, and improve with every interaction. Inspired by OpenAI's in-house data agent (6 context layers, Codex-enriched knowledge pipeline, closed-loop self-correction, evaluation pipeline) and BagOfWords (agentic analytics).
 
-**Architecture**: Each project = isolated PostgreSQL schema + own knowledge vectors + own agent team + own persona + self-learning pipeline. 25+ DB tables. All data persisted in PostgreSQL.
+**Architecture**: Each project = isolated PostgreSQL schema + own knowledge vectors + own agent team + own persona + self-learning pipeline. 35+ DB tables. All data persisted in PostgreSQL.
+
+```
+App (4 workers) → PgBouncer (transaction pooling) → PostgreSQL
+```
 
 ## Structure
 
@@ -79,7 +83,7 @@ frontend/src/routes/
 **Content:** dash_dashboards, dash_schedules, dash_quality_scores, dash_suggested_rules, dash_audit_log, dash_notifications
 **Self-Learning:** dash_memories, dash_feedback, dash_annotations, dash_evals, dash_query_patterns, dash_workflows_db, dash_training_runs, dash_relationships
 **Self-Evolution:** dash_proactive_insights, dash_user_preferences, dash_query_plans, dash_evolved_instructions, dash_meta_learnings, dash_eval_history, dash_eval_runs
-**Data Persistence:** dash_table_metadata, dash_business_rules_db, dash_rules_db, dash_training_qa, dash_personas, dash_documents, dash_drift_alerts
+**Data Persistence:** dash_table_metadata, dash_business_rules_db, dash_rules_db, dash_training_qa, dash_personas, dash_documents, dash_drift_alerts, dash_presentations
 
 ## Agent System
 
@@ -234,6 +238,36 @@ Q&A Eval Pairs → Generation (LLM generates SQL from question)
 
 34. **PPTX/DOCX/PDF Text Extraction** — Uploaded presentation, document, and PDF files are extracted and indexed into knowledge search.
 
+35. **Slide Agent v2** — McKinsey-style presentation generation with 2 LLM calls (think + generate), 7 slide layouts, ECharts-based charts, CLI progress indicator.
+
+36. **Excel Export** — `/api/export/excel-from-chat` generates Excel workbooks with 4 sheets: Summary, Data, Charts, Conversation. Native Excel charts via XlsxWriter.
+
+37. **Save as Workflow** — Users can save conversations as workflows from the Flow dropdown, with checkable steps for guided execution.
+
+38. **Presentations Page** — `/ui/presentations` with full save/version/recall support for generated presentations.
+
+39. **Document Table Extraction** — Extracts structured tables from PPTX (slide table shapes), PDF (pdfplumber), and DOCX (doc.tables) into PostgreSQL tables.
+
+40. **10 File Format Support** — CSV, Excel (.xlsx/.xls), JSON, SQL, PPTX, DOCX, PDF, MD, TXT now all supported for upload and processing.
+
+41. **PgBouncer for Scaling** — Transaction-mode connection pooling via PgBouncer enables 100+ concurrent users.
+
+42. **NullPool for Project Engines** — Per-project SQLAlchemy engines use NullPool to prevent connection leaks.
+
+43. **INSIGHT Tab on Dash Agent Chat** — Badge parsing and direction highlighting for proactive insights in the Dash Agent chat interface.
+
+44. **PIN to Dashboard from Dash Agent** — PIN action available directly from Dash Agent chat responses.
+
+45. **Collapsible Proactive Insights** — Insight cards now collapse/expand for a cleaner chat experience.
+
+46. **Stop Button Fix** — Proper AbortController implementation for reliable streaming cancellation.
+
+47. **Send Icon Centering** — Fixed visual alignment of the send button in chat input.
+
+48. **Footer Cleanup** — Removed GENERATE REPORT / CREATE PPTX / PRESENT links from footer.
+
+49. **Dead Code Cleanup** — Removed 442 lines of unused code across the codebase.
+
 ## Self-Evolution Architecture
 
 ```
@@ -278,6 +312,19 @@ On-Demand Features:
 - **Smart upsert with PK detection** — detects primary keys, upserts on conflict
 - **Date column auto-detection** — identifies and parses date columns automatically
 - **PPTX/DOCX/PDF text extraction** — extracts text content and indexes for knowledge search
+- **Stream upload** — 1MB chunks, never holds full file in memory
+- **Table extraction from PPTX** — extracts slide table shapes into PostgreSQL tables
+- **Table extraction from PDF** — uses pdfplumber to extract tabular data
+- **Table extraction from DOCX** — extracts doc.tables into PostgreSQL tables
+- **pdfminer.six dependency** — for PDF text extraction
+
+## Export System
+
+- **Slide Agent** (`/api/export/slides-agent`): 2 LLM calls (think + generate), McKinsey rules
+- **PPTX** (`/api/export/presentations/{id}/pptx`): Native PowerPoint charts, 7 layouts
+- **Excel** (`/api/export/excel-from-chat`): XlsxWriter, 4 sheets, native Excel charts
+- **HTML**: Self-contained slide deck with ECharts CDN
+- **Presentations CRUD**: save, list, get, delete, versioning
 
 ## Chat UI Features
 
@@ -321,10 +368,9 @@ DATASETS · KNOWLEDGE · RULES · TRAINING · DOCS · QUERIES · LINEAGE · AGEN
 ## Commands
 
 ```bash
-# Deploy
 cp .env.example .env  # edit required vars
 docker compose up -d --build
-# Login: admin/admin (change password immediately)
+# Login with SUPER_ADMIN / SUPER_ADMIN_PASS
 ```
 
 ## Environment Variables
@@ -339,7 +385,7 @@ docker compose up -d --build
 | `SUPER_ADMIN_PASS` | No | same as username | Admin password (set before first boot) |
 | `DB_USER` | No | `ai` | PostgreSQL user |
 | `DB_DATABASE` | No | `ai` | PostgreSQL database name |
-| `WORKERS` | No | `2` | Uvicorn workers (increase for more traffic) |
+| `WORKERS` | No | `4` | Uvicorn workers (increase for more traffic) |
 | `KEYCLOAK_URL/REALM/CLIENT_ID/CLIENT_SECRET` | No | — | Keycloak SSO (optional) |
 | `SLACK_TOKEN` / `SLACK_SIGNING_SECRET` | No | — | Slack notifications (optional) |
 
@@ -364,6 +410,9 @@ docker compose up -d --build
 - Error details hidden from clients
 - Team cache thread-safe (Lock)
 - Prompt injection sanitization
+- PgBouncer connection pooling (transaction mode, 100+ users)
+- NullPool for per-project engines (prevents connection leaks)
+- Streaming file upload (1MB chunks, no full file in memory)
 
 ## Build & Deploy Troubleshooting
 

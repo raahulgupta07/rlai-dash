@@ -12,6 +12,18 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **9 Context Layers** -- proven patterns, approved responses, anti-patterns, memories, annotations, JOIN strategies, user preferences, meta-learning, evolved instructions
 - **Agent-Created Dashboards** -- natural language to full dashboards with metrics, charts, tables, and PPTX export
 - **70+ API Endpoints** -- auth, projects, chat, learning, evaluation, export, dashboards, schedules, workflows, admin
+- **Slide Agent** -- McKinsey-style HTML presentations generated from chat with ECharts visualizations
+- **Excel Export** -- native Excel workbooks with 4 sheets (Summary, Data, Charts, Conversation) including native charts
+- **Save as Workflow** -- save any chat conversation as a reusable workflow
+- **PPTX Export** -- PowerPoint files with native PowerPoint charts (not images)
+- **HTML Slide Deck Download** -- interactive HTML slide decks for offline viewing
+- **Presentations Tab** -- save, version, and recall slide decks within projects
+- **Document Table Extraction** -- tables embedded in PPTX, PDF, and DOCX files are extracted and loaded into PostgreSQL
+- **10 File Format Support** -- CSV, Excel, JSON, SQL, PPTX, DOCX, PDF, MD, TXT, PY
+- **Proactive Insights** -- collapsible insight cards with anomaly detection after each chat
+- **INSIGHT Tab** -- badge parsing with MODE, ANALYSIS, UP/DOWN/FLAT trends, and RISK indicators
+- **Icon Picker** -- SVG Lucide icons selectable on project cards
+- **PIN to Dashboard** -- pin charts, tables, and text from both project chat and Dash Agent to any dashboard
 
 ## Quick Start
 
@@ -57,7 +69,7 @@ open http://localhost:8001
 | `SUPER_ADMIN_PASS` | Admin password (created on first boot) | same as username |
 | `DB_USER` | PostgreSQL user | `ai` |
 | `DB_DATABASE` | PostgreSQL database name | `ai` |
-| `WORKERS` | Uvicorn worker count (increase for traffic) | `2` |
+| `WORKERS` | Uvicorn worker count (5-10 users: 2, 10-30: 4, 30-100: 8) | `4` |
 
 ### Optional
 
@@ -85,6 +97,8 @@ Set both in `.env` before first deploy. Change password from UI after login.
 Internet --> Caddy (auto-SSL, ports 80/443)
                |
             Dash API (FastAPI, port 8000, N workers)
+               |
+            PgBouncer (transaction pooling)
                |
             PostgreSQL 18 + PgVector (port 5432)
 ```
@@ -160,6 +174,29 @@ Nine context layers are injected into the analyst prompt on every query:
 9. **Evolved Instructions** -- auto-generated every 20 chats, versioned
 
 Background processes run after every chat: quality scoring, rule suggestion, proactive insights (anomaly detection), query plan extraction, meta-learning updates, and auto-evolve checks.
+
+## Scaling
+
+| Users | VPS | Workers | RAM |
+|-------|-----|---------|-----|
+| 5-10  | 4GB/2CPU | 2 | $6/mo |
+| 10-30 | 8GB/4CPU | 4 | $12/mo |
+| 30-100 | 16GB/6CPU | 8 | $24/mo |
+
+## Export Options
+
+- **Slide Agent (P button)** -- McKinsey-style HTML slides with ECharts
+- **PPTX** -- PowerPoint with native charts
+- **Excel (X button)** -- 4 sheets: Summary, Data, Charts, Conversation
+- **HTML** -- interactive slide deck
+- **PDF** -- print from HTML
+
+## Supported File Formats
+
+- **CSV, Excel, JSON** -- data tables
+- **PPTX, DOCX, PDF** -- text + embedded tables extracted
+- **SQL** -- query patterns
+- **MD, TXT, PY** -- knowledge base
 
 ## Troubleshooting
 
