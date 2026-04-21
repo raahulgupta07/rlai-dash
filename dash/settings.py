@@ -38,6 +38,7 @@ TRAINING_CONFIGS = {
     "consolidation":    {"temp": 0.1, "tokens": 800,  "thinking": "low"},
     "mining":           {"temp": 0.2, "tokens": 1000, "thinking": "low"},
     "meta_learning":    {"temp": 0.0, "tokens": 300,  "thinking": "none"},
+    "vision":           {"temp": 0.1, "tokens": 1000, "thinking": "none"},
 }
 
 
@@ -122,6 +123,36 @@ def training_llm_call(prompt: str, task: str = "extraction") -> str | None:
             clean = _repair_json(clean)
             return clean
         return None
+    except Exception:
+        return None
+
+
+def training_vision_call(prompt: str, images: list[dict], task: str = "vision") -> str | None:
+    """Call LLM with images for vision-based extraction. images: [{"b64": str, "mime": str}]"""
+    from os import getenv
+    api_key = getenv("OPENROUTER_API_KEY", "")
+    if not api_key or not images:
+        return None
+    cfg = TRAINING_CONFIGS.get(task, TRAINING_CONFIGS["extraction"])
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for img in images[:10]:
+        content.append({"type": "image_url", "image_url": {"url": f"data:{img['mime']};base64,{img['b64']}"}})
+    import httpx
+    body: dict = {
+        "model": TRAINING_MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": cfg["tokens"],
+        "temperature": cfg["temp"],
+    }
+    try:
+        resp = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=body,
+            timeout=45,
+        )
+        result = resp.json()
+        return result.get("choices", [{}])[0].get("message", {}).get("content", "")
     except Exception:
         return None
 

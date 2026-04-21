@@ -171,12 +171,12 @@
   let projectTables = $state<{name: string; columns: string[]; rows: number}[]>([]);
 
   // Chat stats for empty state
-  let sessionCount = $state(0);
   let avgScore = $state(0);
   let memoryCount = $state(0);
 
+  let sessionCount = $derived(pastSessions.length);
+
   async function loadChatStats() {
-    sessionCount = pastSessions.length;
     // Fetch average quality score
     try {
       const r = await fetch(`/api/projects/${projectSlug}/scores/latest?session_id=all`, { headers: _headers() });
@@ -191,25 +191,28 @@
 
   async function loadDynamicSuggestions() {
     try {
+      // Always try eval Q&A first — these are LLM-generated smart questions from training
+      try {
+        const evRes = await fetch(`/api/projects/${projectSlug}/evals`, { headers: _headers() });
+        if (evRes.ok) {
+          const evData = await evRes.json();
+          const evals = evData.evals || [];
+          if (evals.length > 0) {
+            dynamicSuggestions = evals.slice(0, 6).map((e: any) => e.question?.replace(/^\[.*?\]\s*/, '') || '');
+            dynamicSuggestions = dynamicSuggestions.filter((s: string) => s.length > 5);
+          }
+        }
+      } catch {}
+      if (dynamicSuggestions.length >= 3) return; // Got good suggestions from evals
+
+      // Fallback: generate from table metadata
       const res = await fetch(`/api/projects/${projectSlug}/stats`, { headers: _headers() });
       if (!res.ok) return;
       const data = await res.json();
       const tables = data.tables || [];
       if (tables.length === 0) {
-        // Doc-only project — load training Q&A as suggestions
-        try {
-          const evRes = await fetch(`/api/projects/${projectSlug}/evals`, { headers: _headers() });
-          if (evRes.ok) {
-            const evData = await evRes.json();
-            const evals = evData.evals || [];
-            if (evals.length > 0) {
-              dynamicSuggestions = evals.slice(0, 6).map((e: any) => e.question?.replace(/^\[.*?\]\s*/, '') || '');
-              dynamicSuggestions = dynamicSuggestions.filter((s: string) => s.length > 5);
-            }
-          }
-        } catch {}
         if (dynamicSuggestions.length === 0) {
-          dynamicSuggestions = ["Tell me about this project", "What are the key findings?", "Summarize the documents"];
+          dynamicSuggestions = ["What information do we have?", "What are the key findings?", "Summarize the documents"];
         }
         return;
       }
@@ -231,42 +234,21 @@
       }
       projectTables = tableDetails;
 
-      // Generate smart, varied suggestions from actual data
+      // Generate smart suggestions from column names (not table names)
       const suggestions: string[] = [];
-      const templates = [
-        (t: string, cols: string[]) => {
-          const numCol = cols.find(c => /amount|price|revenue|total|cost|value|salary|qty|quantity|count/i.test(c));
-          return numCol ? `What is the total ${numCol.replace(/_/g, ' ')} in ${t.replace(/_/g, ' ')}?` : null;
-        },
-        (t: string, cols: string[]) => {
-          const dateCol = cols.find(c => /date|created|updated|time|month|year/i.test(c));
-          return dateCol ? `Show ${t.replace(/_/g, ' ')} trends over time` : null;
-        },
-        (t: string, cols: string[]) => {
-          const catCol = cols.find(c => /status|type|category|plan|region|country|department|segment/i.test(c));
-          return catCol ? `Break down ${t.replace(/_/g, ' ')} by ${catCol.replace(/_/g, ' ')}` : null;
-        },
-        (t: string, _cols: string[]) => `Show me the top 10 records in ${t.replace(/_/g, ' ')}`,
-        (t: string, _cols: string[]) => `Summarize the ${t.replace(/_/g, ' ')} data`,
-      ];
-
       for (const td of tableDetails) {
-        for (const tmpl of templates) {
-          const s = tmpl(td.name, td.columns);
-          if (s && suggestions.length < 6) suggestions.push(s);
-          if (suggestions.length >= 6) break;
-        }
-        if (suggestions.length >= 6) break;
+        const numCol = td.columns.find(c => /amount|price|revenue|total|cost|value|salary|qty|quantity|count|sales|profit|budget/i.test(c));
+        const dateCol = td.columns.find(c => /date|created|updated|time|month|year|period/i.test(c));
+        const catCol = td.columns.find(c => /status|type|category|plan|region|country|department|segment|product|brand|channel/i.test(c));
+        if (numCol && suggestions.length < 6) suggestions.push(`What is the total ${numCol.replace(/_/g, ' ')}?`);
+        if (dateCol && numCol && suggestions.length < 6) suggestions.push(`Show ${numCol.replace(/_/g, ' ')} trends over time`);
+        if (catCol && numCol && suggestions.length < 6) suggestions.push(`Break down ${numCol.replace(/_/g, ' ')} by ${catCol.replace(/_/g, ' ')}`);
       }
 
-      // Add relationship question if multiple tables
-      if (tableDetails.length > 1 && suggestions.length < 6) {
-        suggestions.push(`How do ${tableDetails[0].name.replace(/_/g, ' ')} and ${tableDetails[1].name.replace(/_/g, ' ')} relate?`);
-      }
-
-      if (suggestions.length === 0) {
-        suggestions.push("Give me an overview of my data", "What are the key metrics?");
-      }
+      // Add generic business questions
+      if (suggestions.length < 6) suggestions.push("Give me an overview of my data");
+      if (suggestions.length < 6) suggestions.push("What are the key metrics and trends?");
+      if (tableDetails.length > 1 && suggestions.length < 6) suggestions.push("How do these datasets relate to each other?");
 
       dynamicSuggestions = suggestions.slice(0, 6);
     } catch {}
@@ -277,39 +259,29 @@
   }
 
   function getSuggestions(content: string): string[] {
-    // Generate follow-ups based on response content + actual project tables
+    // Generate follow-ups based on response content (no raw table names)
     const lower = content.toLowerCase();
     const suggestions: string[] = [];
 
     // Content-aware follow-ups
-    if (lower.includes('table') || lower.includes('column')) {
-      for (const t of projectTables.slice(0, 2)) {
-        suggestions.push(`Show me sample data from ${t.name.replace(/_/g, ' ')}`);
-      }
-    }
-    if (lower.includes('trend') || lower.includes('growth') || lower.includes('month')) {
+    if (lower.includes('trend') || lower.includes('growth') || lower.includes('month') || lower.includes('increase') || lower.includes('decrease')) {
       suggestions.push("Compare this to the previous period");
       suggestions.push("What's driving this trend?");
     }
-    if (lower.includes('top') || lower.includes('highest') || lower.includes('largest')) {
+    if (lower.includes('top') || lower.includes('highest') || lower.includes('largest') || lower.includes('best')) {
       suggestions.push("Show the bottom performers too");
       suggestions.push("What percentage of total do they represent?");
     }
-
-    // Table-aware generic follow-ups
-    if (suggestions.length < 3) {
-      for (const t of projectTables.slice(0, 3)) {
-        const numCol = t.columns.find(c => /amount|price|revenue|total|cost|value/i.test(c));
-        const catCol = t.columns.find(c => /status|type|category|plan|region/i.test(c));
-        if (numCol && catCol && suggestions.length < 3) {
-          suggestions.push(`Break down ${numCol.replace(/_/g, ' ')} by ${catCol.replace(/_/g, ' ')} in ${t.name.replace(/_/g, ' ')}`);
-        }
-      }
+    if (lower.includes('revenue') || lower.includes('sales') || lower.includes('profit') || lower.includes('cost')) {
+      if (suggestions.length < 3) suggestions.push("Break this down by category");
+    }
+    if (lower.includes('anomal') || lower.includes('outlier') || lower.includes('unusual')) {
+      if (suggestions.length < 3) suggestions.push("What caused these anomalies?");
     }
 
     // Fallback
     if (suggestions.length === 0) {
-      suggestions.push("Tell me more about this", "Can you visualize this?", "What else can you find?");
+      suggestions.push("Tell me more about this", "Can you visualize this?", "What are the key takeaways?");
     }
 
     return suggestions.slice(0, 3);

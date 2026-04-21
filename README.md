@@ -25,6 +25,9 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Icon Picker** -- SVG Lucide icons selectable on project cards
 - **PIN to Dashboard** -- pin charts, tables, and text from both project chat and Dash Agent to any dashboard
 - **Researcher Agent** -- dedicated document RAG specialist for uploaded files
+- **Vision Pipeline** -- images/charts in PPTX and PDF files are described by AI vision model and indexed as searchable text
+- **Document-to-Workflow** -- upload a past PPTX/PDF report and auto-convert its structure into a reusable analysis workflow
+- **Smart Suggestions** -- LLM-generated business questions replace raw table names in chat suggestions
 
 ## Quick Start
 
@@ -111,14 +114,14 @@ Each project gets an isolated PostgreSQL schema (`proj_{slug}`), its own PgVecto
 **Agent Team:** Leader (persona + routing + result review) dispatches to:
 - **Analyst** — SQL queries on data tables, 11 analysis types, Prophet forecasting
 - **Engineer** — Create views, dashboards
-- **Researcher** — Document RAG — answers from uploaded PPTX/PDF/DOCX
+- **Researcher** — Document RAG — answers from uploaded PPTX/PDF/DOCX (text + tables + image descriptions via vision)
 
 ## Tech Stack
 
 - **Backend:** Python 3.12, FastAPI, Uvicorn
 - **Frontend:** SvelteKit 2, Svelte 5, Tailwind CSS v4, ECharts
 - **Database:** PostgreSQL 18 (pgvector/pgvector:pg18-trixie), PgVector
-- **LLM Router:** OpenRouter (gpt-4.1-mini for chat, gemini-2.5-flash-lite for training)
+- **LLM Router:** OpenRouter (gpt-5.4-mini for chat, gemini-3.1-flash-lite for training + vision)
 - **Reverse Proxy:** Caddy 2 (auto-SSL)
 - **Containerization:** Docker Compose
 
@@ -167,6 +170,8 @@ Training runs are tracked with success/fail status and duration.
 
 For document-only projects (PPTX/PDF/DOCX without data tables), training runs a 14-step pipeline: knowledge indexing, memories, persona, workflows, evals, feedback, business rules, domain knowledge (glossary/KPIs/metrics), proactive insights, negative examples, training Q&A, multi-document synthesis, cross-document relationships, and completion.
 
+**Vision Processing:** When PPTX/PDF files contain images (charts, graphs, diagrams), each image is sent to a vision-capable LLM that extracts data points, labels, and trends as text. These descriptions are indexed in the knowledge base, enabling the agent to answer questions about visual content.
+
 ## Self-Learning
 
 Nine context layers are injected into the analyst prompt on every query:
@@ -202,7 +207,7 @@ Background processes run after every chat: quality scoring, rule suggestion, pro
 ## Supported File Formats
 
 - **CSV, Excel, JSON** -- data tables
-- **PPTX, DOCX, PDF** -- text + embedded tables extracted
+- **PPTX, DOCX, PDF** -- text + embedded tables + images (vision-described) extracted
 - **SQL** -- query patterns
 - **MD, TXT, PY** -- knowledge base
 

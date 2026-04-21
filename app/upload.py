@@ -2296,6 +2296,34 @@ def _extract_tables_pptx(file_path: str) -> list:
     return tables
 
 
+def _extract_images_pptx(file_path: str) -> list[dict]:
+    """Extract images from PPTX slides. Returns [{"b64": str, "mime": str, "source": str}]."""
+    images: list[dict] = []
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        import base64
+        prs = Presentation(file_path)
+        for si, slide in enumerate(prs.slides):
+            if len(images) >= 10:
+                break
+            for shape in slide.shapes:
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    blob = shape.image.blob
+                    if len(blob) < 5000:
+                        continue
+                    images.append({
+                        "b64": base64.b64encode(blob).decode(),
+                        "mime": shape.image.content_type or "image/png",
+                        "source": f"slide_{si + 1}",
+                    })
+                    if len(images) >= 10:
+                        break
+    except Exception:
+        pass
+    return images
+
+
 def _extract_tables_pdf(file_path: str) -> list:
     """Extract tables from PDF pages as list of DataFrames."""
     tables = []
@@ -2319,6 +2347,38 @@ def _extract_tables_pdf(file_path: str) -> list:
     except Exception:
         pass
     return tables
+
+
+def _extract_images_pdf(file_path: str) -> list[dict]:
+    """Extract images from PDF pages. Returns [{"b64": str, "mime": str, "source": str}]."""
+    images: list[dict] = []
+    try:
+        import fitz
+        import base64
+        doc = fitz.open(file_path)
+        for pi, page in enumerate(doc):
+            if len(images) >= 10:
+                break
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                extracted = doc.extract_image(xref)
+                if not extracted:
+                    continue
+                raw = extracted["image"]
+                if len(raw) < 5000:
+                    continue
+                ext = extracted.get("ext", "png")
+                images.append({
+                    "b64": base64.b64encode(raw).decode(),
+                    "mime": f"image/{ext}",
+                    "source": f"page_{pi + 1}",
+                })
+                if len(images) >= 10:
+                    break
+        doc.close()
+    except Exception:
+        pass
+    return images
 
 
 def _extract_tables_docx(file_path: str) -> list:
@@ -2352,7 +2412,7 @@ def _extract_content(file_path: str, ext: str, raw_content: bytes) -> dict:
     # Get text (existing logic)
     if ext in (".md", ".txt", ".sql", ".py"):
         text = raw_content.decode("utf-8", errors="ignore")
-        return {"text": text, "tables": []}
+        return {"text": text, "tables": [], "images": []}
 
     if ext == ".docx":
         try:
@@ -2362,7 +2422,7 @@ def _extract_content(file_path: str, ext: str, raw_content: bytes) -> dict:
         except Exception:
             text = raw_content.decode("utf-8", errors="ignore")
         tables = _extract_tables_docx(file_path)
-        return {"text": text, "tables": tables}
+        return {"text": text, "tables": tables, "images": []}
 
     if ext == ".pptx":
         try:
@@ -2380,7 +2440,7 @@ def _extract_content(file_path: str, ext: str, raw_content: bytes) -> dict:
         except Exception:
             text = ""
         tables = _extract_tables_pptx(file_path)
-        return {"text": text, "tables": tables}
+        return {"text": text, "tables": tables, "images": _extract_images_pptx(file_path)}
 
     if ext == ".pdf":
         try:
@@ -2394,9 +2454,144 @@ def _extract_content(file_path: str, ext: str, raw_content: bytes) -> dict:
         except Exception:
             text = ""
         tables = _extract_tables_pdf(file_path)
-        return {"text": text, "tables": tables}
+        return {"text": text, "tables": tables, "images": _extract_images_pdf(file_path)}
 
-    return {"text": raw_content.decode("utf-8", errors="ignore"), "tables": []}
+    return {"text": raw_content.decode("utf-8", errors="ignore"), "tables": [], "images": []}
+
+
+def _describe_images_with_vision(images: list[dict], filename: str) -> str:
+    """Send images to vision model and return combined text descriptions."""
+    if not images:
+        return ""
+    from dash.settings import training_vision_call
+    descriptions = []
+    for img in images[:10]:
+        result = training_vision_call(
+            prompt=(
+                "Describe this image from a business document in detail. "
+                "If it's a chart or graph, extract ALL data points, labels, numbers, axes, and trends. "
+                "If it's a diagram, describe the structure and relationships. "
+                "If it's a table rendered as image, extract all the data. "
+                "Be precise with all numbers and labels."
+            ),
+            images=[img],
+        )
+        if result:
+            descriptions.append(f"[Image from {img['source']} in {filename}]: {result}")
+    return "\n\n".join(descriptions)
+
+
+def _extract_document_structure(file_path: str, ext: str) -> list[dict]:
+    """Extract document structure (titles + content summaries) for workflow conversion.
+
+    Returns list of {"index": 1, "title": "...", "content_summary": "..."} dicts.
+    PPTX → slide titles, PDF → page headers by font size, DOCX → heading paragraphs.
+    """
+    sections: list[dict] = []
+
+    if ext == ".pptx":
+        try:
+            from pptx import Presentation
+            prs = Presentation(file_path)
+            for i, slide in enumerate(prs.slides, 1):
+                title = ""
+                content_parts: list[str] = []
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            t = para.text.strip()
+                            if not t:
+                                continue
+                            if not title and (shape == slide.shapes.title if hasattr(slide.shapes, 'title') and slide.shapes.title else shape == slide.shapes[0]):
+                                title = t
+                            else:
+                                content_parts.append(t)
+                if not title and content_parts:
+                    title = content_parts.pop(0)
+                if title:
+                    sections.append({
+                        "index": i,
+                        "title": title[:120],
+                        "content_summary": " ".join(content_parts)[:150],
+                    })
+        except Exception:
+            pass
+
+    elif ext == ".pdf":
+        try:
+            import fitz
+            doc = fitz.open(file_path)
+            for i, page in enumerate(doc, 1):
+                blocks = page.get_text("dict").get("blocks", [])
+                max_size = 0
+                title = ""
+                content_parts: list[str] = []
+                for block in blocks:
+                    if "lines" not in block:
+                        continue
+                    for line in block["lines"]:
+                        for span in line.get("spans", []):
+                            text = span.get("text", "").strip()
+                            size = span.get("size", 0)
+                            if not text:
+                                continue
+                            if size > max_size and len(text) > 3:
+                                if title:
+                                    content_parts.insert(0, title)
+                                title = text
+                                max_size = size
+                            else:
+                                content_parts.append(text)
+                if not title and content_parts:
+                    title = content_parts.pop(0)
+                if title:
+                    sections.append({
+                        "index": i,
+                        "title": title[:120],
+                        "content_summary": " ".join(content_parts)[:150],
+                    })
+            doc.close()
+        except Exception:
+            pass
+
+    elif ext == ".docx":
+        try:
+            from docx import Document
+            doc = Document(file_path)
+            current_title = ""
+            current_content: list[str] = []
+            idx = 0
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                if not text:
+                    continue
+                is_heading = para.style and para.style.name and para.style.name.startswith("Heading")
+                if is_heading:
+                    if current_title:
+                        idx += 1
+                        sections.append({
+                            "index": idx,
+                            "title": current_title[:120],
+                            "content_summary": " ".join(current_content)[:150],
+                        })
+                    current_title = text
+                    current_content = []
+                else:
+                    if current_title:
+                        current_content.append(text)
+                    elif not sections:
+                        current_title = text
+            if current_title:
+                idx += 1
+                sections.append({
+                    "index": idx,
+                    "title": current_title[:120],
+                    "content_summary": " ".join(current_content)[:150],
+                })
+        except Exception:
+            pass
+
+    return sections[:20]
 
 
 @router.post("/upload")
@@ -2876,6 +3071,11 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
         extracted = _extract_content(tmp_path, ext, content)
         text_content = extracted["text"]
         doc_tables = extracted["tables"]
+        doc_images = extracted.get("images", [])
+        if doc_images:
+            image_text = _describe_images_with_vision(doc_images, file.filename)
+            if image_text:
+                text_content += f"\n\n--- IMAGE DESCRIPTIONS ---\n{image_text}"
         import os; os.unlink(tmp_path)
     else:
         text_content = content.decode("utf-8", errors="replace")
@@ -2891,6 +3091,12 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
     doc_path = docs_dir / file.filename
     with open(doc_path, "w") as f:
         f.write(text_content)
+
+    # Save raw binary for structure extraction (doc-to-workflow)
+    if ext in (".pptx", ".docx", ".pdf") and project:
+        docs_raw_dir = KNOWLEDGE_DIR / project / "docs_raw"
+        docs_raw_dir.mkdir(parents=True, exist_ok=True)
+        (docs_raw_dir / file.filename).write_bytes(content)
 
     # Index into project-specific or global knowledge
     from agno.knowledge.reader.text_reader import TextReader
@@ -3631,6 +3837,24 @@ def retrain_project(slug: str, request: Request):
                                 pass
                 all_text = all_text[:8000]
 
+                # Extract and describe images from raw document files
+                docs_raw_dir = KNOWLEDGE_DIR / slug / "docs_raw"
+                if docs_raw_dir.exists():
+                    for raw_file in docs_raw_dir.iterdir():
+                        ext_r = raw_file.suffix.lower()
+                        if ext_r == ".pptx":
+                            imgs = _extract_images_pptx(str(raw_file))
+                        elif ext_r == ".pdf":
+                            imgs = _extract_images_pdf(str(raw_file))
+                        else:
+                            continue
+                        if imgs:
+                            _dlog(f"describing {len(imgs)} images from {raw_file.name}...")
+                            desc = _describe_images_with_vision(imgs, raw_file.name)
+                            if desc:
+                                all_text += f"\n\n--- IMAGES FROM {raw_file.name} ---\n{desc}"
+                                _dlog(f"✓ {len(imgs)} image descriptions added")
+
                 if not all_text.strip():
                     _dlog("· no document text found — skipping brain fill")
                 else:
@@ -3689,30 +3913,87 @@ def retrain_project(slug: str, request: Request):
                     except Exception as e:
                         _dlog(f"⚠ persona error: {str(e)[:60]}")
 
-                    # Step 5: Generate workflows
+                    # Step 5: Generate workflows (structure-aware for PPTX/PDF/DOCX)
                     _update_step("synthesis")
                     _dlog("generating sample workflows...")
                     try:
-                        result = training_llm_call(
-                            f"Based on this document, generate 3 analysis workflows an analyst might run.\n\n"
-                            f"DOCUMENT:\n{all_text[:3000]}\n\n"
-                            f'Return JSON array: [{{"name": "Workflow Name", "description": "What it does", "steps": ["Step 1 question", "Step 2 question", "Step 3 question"]}}]',
-                            "extraction"
-                        )
-                        if result:
-                            wfs = json.loads(result)
-                            if isinstance(wfs, list):
-                                saved = 0
-                                with eng.connect() as conn:
-                                    for wf in wfs[:3]:
-                                        if isinstance(wf, dict) and wf.get("name"):
+                        # Try structure-based extraction from raw docs first
+                        structure_wf_saved = 0
+                        docs_raw_dir = KNOWLEDGE_DIR / slug / "docs_raw"
+                        if docs_raw_dir.exists():
+                            for raw_file in docs_raw_dir.iterdir():
+                                ext = raw_file.suffix.lower()
+                                if ext not in (".pptx", ".pdf", ".docx"):
+                                    continue
+                                sections = _extract_document_structure(str(raw_file), ext)
+                                if len(sections) < 2:
+                                    continue
+                                sections_text = "\n".join(f"{s['index']}. {s['title']} — {s['content_summary']}" for s in sections)
+                                result = training_llm_call(
+                                    f"Convert this document structure into a reusable analysis workflow.\n"
+                                    f"Each section becomes one step — write a clear analyst question.\n\n"
+                                    f"DOCUMENT: {raw_file.name}\nSECTIONS:\n{sections_text}\n\n"
+                                    f'Return ONLY valid JSON (no markdown):\n'
+                                    f'{{"name": "workflow name", "description": "what it analyzes", '
+                                    f'"steps": [{{"title": "section title", "question": "analyst question"}}]}}',
+                                    "extraction"
+                                )
+                                if result:
+                                    wf = json.loads(result.strip().strip("`").strip())
+                                    if isinstance(wf, dict) and wf.get("name"):
+                                        steps = wf.get("steps", [])
+                                        step_list = [s.get("question", s.get("title", "")) if isinstance(s, dict) else s for s in steps]
+                                        with eng.connect() as conn:
                                             conn.execute(text(
                                                 "INSERT INTO public.dash_workflows_db (project_slug, name, description, steps, source) "
-                                                "VALUES (:s, :n, :d, CAST(:st AS jsonb), 'training') ON CONFLICT DO NOTHING"
-                                            ), {"s": slug, "n": wf["name"], "d": wf.get("description", ""), "st": json.dumps(wf.get("steps", []))})
-                                            saved += 1
-                                    conn.commit()
-                                _dlog(f"✓ {saved} workflows saved")
+                                                "VALUES (:s, :n, :d, CAST(:st AS jsonb), 'document') ON CONFLICT DO NOTHING"
+                                            ), {"s": slug, "n": wf["name"], "d": wf.get("description", ""), "st": json.dumps(step_list)})
+                                            conn.commit()
+                                        structure_wf_saved += 1
+                                        _dlog(f"✓ workflow from {raw_file.name} ({len(step_list)} steps)")
+
+                        # Fall back: use LLM to extract structure from text content
+                        if structure_wf_saved == 0:
+                            result = training_llm_call(
+                                f"Read this document and identify the analysis sections/topics.\n"
+                                f"Convert the document structure into a reusable analysis workflow.\n"
+                                f"Each section/topic becomes one step — write a clear analyst question.\n\n"
+                                f"DOCUMENT:\n{all_text[:4000]}\n\n"
+                                f"Return ONLY valid JSON (no markdown):\n"
+                                f'{{"name": "workflow name based on document", "description": "what this workflow analyzes", '
+                                f'"steps": [{{"title": "section title", "question": "analyst question to reproduce this analysis"}}]}}',
+                                "extraction"
+                            )
+                            if result:
+                                wf = json.loads(result.strip().strip("`").strip())
+                                if isinstance(wf, dict) and wf.get("name"):
+                                    steps = wf.get("steps", [])
+                                    step_list = [s.get("question", s.get("title", "")) if isinstance(s, dict) else s for s in steps]
+                                    with eng.connect() as conn:
+                                        conn.execute(text(
+                                            "INSERT INTO public.dash_workflows_db (project_slug, name, description, steps, source) "
+                                            "VALUES (:s, :n, :d, CAST(:st AS jsonb), 'document') ON CONFLICT DO NOTHING"
+                                        ), {"s": slug, "n": wf["name"], "d": wf.get("description", ""), "st": json.dumps(step_list)})
+                                        conn.commit()
+                                    _dlog(f"✓ workflow from text ({len(step_list)} steps)")
+                                    structure_wf_saved = 1
+                                elif isinstance(wf, list):
+                                    saved = 0
+                                    with eng.connect() as conn:
+                                        for w in wf[:3]:
+                                            if isinstance(w, dict) and w.get("name"):
+                                                steps = w.get("steps", [])
+                                                step_list = [s.get("question", s.get("title", "")) if isinstance(s, dict) else s for s in steps]
+                                                conn.execute(text(
+                                                    "INSERT INTO public.dash_workflows_db (project_slug, name, description, steps, source) "
+                                                    "VALUES (:s, :n, :d, CAST(:st AS jsonb), 'document') ON CONFLICT DO NOTHING"
+                                                ), {"s": slug, "n": w["name"], "d": w.get("description", ""), "st": json.dumps(step_list)})
+                                                saved += 1
+                                        conn.commit()
+                                    _dlog(f"✓ {saved} workflows from text")
+                                    structure_wf_saved = saved
+                        else:
+                            _dlog(f"✓ {structure_wf_saved} document-based workflows saved")
                     except Exception as e:
                         _dlog(f"⚠ workflows error: {str(e)[:60]}")
 
@@ -3720,9 +4001,13 @@ def retrain_project(slug: str, request: Request):
                     _dlog("generating eval questions...")
                     try:
                         result = training_llm_call(
-                            f"Based on this document, generate 3 test questions an analyst might ask.\n\n"
-                            f"DOCUMENT:\n{all_text[:3000]}\n\n"
-                            f'Return JSON array: [{{"question": "What is X?", "expected_answer": "X is..."}}]',
+                            f"Based on this document, generate 6 smart business questions an executive would ask.\n\n"
+                            f"DOCUMENT:\n{all_text[:4000]}\n\n"
+                            f"Generate questions that:\n"
+                            f"- Ask about key metrics, trends, performance, comparisons\n"
+                            f"- Use business language (not technical or table names)\n"
+                            f"- Cover: summary, metrics, trends, comparisons, risks, recommendations\n\n"
+                            f'Return JSON array: [{{"question": "What was the revenue growth this quarter?", "expected_answer": "Revenue grew..."}}]',
                             "extraction"
                         )
                         if result:
@@ -3730,7 +4015,7 @@ def retrain_project(slug: str, request: Request):
                             if isinstance(evals, list):
                                 saved = 0
                                 with eng.connect() as conn:
-                                    for ev in evals[:5]:
+                                    for ev in evals[:6]:
                                         if isinstance(ev, dict) and ev.get("question"):
                                             conn.execute(text(
                                                 "INSERT INTO public.dash_evals (project_slug, question, expected_sql) VALUES (:s, :q, :a)"

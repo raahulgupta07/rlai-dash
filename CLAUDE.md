@@ -29,7 +29,7 @@ app/
 
 dash/
 ├── team.py               # Team factory (with persona injection)
-├── settings.py            # Shared config
+├── settings.py            # Shared config + training_llm_call + training_vision_call
 ├── instructions.py        # Dynamic instructions (persona + rules + training + self-learning + self-correction + source attribution + clarifying questions)
 ├── paths.py               # Path constants
 ├── agents/
@@ -283,6 +283,20 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 52. **Researcher Agent** — Dedicated document RAG agent for PPTX/PDF/DOCX. Leader auto-routes document questions to Researcher, data queries to Analyst. Doc text injected directly into Researcher's context.
 
+53. **Document-to-Workflow** — Upload a PPTX/PDF/DOCX → system extracts slide/section structure → converts to reusable analysis workflow. Each slide title becomes a workflow step. Available via Settings → DOCS tab "→ WORKFLOW" button and Settings → WORKFLOWS tab "↑ IMPORT ANALYSIS" button. Auto-extracted during training. `_extract_document_structure()` in `app/upload.py`, `POST /{slug}/doc-to-workflow` and `POST /{slug}/workflows-db` in `app/learning.py`.
+
+54. **Vision Pipeline for Images** — PPTX/PDF images (charts, graphs, diagrams) are now extracted and described by a vision-capable LLM (Gemini 3.1). Image descriptions are saved as searchable text in the knowledge base. Agent can answer questions about chart data, visual trends. `_extract_images_pptx()`, `_extract_images_pdf()`, `_describe_images_with_vision()` in `app/upload.py`, `training_vision_call()` in `dash/settings.py`. 10-image cap, 5KB minimum filter.
+
+55. **Smart Suggested Questions** — Chat suggestions now use LLM-generated eval questions from training instead of ugly raw table names. Falls back to column-based suggestions only if no evals exist. Follow-up suggestions no longer expose internal table names.
+
+56. **Reactive Session Counter** — Cockpit session count now uses `$derived(pastSessions.length)` for live updates instead of stale mount-time value.
+
+57. **Workflow Source Badges** — WORKFLOWS tab shows source badges: FROM DOC (orange), DISCOVERED (purple), USER (green), TRAINING (gray). Workflow list API now returns `source` field.
+
+58. **Redesigned DATASETS Tab** — CLI header, single-click upload (no drop zone step), DOCUMENTS section for non-data files, DATA TABLES summary table with health bars, expandable detail cards below. Unified view of all project files.
+
+59. **Raw Binary Storage** — PPTX/PDF/DOCX uploads now save original binary to `docs_raw/` alongside extracted text. Enables structure extraction and image processing from original files.
+
 ## Self-Evolution Architecture
 
 ```
@@ -314,7 +328,8 @@ On-Demand Features:
   ├── Knowledge Consolidation (compress 30+ memories → 5-10 insights)
   ├── Conversation Pattern Mining (discover recurring workflows)
   ├── Cross-Project Transfer (import learnings from similar projects)
-  └── Self-Evaluation Loop (run evals + regression detection)
+  ├── Self-Evaluation Loop (run evals + regression detection)
+  └── Document-to-Workflow (extract slide structure → reusable workflow)
 ```
 
 ## Upload System
@@ -334,6 +349,9 @@ On-Demand Features:
 - **pdfminer.six dependency** — for PDF text extraction
 - Doc-only projects fully supported — no CSV/data table required for training
 - Training progress UI works for doc-only projects (step tracking in DB)
+- **Vision pipeline** — extracts images from PPTX (shape.image.blob) and PDF (fitz extract_image), sends to vision LLM, saves descriptions as searchable text
+- **Document-to-workflow** — extracts slide/section structure, LLM converts to reusable workflow steps
+- **Raw binary preservation** — original PPTX/PDF/DOCX saved to docs_raw/ for structure and image extraction
 
 ## Export System
 

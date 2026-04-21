@@ -591,14 +591,103 @@ def list_workflows_db(slug: str, request: Request):
     _check_access(user, slug)
     with _engine.connect() as conn:
         rows = conn.execute(text(
-            "SELECT id, name, description, steps, created_at FROM public.dash_workflows_db "
+            "SELECT id, name, description, steps, created_at, source FROM public.dash_workflows_db "
             "WHERE project_slug = :s ORDER BY created_at"
         ), {"s": slug}).fetchall()
     wfs = []
     for r in rows:
         steps = r[3] if isinstance(r[3], list) else json.loads(r[3]) if r[3] else []
-        wfs.append({"id": r[0], "name": r[1], "description": r[2], "steps": steps, "created_at": str(r[4]) if r[4] else None})
+        wfs.append({"id": r[0], "name": r[1], "description": r[2], "steps": steps, "created_at": str(r[4]) if r[4] else None, "source": r[5] or "training"})
     return {"workflows": wfs}
+
+
+@router.post("/{slug}/workflows-db")
+async def create_workflow(slug: str, request: Request):
+    """Create a new workflow."""
+    user = _get_user(request)
+    _check_access(user, slug)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    name = body.get("name", "").strip()
+    if not name:
+        raise HTTPException(400, "Workflow name is required")
+    steps = body.get("steps", [])
+    if not steps:
+        raise HTTPException(400, "At least one step is required")
+    description = body.get("description", "")
+    source = body.get("source", "user")
+    with _engine.connect() as conn:
+        result = conn.execute(text(
+            "INSERT INTO public.dash_workflows_db (project_slug, name, description, steps, source) "
+            "VALUES (:s, :n, :d, CAST(:st AS jsonb), :src) RETURNING id"
+        ), {"s": slug, "n": name, "d": description, "st": json.dumps(steps), "src": source})
+        new_id = result.fetchone()[0]
+        conn.commit()
+    return {"status": "ok", "id": new_id}
+
+
+@router.post("/{slug}/doc-to-workflow")
+async def doc_to_workflow(slug: str, request: Request):
+    """Extract document structure and convert to a workflow preview."""
+    user = _get_user(request)
+    _check_access(user, slug)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    filename = body.get("filename", "").strip()
+    if not filename:
+        raise HTTPException(400, "filename is required")
+
+    from dash.paths import KNOWLEDGE_DIR
+    from pathlib import Path
+
+    # Try raw binary first, fall back to text file
+    raw_path = KNOWLEDGE_DIR / slug / "docs_raw" / filename
+    ext = Path(filename).suffix.lower()
+    if not raw_path.exists():
+        raise HTTPException(404, f"Document not found: {filename}")
+    if ext not in (".pptx", ".pdf", ".docx"):
+        raise HTTPException(400, "Only PPTX, PDF, and DOCX files support workflow extraction")
+
+    # Extract structure
+    import tempfile
+    from app.upload import _extract_document_structure
+    sections = _extract_document_structure(str(raw_path), ext)
+    if len(sections) < 2:
+        raise HTTPException(400, "Document has insufficient structure (need at least 2 sections)")
+
+    # Build LLM prompt
+    sections_text = "\n".join(
+        f"{s['index']}. {s['title']} — {s['content_summary']}" for s in sections
+    )
+    prompt = (
+        f"Convert this document structure into a reusable analysis workflow.\n"
+        f"Each section should become one workflow step — write a clear analyst question "
+        f"that would reproduce the analysis shown in that section.\n\n"
+        f"DOCUMENT: {filename}\n"
+        f"SECTIONS:\n{sections_text}\n\n"
+        f"Return ONLY valid JSON (no markdown):\n"
+        f'{{"name": "workflow name based on document", "description": "what this workflow analyzes", '
+        f'"steps": [{{"title": "section title", "question": "analyst question to reproduce this analysis"}}]}}'
+    )
+
+    from dash.settings import training_llm_call
+    result = training_llm_call(prompt, "extraction")
+    if not result:
+        raise HTTPException(500, "LLM call failed")
+
+    try:
+        workflow = json.loads(result.strip().strip("`").strip())
+    except Exception:
+        raise HTTPException(500, "Failed to parse LLM response")
+
+    # Add source sections for reference
+    workflow["source_file"] = filename
+    workflow["sections_found"] = len(sections)
+    return {"workflow": workflow}
 
 
 @router.post("/{slug}/workflows-db/{wf_id}/run")

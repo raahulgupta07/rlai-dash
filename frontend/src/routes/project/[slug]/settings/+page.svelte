@@ -41,6 +41,11 @@
   let knowledgeFiles = $state<any[]>([]);
   let workflows = $state<any[]>([]);
 
+  // Doc-to-workflow
+  let docToWorkflowLoading = $state<string | null>(null);
+  let docWorkflowPreview = $state<any>(null);
+  let docWorkflowCreated = $state<Set<string>>(new Set());
+
   // Knowledge graph click detail
   let graphSelectedNode = $state<any>(null);
 
@@ -254,7 +259,7 @@
   async function loadTraining() { try { const r = await fetch(`/api/training?project=${slug}`, { headers: _h() }); if (r.ok) training = await r.json(); } catch {} }
   async function loadDocs() { try { const r = await fetch(`/api/docs?project=${slug}`, { headers: _h() }); if (r.ok) { const d = await r.json(); docs = d.docs || []; } } catch {} }
   async function loadKnowledgeFiles() { try { const r = await fetch(`/api/knowledge-files?project=${slug}`, { headers: _h() }); if (r.ok) { const d = await r.json(); knowledgeFiles = d.files || []; } } catch {} }
-  async function loadWorkflows() { try { const r = await fetch(`/api/workflows?project=${slug}`, { headers: _h() }); if (r.ok) { const d = await r.json(); workflows = d.workflows || []; } } catch {} }
+  async function loadWorkflows() { try { const r = await fetch(`/api/projects/${slug}/workflows-db`, { headers: _h() }); if (r.ok) { const d = await r.json(); workflows = d.workflows || []; } } catch {} }
   async function loadSchedules() { try { const r = await fetch(`/api/projects/${slug}/schedules`, { headers: _h() }); if (r.ok) { const d = await r.json(); schedules = d.schedules || []; } } catch {} }
   async function loadPersona() { try { const r = await fetch(`/api/projects/${slug}/persona`, { headers: _h() }); if (r.ok) { const d = await r.json(); persona = d.persona; editPersonaText = persona?.persona_prompt || ''; } } catch {} }
   async function loadTrainingRuns() { try { const r = await fetch(`/api/projects/${slug}/training-runs`, { headers: _h() }); if (r.ok) { const d = await r.json(); trainingRuns = d.runs || []; } } catch {} }
@@ -989,46 +994,46 @@
 
   <!-- ═══ DATASETS ═══ -->
   {:else if activeTab === 'datasets'}
-    <div class="flex items-center justify-between mb-4">
-      <div>
-        <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Datasets</div>
-        <div style="font-size: 10px; color: var(--color-on-surface-dim); text-transform: uppercase; letter-spacing: 0.08em; margin-top: 2px;">
-          {detail?.tables?.length || 0} tables · {detail?.tables?.reduce((s: number, t: any) => s + (t.rows || 0), 0).toLocaleString()} total rows
-        </div>
+    <!-- CLI Header -->
+    <div class="cli-terminal" style="margin-bottom: 16px; padding: 8px 14px;">
+      <div class="cli-line">
+        <span class="cli-prompt">$</span>
+        <span class="cli-command">dash datasets</span>
+        <span class="cli-output">--status</span>
+        <span class="cli-dim" style="margin-left: auto;">{detail?.tables?.length || 0} tables · {docs.length} docs · {detail?.tables?.reduce((s: number, t: any) => s + (t.rows || 0), 0).toLocaleString()} rows</span>
       </div>
-      <button class="send-btn" onclick={() => { showUpload = !showUpload; selectedFile = null; selectedFiles = []; tableName = ''; uploadSteps = []; uploadResult = null; uploadResults = []; uploadError = ''; uploadMatch = null; uploadAction = 'auto'; }} style="padding: 6px 14px; font-size: 10px; cursor: pointer;">{showUpload ? '✕ CLOSE' : '+ ADD DATA'}</button>
     </div>
 
-    <!-- Inline upload zone (no modal) -->
-    {#if showUpload}
-      <div class="ink-border" style="padding: 16px; margin-bottom: 16px; background: var(--color-surface-bright);">
-        <!-- svelte-ignore a11y_no_static_element_interactions -->
-        <div class="drop-zone" style="padding: 16px; cursor: pointer;" onclick={() => fileInputEl?.click()} ondragover={(e) => e.preventDefault()} ondrop={(e) => { e.preventDefault(); const files = e.dataTransfer?.files; if (files && files.length > 0) { files.length === 1 ? setFile(files[0]) : setFiles(files); } }}>
-          <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
+    <div class="flex items-center justify-between mb-4">
+      <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Datasets</div>
+      <div>
+        <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
+        <button class="send-btn" onclick={() => fileInputEl?.click()} style="padding: 6px 14px; font-size: 10px; cursor: pointer;">↑ UPLOAD DATA</button>
+      </div>
+    </div>
+
+    <!-- Upload progress (shows after file selected) -->
+    {#if showUpload && (selectedFile || selectedFiles.length > 0)}
+      <div class="ink-border" style="padding: 12px 16px; margin-bottom: 16px; background: var(--color-surface-bright);">
+        <div class="flex items-center justify-between mb-2">
           {#if selectedFiles.length > 1}
             <div>
-              <span style="font-weight: 900;">{selectedFiles.length} files selected</span>
-              <span style="font-size: 10px; color: var(--color-on-surface-dim); margin-left: 8px;">({(selectedFiles.reduce((s, f) => s + f.size, 0) / 1024).toFixed(1)} KB total)</span>
-              <div style="margin-top: 6px; font-size: 10px; color: var(--color-on-surface-dim);">
-                {selectedFiles.map(f => f.name).join(', ')}
-              </div>
+              <span style="font-weight: 900; font-size: 12px;">{selectedFiles.length} files selected</span>
+              <span style="font-size: 10px; color: var(--color-on-surface-dim); margin-left: 6px;">({(selectedFiles.reduce((s, f) => s + f.size, 0) / 1024).toFixed(1)} KB)</span>
             </div>
           {:else if selectedFile}
-            <div style="display: flex; align-items: center; gap: 8px;">
-              <span style="font-weight: 900;">{selectedFile.name}</span>
+            <div class="flex items-center gap-2">
+              <span style="font-weight: 900; font-size: 12px;">{selectedFile.name}</span>
               <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: {uploadFileType === 'data' ? 'var(--color-primary)' : uploadFileType === 'sql_patterns' ? 'var(--color-secondary)' : 'var(--color-warning)'}; color: white; text-transform: uppercase;">{uploadFileType === 'data' ? 'DATA' : uploadFileType === 'sql_patterns' ? 'SQL' : 'DOC'}</span>
               <span style="font-size: 10px; color: var(--color-on-surface-dim);">({(selectedFile.size / 1024).toFixed(1)} KB)</span>
             </div>
-          {:else}
-            <span style="font-size: 11px; text-transform: uppercase;">Drop files — CSV, Excel, JSON, SQL, PPTX, DOCX, PDF, MD, TXT</span>
           {/if}
+          <button onclick={() => { showUpload = false; selectedFile = null; selectedFiles = []; uploadSteps = []; uploadResult = null; uploadError = ''; }} style="background: none; border: none; cursor: pointer; font-size: 14px; color: var(--color-on-surface-dim);">&times;</button>
         </div>
 
         {#if selectedFile || selectedFiles.length > 0}
           {#if uploadFileType === 'data' && selectedFiles.length <= 1}
-            <div class="flex gap-2 items-end mt-3">
-              <div style="flex: 1;"><input type="text" bind:value={tableName} placeholder="Table name (auto-generated)" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 12px; background: var(--color-surface);" /></div>
-            </div>
+            <input type="text" bind:value={tableName} placeholder="Table name (auto-generated)" style="width: 100%; border: 1px solid var(--color-surface-dim); padding: 5px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface); margin-bottom: 8px;" />
           {/if}
 
           {#if uploadMatch}
@@ -1075,9 +1080,79 @@
       </div>
     {/if}
 
-    {#if !detail?.tables?.length && !showUpload}
-      <div style="font-size: 12px; color: var(--color-on-surface-dim);">No data yet. Click + ADD DATA above.</div>
-    {:else}
+    <!-- Documents list (non-data files) -->
+    {#if docs.length > 0}
+      <div style="margin-bottom: 16px;">
+        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; color: var(--color-on-surface-dim);">DOCUMENTS ({docs.length})</div>
+        {#each docs as d}
+          <div class="flex items-center justify-between" style="padding: 4px 0; border-bottom: 1px solid var(--color-surface-dim); font-size: 11px;">
+            <div class="flex items-center gap-2">
+              <span style="font-size: 7px; font-weight: 900; padding: 1px 4px; background: {['.pptx','.pdf','.docx'].includes(d.type) ? 'var(--color-warning)' : ['.sql','.py'].includes(d.type) ? '#6366f1' : '#888'}; color: white; text-transform: uppercase; min-width: 26px; text-align: center;">{d.type.replace('.','')}</span>
+              <span style="font-weight: 700;">{d.name}</span>
+            </div>
+            <div class="flex items-center gap-3">
+              <span style="font-size: 9px; color: var(--color-on-surface-dim);">{(d.size / 1024).toFixed(1)} KB</span>
+              <span style="font-size: 8px; font-weight: 900; color: var(--color-primary);">✓ INDEXED</span>
+              <button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={() => deleteDoc(d.name)}>DEL</button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
+    <!-- Data Tables Summary -->
+    {#if detail?.tables?.length > 0}
+      <div style="margin-bottom: 16px;">
+        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; color: var(--color-on-surface-dim);">DATA TABLES ({detail.tables.length})</div>
+        <div style="overflow-x: auto;">
+          <table class="data-table" style="font-size: 11px; width: 100%;">
+            <thead>
+              <tr>
+                <th style="text-align: left;">TABLE</th>
+                <th>ROWS</th>
+                <th>COLS</th>
+                <th>TRAINED</th>
+                <th>Q&A</th>
+                <th>HEALTH</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each detail.tables as t}
+                {@const isTrained = knowledgeFiles.some((f: any) => f.type === 'tables' && f.name === t.name + '.json')}
+                {@const qaCount = (training?.training_qa || []).filter((q: any) => q.source_table === t.name).length}
+                {@const health = isTrained ? (qaCount > 0 ? 100 : 60) : 0}
+                <tr style="cursor: pointer;" onclick={() => toggleTableExpand(t.name)}>
+                  <td style="font-weight: 900;">{t.name}</td>
+                  <td style="text-align: center;">{(t.rows || 0).toLocaleString()}</td>
+                  <td style="text-align: center;">{t.columns || '—'}</td>
+                  <td style="text-align: center;">
+                    {#if isTrained}<span style="color: var(--color-primary); font-weight: 900;">✓</span>{:else}<span style="color: var(--color-on-surface-dim);">○</span>{/if}
+                  </td>
+                  <td style="text-align: center;">{qaCount}</td>
+                  <td style="text-align: center;">
+                    <div style="display: inline-flex; align-items: center; gap: 4px;">
+                      <div style="width: 40px; height: 5px; background: var(--color-surface-dim);">
+                        <div style="height: 100%; width: {health}%; background: {health >= 70 ? 'var(--color-primary)' : health >= 40 ? 'var(--color-warning)' : 'var(--color-error)'};"></div>
+                      </div>
+                      <span style="font-size: 9px;">{health}%</span>
+                    </div>
+                  </td>
+                  <td style="text-align: center;">
+                    <button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={(e) => { e.stopPropagation(); deleteTable(t.name); }}>DEL</button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Table Detail Cards -->
+    {#if !detail?.tables?.length && docs.length === 0}
+      <div style="font-size: 12px; color: var(--color-on-surface-dim);">No data yet. Click ↑ UPLOAD DATA to add files.</div>
+    {:else if detail?.tables?.length > 0}
       <div class="flex flex-col gap-3">
         {#each detail.tables as t, ti}
           {@const isTrained = training?.training_qa?.some((qa: any) => qa.source_table === t.name) || knowledgeFiles.some((f: any) => f.type === 'tables' && f.name === t.name + '.json')}
@@ -1753,12 +1828,93 @@
         <div class="flex items-center justify-between py-2" style="border-bottom: 1px solid var(--color-surface-dim); font-size: 12px;">
           <div class="flex items-center gap-2"><span style="font-weight: 900;">{d.name}</span><span class="tag-label" style="font-size: 7px; padding: 1px 4px;">{d.type}</span></div>
           <div class="flex items-center gap-3">
+            {#if ['.pptx', '.pdf', '.docx'].includes(d.type)}
+              {#if docWorkflowCreated.has(d.name)}
+                <span style="font-size: 8px; font-weight: 900; color: var(--color-primary); text-transform: uppercase; letter-spacing: 0.05em;">✓ WORKFLOW</span>
+              {:else}
+                <button class="feedback-btn" style="font-size: 8px; padding: 2px 8px; cursor: pointer; font-weight: 900; text-transform: uppercase;"
+                  disabled={docToWorkflowLoading === d.name}
+                  onclick={async () => {
+                    docToWorkflowLoading = d.name;
+                    try {
+                      const r = await fetch(`/api/projects/${slug}/doc-to-workflow`, {
+                        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ filename: d.name })
+                      });
+                      if (r.ok) {
+                        const data = await r.json();
+                        docWorkflowPreview = data.workflow;
+                      } else {
+                        const err = await r.json().catch(() => ({}));
+                        alert(err.detail || 'Failed to extract workflow');
+                      }
+                    } catch { alert('Failed to extract workflow'); }
+                    docToWorkflowLoading = null;
+                  }}>{docToWorkflowLoading === d.name ? 'EXTRACTING...' : '→ WORKFLOW'}</button>
+              {/if}
+            {/if}
             <span style="color: var(--color-on-surface-dim); font-size: 10px;">{(d.size / 1024).toFixed(1)} KB</span>
             <button class="feedback-btn" style="font-size: 9px; color: var(--color-error); border-color: var(--color-error); padding: 2px 8px; cursor: pointer;" onclick={() => deleteDoc(d.name)}>DEL</button>
           </div>
         </div>
       {/each}
     {:else}<div style="font-size: 12px; color: var(--color-on-surface-dim);">No documents. Add SQL files or business docs for richer context.</div>{/if}
+
+    <!-- Doc-to-Workflow Preview Modal -->
+    {#if docWorkflowPreview}
+      <div style="position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999; display: flex; align-items: center; justify-content: center;"
+        onclick={(e) => { if (e.target === e.currentTarget) docWorkflowPreview = null; }}>
+        <div class="ink-border stamp-shadow" style="background: var(--color-surface); width: 560px; max-height: 80vh; overflow-y: auto;">
+          <div class="dark-title-bar" style="padding: 8px 14px; font-size: 11px; display: flex; justify-content: space-between; align-items: center;">
+            <span>WORKFLOW PREVIEW — {docWorkflowPreview.source_file || ''}</span>
+            <button onclick={() => docWorkflowPreview = null} style="background: none; border: none; color: var(--color-primary-container); cursor: pointer; font-size: 14px;">&times;</button>
+          </div>
+          <div style="padding: 16px;">
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; display: block; margin-bottom: 4px;">Workflow Name</label>
+              <input type="text" bind:value={docWorkflowPreview.name} style="width: 100%; padding: 6px 10px; font-size: 12px; border: 1px solid var(--color-surface-dim); font-family: var(--font-family-display); background: var(--color-surface-bright);" />
+            </div>
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; display: block; margin-bottom: 4px;">Description</label>
+              <input type="text" bind:value={docWorkflowPreview.description} style="width: 100%; padding: 6px 10px; font-size: 12px; border: 1px solid var(--color-surface-dim); font-family: var(--font-family-display); background: var(--color-surface-bright);" />
+            </div>
+            <div style="margin-bottom: 12px;">
+              <label style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; display: block; margin-bottom: 8px;">Steps ({docWorkflowPreview.steps?.length || 0})</label>
+              {#each docWorkflowPreview.steps || [] as step, i}
+                <div class="flex items-center gap-2 mb-2" style="border-left: 2px solid var(--color-primary); padding-left: 8px;">
+                  <span style="font-size: 10px; font-weight: 900; color: var(--color-on-surface-dim); min-width: 18px;">{i + 1}</span>
+                  <input type="text" bind:value={step.question} style="flex: 1; padding: 5px 8px; font-size: 11px; border: 1px solid var(--color-surface-dim); font-family: var(--font-family-display); background: var(--color-surface-bright);" />
+                  <button onclick={() => { docWorkflowPreview.steps = docWorkflowPreview.steps.filter((_: any, j: number) => j !== i); docWorkflowPreview = docWorkflowPreview; }}
+                    style="background: none; border: none; cursor: pointer; font-size: 12px; color: var(--color-error); padding: 2px;">&times;</button>
+                </div>
+              {/each}
+            </div>
+            <div class="flex justify-end gap-2">
+              <button class="feedback-btn" style="padding: 6px 14px; font-size: 10px; cursor: pointer;" onclick={() => docWorkflowPreview = null}>CANCEL</button>
+              <button class="send-btn" style="padding: 6px 14px; font-size: 10px; cursor: pointer;"
+                onclick={async () => {
+                  const steps = (docWorkflowPreview.steps || []).map((s: any) => typeof s === 'string' ? s : s.question || s.title || String(s));
+                  try {
+                    const r = await fetch(`/api/projects/${slug}/workflows-db`, {
+                      method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ name: docWorkflowPreview.name, description: docWorkflowPreview.description, steps, source: 'document' })
+                    });
+                    if (r.ok) {
+                      const sourceFile = docWorkflowPreview.source_file;
+                      docWorkflowCreated = new Set([...docWorkflowCreated, sourceFile]);
+                      docWorkflowPreview = null;
+                      loadWorkflows();
+                    } else {
+                      const err = await r.json().catch(() => ({}));
+                      alert(err.detail || 'Failed to save workflow');
+                    }
+                  } catch { alert('Failed to save workflow'); }
+                }}>SAVE WORKFLOW</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    {/if}
 
   <!-- ═══ QUERIES ═══ -->
   {:else if activeTab === 'queries'}
@@ -2184,12 +2340,55 @@
         <span class="cli-dim" style="margin-left: auto;">{workflows.length} workflows</span>
       </div>
     </div>
-    <div style="font-size: 18px; font-weight: 900; text-transform: uppercase; margin-bottom: 16px;">Workflows</div>
+    <div class="flex items-center justify-between mb-4">
+      <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Workflows</div>
+      <div>
+        <input type="file" accept=".pptx,.pdf,.docx" onchange={async (e) => {
+          const file = (e.target as HTMLInputElement).files?.[0];
+          if (!file) return;
+          // 1. Upload the doc
+          const fd = new FormData(); fd.append('file', file);
+          cLog(`${ts()} ── uploading ${file.name}...`);
+          try {
+            const upRes = await fetch(`/api/upload-doc?project=${slug}`, { method: 'POST', body: fd, headers: _h() });
+            if (!upRes.ok) { cLog(`${ts()} │  ✗ upload failed`); return; }
+            cLog(`${ts()} │  ✓ uploaded`);
+            // 2. Extract workflow from doc
+            cLog(`${ts()} ── extracting workflow structure...`);
+            const wfRes = await fetch(`/api/projects/${slug}/doc-to-workflow`, {
+              method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+              body: JSON.stringify({ filename: file.name })
+            });
+            if (wfRes.ok) {
+              const data = await wfRes.json();
+              docWorkflowPreview = data.workflow;
+              cLog(`${ts()} │  ✓ found ${data.workflow?.steps?.length || 0} steps`);
+            } else {
+              cLog(`${ts()} │  ✗ extraction failed — try from DOCS tab`);
+            }
+          } catch { cLog(`${ts()} │  ✗ error`); }
+          (e.target as HTMLInputElement).value = '';
+        }} style="display: none;" id="wf-import-input" />
+        <button class="send-btn" onclick={() => (document.getElementById('wf-import-input') as HTMLInputElement)?.click()} style="padding: 6px 14px; font-size: 10px; cursor: pointer;">↑ IMPORT ANALYSIS</button>
+      </div>
+    </div>
+    <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-bottom: 12px;">Upload a past PPTX/PDF/DOCX report to auto-create a reusable workflow from its structure.</div>
     {#if workflows.length > 0}
       {#each workflows as wf, wi}
         <div class="ink-border mb-2" style="background: var(--color-surface); padding: 12px 16px;">
           <div class="flex items-center justify-between">
-            <div style="font-weight: 900; text-transform: uppercase; font-size: 12px;">{wf.name}</div>
+            <div class="flex items-center gap-2">
+              <span style="font-weight: 900; text-transform: uppercase; font-size: 12px;">{wf.name}</span>
+              {#if wf.source === 'document'}
+                <span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: var(--color-warning); color: white; text-transform: uppercase;">FROM DOC</span>
+              {:else if wf.source === 'mined'}
+                <span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: #6366f1; color: white; text-transform: uppercase;">DISCOVERED</span>
+              {:else if wf.source === 'user'}
+                <span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: var(--color-primary); color: white; text-transform: uppercase;">USER</span>
+              {:else}
+                <span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: var(--color-on-surface-dim); color: white; text-transform: uppercase;">TRAINING</span>
+              {/if}
+            </div>
             <button class="send-btn" style="font-size: 9px; padding: 3px 10px;" onclick={async () => {
               window.dispatchEvent(new CustomEvent('dash-cli-log', { detail: { text: `  ${new Date().toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})} ── running workflow: ${wf.name}` } }));
               try {
