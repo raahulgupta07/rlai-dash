@@ -10,6 +10,11 @@
   let loading = $state(true);
   let activeTab = $state('cockpit');
 
+  // Role-based access
+  let userRole = $state<string>('viewer');
+  let canEdit = $derived(userRole === 'editor' || userRole === 'admin' || userRole === 'owner');
+  let canAdmin = $derived(userRole === 'admin' || userRole === 'owner');
+
   // Upload
   let showUpload = $state(false);
   let uploading = $state(false);
@@ -233,7 +238,7 @@
   }
 
   onMount(async () => {
-    await Promise.all([loadDetail(), loadLineage(), loadTraining(), loadDocs(), loadKnowledgeFiles(), loadWorkflows(), loadRules(), loadSuggestedRules(), loadSchedules(), loadSharedUsers(), loadPersona(), loadBrainData(), loadTrainingRuns(), loadDriftAlerts(), loadRelationships(), loadInsights(), loadPreferences(), loadMetaLearnings(), loadConsolidationStatus(), loadEvolvedInstructions(), loadResourceRegistry(), loadEvolutionHistory(), loadQueryPlans(), loadEvalHistory(), loadTransferCandidates(), loadAgents()]);
+    await Promise.all([loadDetail(), loadLineage(), loadTraining(), loadDocs(), loadKnowledgeFiles(), loadWorkflows(), loadRules(), loadSuggestedRules(), loadSchedules(), loadSharedUsers(), loadPersona(), loadBrainData(), loadTrainingRuns(), loadDriftAlerts(), loadRelationships(), loadInsights(), loadPreferences(), loadMetaLearnings(), loadConsolidationStatus(), loadEvolvedInstructions(), loadResourceRegistry(), loadEvolutionHistory(), loadQueryPlans(), loadEvalHistory(), loadTransferCandidates(), loadAgents(), loadAllUsers()]);
     loading = false;
     // Auto-load first table details
     if (detail?.tables?.length) {
@@ -251,6 +256,7 @@
       ]);
       if (pRes.ok) {
         project = await pRes.json();
+        userRole = project.user_role || 'owner';
         editName = project.agent_name || '';
         editRole = project.agent_role || '';
         editPersonality = project.agent_personality || 'friendly';
@@ -552,9 +558,19 @@
 
   // Shared users
   let sharedUsers = $state<any[]>([]);
+  let allUsers = $state<any[]>([]);
   let shareUsername = $state('');
   let shareRole = $state('viewer');
   let shareError = $state('');
+  let showAddAccess = $state(false);
+  let shareSearch = $state('');
+
+  async function loadAllUsers() {
+    try {
+      const r = await fetch('/api/auth/users', { headers: _h() });
+      if (r.ok) { const d = await r.json(); allUsers = d.users || []; }
+    } catch {}
+  }
 
   async function loadSharedUsers() {
     try {
@@ -780,10 +796,12 @@
       <span style="font-size: 18px; font-weight: 900; text-transform: uppercase;">{project?.agent_name || 'Agent'}</span>
     </div>
     <div class="flex items-center gap-2">
-      {#if isTraining}
-        <button class="send-btn" style="padding: 6px 14px; font-size: 10px; background: #d32f2f; color: white; border-color: #d32f2f;" onclick={stopTraining}>■ STOP TRAINING</button>
-      {:else}
-        <button class="send-btn" style="padding: 6px 14px; font-size: 10px; background: var(--color-on-surface); color: var(--color-primary-container); border-color: var(--color-on-surface);" onclick={() => { window.dispatchEvent(new CustomEvent('dash-train-all')); startTrainAll(); }}>TRAIN ALL</button>
+      {#if canEdit}
+        {#if isTraining}
+          <button class="send-btn" style="padding: 6px 14px; font-size: 10px; background: #d32f2f; color: white; border-color: #d32f2f;" onclick={stopTraining}>■ STOP TRAINING</button>
+        {:else}
+          <button class="send-btn" style="padding: 6px 14px; font-size: 10px; background: var(--color-on-surface); color: var(--color-primary-container); border-color: var(--color-on-surface);" onclick={() => { window.dispatchEvent(new CustomEvent('dash-train-all')); startTrainAll(); }}>TRAIN ALL</button>
+        {/if}
       {/if}
       <a href="/ui/project/{slug}" class="send-btn" style="padding: 6px 14px; font-size: 10px; text-decoration: none; cursor: pointer;">← CHAT</a>
     </div>
@@ -838,10 +856,12 @@
           {/if}
         </div>
       </div>
-      {#if isTraining}
-        <button class="send-btn" onclick={stopTraining} style="font-size: 10px; padding: 6px 14px; background: var(--color-error); color: white; font-weight: 900;">■ STOP</button>
-      {:else}
-        <button class="send-btn" onclick={() => { startTrainAll(); }} style="font-size: 10px; padding: 6px 14px; background: var(--color-primary-container); color: var(--color-on-surface); font-weight: 900;">TRAIN ALL</button>
+      {#if canEdit}
+        {#if isTraining}
+          <button class="send-btn" onclick={stopTraining} style="font-size: 10px; padding: 6px 14px; background: var(--color-error); color: white; font-weight: 900;">■ STOP</button>
+        {:else}
+          <button class="send-btn" onclick={() => { startTrainAll(); }} style="font-size: 10px; padding: 6px 14px; background: var(--color-primary-container); color: var(--color-on-surface); font-weight: 900;">TRAIN ALL</button>
+        {/if}
       {/if}
       <button class="feedback-btn" onclick={() => { loadResourceRegistry(); }} style="font-size: 9px; padding: 4px 10px; font-weight: 700;">REFRESH</button>
     </div>
@@ -1058,7 +1078,7 @@
       <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Datasets</div>
       <div>
         <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
-        <button class="send-btn" onclick={() => fileInputEl?.click()} style="padding: 6px 14px; font-size: 10px; cursor: pointer;">↑ UPLOAD DATA</button>
+        {#if canEdit}<button class="send-btn" onclick={() => fileInputEl?.click()} style="padding: 6px 14px; font-size: 10px; cursor: pointer;">↑ UPLOAD DATA</button>{/if}
       </div>
     </div>
 
@@ -1145,7 +1165,7 @@
             <div class="flex items-center gap-3">
               <span style="font-size: 9px; color: var(--color-on-surface-dim);">{(d.size / 1024).toFixed(1)} KB</span>
               <span style="font-size: 8px; font-weight: 900; color: var(--color-primary);">✓ INDEXED</span>
-              <button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={() => deleteDoc(d.name)}>DEL</button>
+              {#if canEdit}<button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={() => deleteDoc(d.name)}>DEL</button>{/if}
             </div>
           </div>
         {/each}
@@ -1191,7 +1211,7 @@
                     </div>
                   </td>
                   <td style="text-align: center;">
-                    <button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={(e) => { e.stopPropagation(); deleteTable(t.name); }}>DEL</button>
+                    {#if canEdit}<button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={(e) => { e.stopPropagation(); deleteTable(t.name); }}>DEL</button>{/if}
                   </td>
                 </tr>
               {/each}
@@ -1228,7 +1248,7 @@
               <div class="flex items-center gap-3" style="font-size: 11px;">
                 <span>{t.rows?.toLocaleString()} rows</span>
                 <span>{t.columns} cols</span>
-                <button onclick={(e) => { e.stopPropagation(); deleteTable(t.name); }} style="background: var(--color-error); border: 1px solid var(--color-error); color: white; cursor: pointer; font-size: 8px; font-weight: 900; padding: 2px 8px; font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.06em;">DELETE</button>
+                {#if canEdit}<button onclick={(e) => { e.stopPropagation(); deleteTable(t.name); }} style="background: var(--color-error); border: 1px solid var(--color-error); color: white; cursor: pointer; font-size: 8px; font-weight: 900; padding: 2px 8px; font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.06em;">DELETE</button>{/if}
                 <span style="font-size: 14px;">{isExpanded ? '▲' : '▼'}</span>
               </div>
             </div>
@@ -1700,7 +1720,7 @@
             <span style="color: #ff9d00;">&#9679;</span>
             <span class="cli-output">{m.fact}</span>
             <span class="cli-dim" style="margin-left: auto; font-size: 8px;">{m.scope}</span>
-            <button onclick={async () => { await fetch(`/api/projects/${slug}/memories/${m.id}`, { method: 'DELETE', headers: _h() }); await loadBrainData(); }} style="background: none; border: none; color: #555; cursor: pointer; font-size: 10px; margin-left: 4px;">&#10005;</button>
+            {#if canEdit}<button onclick={async () => { await fetch(`/api/projects/${slug}/memories/${m.id}`, { method: 'DELETE', headers: _h() }); await loadBrainData(); }} style="background: none; border: none; color: #555; cursor: pointer; font-size: 10px; margin-left: 4px;">&#10005;</button>{/if}
           </div>
         {/each}
       </div>
@@ -1906,7 +1926,7 @@
               {/if}
             {/if}
             <span style="color: var(--color-on-surface-dim); font-size: 10px;">{(d.size / 1024).toFixed(1)} KB</span>
-            <button class="feedback-btn" style="font-size: 9px; color: var(--color-error); border-color: var(--color-error); padding: 2px 8px; cursor: pointer;" onclick={() => deleteDoc(d.name)}>DEL</button>
+            {#if canEdit}<button class="feedback-btn" style="font-size: 9px; color: var(--color-error); border-color: var(--color-error); padding: 2px 8px; cursor: pointer;" onclick={() => deleteDoc(d.name)}>DEL</button>{/if}
           </div>
         </div>
       {/each}
@@ -2690,9 +2710,9 @@
                 {:else}
                   <span class="tag-label" style="font-size: 8px;">NOT RUN</span>
                 {/if}
-                <button class="feedback-btn" style="font-size: 8px; padding: 2px 6px; color: var(--color-error);" onclick={async () => {
+                {#if canEdit}<button class="feedback-btn" style="font-size: 8px; padding: 2px 6px; color: var(--color-error);" onclick={async () => {
                   await fetch(`/api/projects/${slug}/evals/${ev.id}`, { method: 'DELETE', headers: _h() }); await loadBrainData();
-                }}>DEL</button>
+                }}>DEL</button>{/if}
               </div>
             </div>
             <div class="cli-terminal" style="margin-top: 4px; padding: 6px 10px; font-size: 10px;">
@@ -2759,68 +2779,98 @@
     </div>
 
     <div class="flex items-center justify-between mb-4">
-      <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Shared Users</div>
-    </div>
-    <div style="font-size: 11px; color: var(--color-on-surface-dim); margin-bottom: 16px;">
-      Share this project with other users on the platform. They'll see it in their "Shared with me" tab.
+      <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Access List</div>
+      {#if canAdmin}<button class="send-btn" style="font-size: 10px; padding: 6px 14px;" onclick={() => { showAddAccess = true; shareSearch = ''; }}>+ Add Access</button>{/if}
     </div>
 
-    <!-- Add user form -->
-    <div class="flex gap-2 items-end mb-4">
-      <div style="flex: 1;">
-        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">USERNAME</div>
-        <input type="text" bind:value={shareUsername} placeholder="Enter username..." style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 12px; background: var(--color-surface);" />
-      </div>
-      <div>
-        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">ROLE</div>
-        <select bind:value={shareRole} style="border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 12px; background: var(--color-surface);">
-          <option value="viewer">VIEWER</option>
-          <option value="editor">EDITOR</option>
-          <option value="admin">ADMIN</option>
-        </select>
-      </div>
-      <button class="send-btn" style="font-size: 10px; padding: 6px 14px;" onclick={async () => { await shareProject(); await loadSharedUsers(); }}>+ ADD USER</button>
-    </div>
     {#if shareError}
       <div style="font-size: 11px; font-weight: 700; margin-bottom: 12px; color: {shareError === 'Shared!' ? 'var(--color-primary)' : 'var(--color-error)'};">{shareError}</div>
     {/if}
 
-    <!-- User list -->
+    <!-- Access list -->
     {#if sharedUsers.length > 0}
-      <div style="display: flex; flex-direction: column; gap: 8px;">
-        {#each sharedUsers as u}
-          <div class="ink-border" style="background: var(--color-surface-bright); padding: 12px 16px;">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-3">
-                <div style="background: var(--color-primary-container); color: var(--color-on-surface); width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 14px; border: 2px solid var(--color-on-surface);">
-                  {u.username.charAt(0).toUpperCase()}
-                </div>
-                <div>
-                  <div style="font-size: 13px; font-weight: 900;">{u.username}</div>
-                  <div style="font-size: 9px; color: var(--color-on-surface-dim); text-transform: uppercase;">
-                    Shared by {u.shared_by} &middot; {u.created_at?.slice(0, 10) || ''}
-                  </div>
-                </div>
-              </div>
-              <div class="flex items-center gap-2">
-                <select value={u.role || 'viewer'} onchange={async (e) => {
-                  const newRole = (e.target as HTMLSelectElement).value;
-                  await fetch(`/api/projects/${slug}/share?username=${encodeURIComponent(u.username)}&role=${newRole}`, { method: 'POST', headers: _h() });
-                  await loadSharedUsers();
-                }} style="border: 2px solid var(--color-on-surface); padding: 2px 6px; font-family: var(--font-family-display); font-size: 9px; font-weight: 700; text-transform: uppercase; background: var(--color-surface);">
-                  <option value="viewer">VIEWER</option>
-                  <option value="editor">EDITOR</option>
-                  <option value="admin">ADMIN</option>
-                </select>
-                <button class="feedback-btn" style="font-size: 9px; padding: 3px 10px; color: var(--color-error); border-color: var(--color-error);" onclick={() => unshareUser(u.username)}>REMOVE</button>
-              </div>
+      {#each sharedUsers as u}
+        <div class="flex items-center justify-between" style="padding: 10px 0; border-bottom: 1px solid var(--color-surface-dim);">
+          <div class="flex items-center gap-3">
+            <div style="background: var(--color-primary-container); color: var(--color-on-surface); width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 15px;">
+              {u.username.charAt(0).toUpperCase()}
+            </div>
+            <div>
+              <div style="font-size: 13px; font-weight: 900;">{u.username}</div>
+              <div style="font-size: 9px; color: var(--color-on-surface-dim);">{u.email || ''} · shared by {u.shared_by}</div>
             </div>
           </div>
-        {/each}
-      </div>
+          <div class="flex items-center gap-2">
+            <select value={u.role || 'viewer'} onchange={async (e) => {
+              const newRole = (e.target as HTMLSelectElement).value;
+              await fetch(`/api/projects/${slug}/share?username=${encodeURIComponent(u.username)}&role=${newRole}`, { method: 'POST', headers: _h() });
+              await loadSharedUsers();
+            }} style="border: 1px solid var(--color-surface-dim); padding: 3px 8px; font-family: var(--font-family-display); font-size: 9px; font-weight: 700; text-transform: uppercase; background: var(--color-surface); border-radius: 4px;">
+              <option value="viewer">READ</option>
+              <option value="editor">EDITOR</option>
+              <option value="admin">ADMIN</option>
+            </select>
+            <button onclick={() => unshareUser(u.username)} style="background: none; border: none; cursor: pointer; font-size: 16px; color: var(--color-on-surface-dim);">&times;</button>
+          </div>
+        </div>
+      {/each}
     {:else}
-      <div style="text-align: center; padding: 30px; color: var(--color-on-surface-dim); font-size: 12px;">
-        No users shared yet. Add a username above to share this project.
+      <div style="text-align: center; padding: 40px; color: var(--color-on-surface-dim); font-size: 12px;">
+        No users have access. Click + Add Access to share this project.
+      </div>
+    {/if}
+
+    <!-- Add Access Modal -->
+    {#if showAddAccess}
+      <div style="position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999; display: flex; align-items: center; justify-content: center;"
+        onclick={(e) => { if (e.target === e.currentTarget) showAddAccess = false; }}>
+        <div class="ink-border stamp-shadow" style="background: var(--color-surface); width: 420px; max-height: 500px; display: flex; flex-direction: column;">
+          <div class="dark-title-bar" style="padding: 10px 16px; display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 12px; font-weight: 900;">ADD ACCESS</span>
+            <button onclick={() => showAddAccess = false} style="background: none; border: none; color: var(--color-primary-container); cursor: pointer; font-size: 16px;">&times;</button>
+          </div>
+          <div style="padding: 12px 16px;">
+            <input type="text" bind:value={shareSearch} placeholder="Search users..." style="width: 100%; padding: 8px 12px; border: 1px solid var(--color-surface-dim); font-family: var(--font-family-display); font-size: 12px; background: var(--color-surface-bright); margin-bottom: 8px;" />
+            <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; color: var(--color-on-surface-dim); margin-bottom: 6px;">USERS</div>
+          </div>
+          <div style="flex: 1; overflow-y: auto; padding: 0 16px;">
+            {#each allUsers.filter(u => (!shareSearch || u.username.toLowerCase().includes(shareSearch.toLowerCase()) || (u.email || '').toLowerCase().includes(shareSearch.toLowerCase()))) as u}
+              {@const isShared = sharedUsers.some(s => s.username === u.username)}
+              <div class="flex items-center justify-between" style="padding: 8px 0; border-bottom: 1px solid var(--color-surface-dim); opacity: {isShared ? 0.5 : 1};">
+                <div class="flex items-center gap-3">
+                  <div style="background: {isShared ? 'var(--color-primary)' : 'var(--color-surface-dim)'}; color: {isShared ? 'white' : 'var(--color-on-surface)'}; width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 12px;">
+                    {u.username.charAt(0).toUpperCase()}
+                  </div>
+                  <div>
+                    <div style="font-size: 12px; font-weight: 700;">{u.username}</div>
+                    <div style="font-size: 9px; color: var(--color-on-surface-dim);">{u.email || ''}</div>
+                  </div>
+                </div>
+                {#if isShared}
+                  <span style="font-size: 8px; font-weight: 900; color: var(--color-primary);">✓ SHARED</span>
+                {:else}
+                  <button class="feedback-btn" style="font-size: 8px; padding: 3px 10px; font-weight: 900;" onclick={async () => {
+                    shareUsername = u.username;
+                    await shareProject();
+                    await loadSharedUsers();
+                    shareError = '';
+                  }}>ADD</button>
+                {/if}
+              </div>
+            {/each}
+          </div>
+          <div style="padding: 12px 16px; border-top: 1px solid var(--color-surface-dim); display: flex; justify-content: space-between; align-items: center;">
+            <div class="flex items-center gap-2">
+              <span style="font-size: 9px; font-weight: 700; text-transform: uppercase;">Role:</span>
+              <select bind:value={shareRole} style="border: 1px solid var(--color-surface-dim); padding: 3px 8px; font-family: var(--font-family-display); font-size: 10px; font-weight: 700; background: var(--color-surface-bright); border-radius: 4px;">
+                <option value="viewer">READ</option>
+                <option value="editor">EDITOR</option>
+                <option value="admin">ADMIN</option>
+              </select>
+            </div>
+            <button class="send-btn" style="font-size: 10px; padding: 6px 14px;" onclick={() => showAddAccess = false}>DONE</button>
+          </div>
+        </div>
       </div>
     {/if}
 

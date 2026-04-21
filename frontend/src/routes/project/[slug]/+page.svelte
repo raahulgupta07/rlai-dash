@@ -18,6 +18,10 @@
   const projectSlug = $derived(page.params.slug || '');
   let projectInfo = $state<any>(null);
 
+  // Role-based access
+  let userRole = $state<string>('viewer');
+  let canEdit = $derived(userRole === 'editor' || userRole === 'admin' || userRole === 'owner');
+
   interface ChatMessage {
     role: 'user' | 'assistant';
     content: string;
@@ -319,7 +323,7 @@
     // Load project info
     try {
       const res = await fetch(`/api/projects/${projectSlug}`, { headers: _headers() });
-      if (res.ok) projectInfo = await res.json();
+      if (res.ok) { projectInfo = await res.json(); userRole = projectInfo.user_role || 'owner'; }
     } catch {}
 
     const savedSession = localStorage.getItem(`dash_session_${projectSlug}`);
@@ -550,6 +554,7 @@
   let dashboardPanelOpen = $state(false);
   let activeDashboardId = $state<number | null>(null);
   let dashboardGenerating = $state(false);
+  let unsavedDashboardId = $state<number | null>(null);
 
   // Slide Agent panel
   let slidesPanelOpen = $state(false);
@@ -593,10 +598,28 @@
         const data = await res.json();
         if (data.dashboard_id) {
           activeDashboardId = data.dashboard_id;
+          unsavedDashboardId = data.dashboard_id;
         }
       }
     } catch {}
     dashboardGenerating = false;
+  }
+
+  async function discardDashboard() {
+    if (!unsavedDashboardId) return;
+    try {
+      await fetch(`/api/projects/${projectSlug}/dashboards/${unsavedDashboardId}`, {
+        method: 'DELETE',
+        headers: _headers()
+      });
+    } catch {}
+    activeDashboardId = null;
+    unsavedDashboardId = null;
+    dashboardPanelOpen = false;
+  }
+
+  function confirmDashboardSave() {
+    unsavedDashboardId = null;
   }
 
   async function generateSlides() {
@@ -1146,7 +1169,7 @@
   {/if}
 
   <!-- Dashboard panel toggle -->
-  <button class="panel-toggle-btn" class:panel-active={dashboardPanelOpen} onclick={() => { dashboardPanelOpen = !dashboardPanelOpen; if (!dashboardPanelOpen) activeDashboardId = null; }} title="Toggle dashboard panel">
+  <button class="panel-toggle-btn" class:panel-active={dashboardPanelOpen} onclick={() => { if (dashboardPanelOpen && unsavedDashboardId) { discardDashboard(); } else { dashboardPanelOpen = !dashboardPanelOpen; if (!dashboardPanelOpen) activeDashboardId = null; } }} title="Toggle dashboard panel">
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="0"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="9" y1="9" x2="21" y2="9"/></svg>
     DASH
   </button>
@@ -1728,7 +1751,7 @@
           {#if workflowPickerOpen}
             <div class="mode-dropdown" style="min-width: 280px;">
               <!-- Save current chat as workflow -->
-              {#if messages.filter(m => m.role === 'user').length >= 1}
+              {#if canEdit && messages.filter(m => m.role === 'user').length >= 1}
                 <button class="mode-dropdown-item" onclick={() => { workflowPickerOpen = false; openWorkflowSave(); }} style="border-bottom: 2px solid var(--color-on-surface-dim);">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
                   <div>
@@ -2213,8 +2236,11 @@
       dashboardId={activeDashboardId}
       projectSlug={projectSlug}
       generating={dashboardGenerating}
-      onClose={() => { dashboardPanelOpen = false; activeDashboardId = null; }}
+      unsavedId={unsavedDashboardId}
+      onClose={() => { if (unsavedDashboardId) { discardDashboard(); } else { dashboardPanelOpen = false; activeDashboardId = null; } }}
       onSelectDashboard={(id) => { activeDashboardId = id || null; }}
+      onSave={confirmDashboardSave}
+      onDiscard={discardDashboard}
     />
   {/if}
 </div>

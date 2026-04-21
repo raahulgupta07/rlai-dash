@@ -47,7 +47,7 @@
     if (activeFilter === 'mine') return projects;
     if (activeFilter === 'favorites') return projects.filter(p => p.is_favorite);
     if (activeFilter === 'shared') return [];
-    return projects;
+    return [...projects, ...sharedProjects];
   });
 
   const allCount = $derived(projects.length + sharedProjects.length);
@@ -262,18 +262,20 @@
               <a href="/ui/project/{p.slug}" style="flex: 1; padding: 10px; text-align: center; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; text-decoration: none; color: var(--color-on-surface); background: var(--color-primary-container); border-right: 2px solid var(--color-on-surface);">
                 CHAT
               </a>
-              <a href="/ui/project/{p.slug}/settings" style="flex: 1; padding: 10px; text-align: center; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; text-decoration: none; color: var(--color-on-surface); border-right: 2px solid var(--color-on-surface);">
-                SETTINGS
-              </a>
-              <button onclick={() => { deleteTarget = p; deleteTypedName = ''; }} style="padding: 10px 14px; background: none; border: none; cursor: pointer; color: var(--color-error); font-size: 11px; font-weight: 900;">
-                ✕
-              </button>
+              {#if !p.shared_by}
+                <a href="/ui/project/{p.slug}/settings" style="flex: 1; padding: 10px; text-align: center; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; text-decoration: none; color: var(--color-on-surface); border-right: 2px solid var(--color-on-surface);">
+                  SETTINGS
+                </a>
+                <button onclick={() => { deleteTarget = p; deleteTypedName = ''; }} style="padding: 10px 14px; background: none; border: none; cursor: pointer; color: var(--color-error); font-size: 11px; font-weight: 900;">
+                  ✕
+                </button>
+              {/if}
             </div>
           </div>
         {/each}
 
-        <!-- Empty state / create card -->
-        {#if projects.length === 0}
+        <!-- Empty state / create card (only when NO projects at all, including shared) -->
+        {#if projects.length === 0 && sharedProjects.length === 0}
           <div class="ink-border" style="background: var(--color-surface); padding: 40px 24px; text-align: center; border-style: dashed; grid-column: 1 / -1;">
             <div style="margin-bottom: 12px; display: flex; justify-content: center;">{@html defaultIcon.replace('width="24"', 'width="36"').replace('height="24"', 'height="36"')}</div>
             <div style="font-size: 16px; font-weight: 900; text-transform: uppercase; margin-bottom: 8px;">No agents yet</div>

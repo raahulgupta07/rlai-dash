@@ -8,11 +8,16 @@
     dashboardId: number | null;
     projectSlug: string;
     generating?: boolean;
+    unsavedId?: number | null;
     onClose: () => void;
     onSelectDashboard: (id: number) => void;
+    onSave?: () => void;
+    onDiscard?: () => void;
   }
 
-  let { dashboardId, projectSlug, generating = false, onClose, onSelectDashboard }: Props = $props();
+  let { dashboardId, projectSlug, generating = false, unsavedId = null, onClose, onSelectDashboard, onSave, onDiscard }: Props = $props();
+
+  let isUnsaved = $derived(unsavedId != null && dashboardId === unsavedId);
 
   let dashboard = $state<any>(null);
   let dashboards = $state<any[]>([]);
@@ -109,12 +114,18 @@
       <span class="panel-header-title">
         {dashboard ? dashboard.name : 'DASHBOARDS'}
       </span>
+      {#if dashboard && isUnsaved}
+        <span style="font-size: 8px; padding: 1px 5px; background: #F0A030; color: #000; font-weight: 900; letter-spacing: 0.06em;">PREVIEW</span>
+      {/if}
       {#if dashboard}
         <span style="font-size: 9px; opacity: 0.6;">{dashboard.widgets?.length || 0} widgets</span>
       {/if}
     </div>
     <div style="display: flex; align-items: center; gap: 6px;">
-      {#if dashboard}
+      {#if dashboard && isUnsaved}
+        <button onclick={onSave} style="background: #00a86b; color: white; border: none; padding: 3px 8px; font-family: var(--font-family-display); font-size: 8px; font-weight: 900; text-transform: uppercase; cursor: pointer; letter-spacing: 0.06em;">SAVE</button>
+        <button onclick={onDiscard} style="background: #cc3333; color: white; border: none; padding: 3px 8px; font-family: var(--font-family-display); font-size: 8px; font-weight: 900; text-transform: uppercase; cursor: pointer; letter-spacing: 0.06em;">DISCARD</button>
+      {:else if dashboard}
         <button onclick={exportPptx} style="background: var(--color-primary); color: white; border: none; padding: 3px 8px; font-family: var(--font-family-display); font-size: 8px; font-weight: 900; text-transform: uppercase; cursor: pointer; letter-spacing: 0.06em;">EXPORT</button>
         <button onclick={() => window.location.href = `/ui/project/${projectSlug}/dashboard`} style="background: var(--color-secondary); color: white; border: none; padding: 3px 8px; font-family: var(--font-family-display); font-size: 8px; font-weight: 900; text-transform: uppercase; cursor: pointer; letter-spacing: 0.06em;">FULL VIEW</button>
       {/if}
@@ -168,14 +179,14 @@
                 <div style="height: 200px;">
                   <EChartView headers={['Label', 'Value']} rows={widget.config.data.labels.map((l, i) => [l, String(widget.config.data.values[i] ?? 0)])} chartType={widget.chartType || 'bar'} />
                 </div>
-              {:else if widget.type === 'chart' && widget.headers && widget.rows}
+              {:else if widget.type === 'chart' && widget.headers && widget.rows && widget.rows.length > 0}
                 <div style="display: flex; gap: 0; margin-bottom: 4px;">
                   {#each ['bar', 'line', 'pie', 'scatter', 'area'] as ct}
                     <button class="chart-type-btn" class:chart-type-btn-active={(widget.chartType || 'bar') === ct} onclick={() => changeChartType(wi, ct)} style="font-size: 8px; padding: 2px 6px;">{ct.toUpperCase()}</button>
                   {/each}
                 </div>
                 <div style="height: 200px;">
-                  <EChartView headers={widget.headers} rows={widget.rows} chartType={widget.chartType || 'bar'} />
+                  <EChartView headers={widget.headers} rows={widget.rows.map((r: any[]) => r.map((c: any) => String(c ?? '')))} chartType={widget.chartType || 'bar'} />
                 </div>
               {:else if widget.type === 'metric'}
                 <div style="text-align: center; padding: 12px;">
@@ -245,7 +256,12 @@
   </div>
 
   <!-- Bottom actions (when viewing a dashboard) -->
-  {#if dashboard}
+  {#if dashboard && isUnsaved}
+    <div class="panel-actions" style="display: flex; gap: 6px;">
+      <button class="feedback-btn" onclick={onSave} style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px; background: #00a86b; color: #fff; border: none;">SAVE</button>
+      <button class="feedback-btn" onclick={onDiscard} style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px; background: #cc3333; color: #fff; border: none;">DISCARD</button>
+    </div>
+  {:else if dashboard}
     <div class="panel-actions">
       <button class="feedback-btn" onclick={exportPptx} style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;">EXPORT PPTX</button>
       <button class="feedback-btn" onclick={() => window.location.href = `/ui/project/${projectSlug}/dashboard`} style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;">OPEN FULL VIEW</button>

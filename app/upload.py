@@ -2666,6 +2666,14 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
     """Upload a data file. action: auto/append/upsert/replace/new"""
     user_id = _get_user_id(request)
 
+    # Editor role required for uploads
+    from app.auth import check_project_permission
+    user = getattr(getattr(request, 'state', None), 'user', None)
+    if project and user:
+        perm = check_project_permission(user, project, required_role="editor")
+        if not perm:
+            raise HTTPException(403, "Editor access required to upload")
+
     if not file.filename:
         raise HTTPException(400, "No filename provided")
 
@@ -3127,6 +3135,14 @@ def get_dashboard(request: Request):
 @router.post("/upload-doc")
 async def upload_document(request: Request, file: UploadFile, project: str | None = None):
     """Upload a code/doc file to project or global knowledge base."""
+    # Editor role required for doc uploads
+    from app.auth import check_project_permission
+    user = getattr(getattr(request, 'state', None), 'user', None)
+    if project and user:
+        perm = check_project_permission(user, project, required_role="editor")
+        if not perm:
+            raise HTTPException(403, "Editor access required to upload")
+
     if not file.filename:
         raise HTTPException(400, "No filename provided")
 
@@ -3851,6 +3867,12 @@ def retrain_project(slug: str, request: Request):
     user = getattr(getattr(request, 'state', None), 'user', None)
     if not user:
         raise HTTPException(401, "Not authenticated")
+
+    # Editor role required for retraining
+    from app.auth import check_project_permission
+    perm = check_project_permission(user, slug, required_role="editor")
+    if not perm:
+        raise HTTPException(403, "Editor access required to retrain")
 
     from db.session import create_project_schema
     schema = create_project_schema(slug)

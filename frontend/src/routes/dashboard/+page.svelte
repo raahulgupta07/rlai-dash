@@ -237,13 +237,20 @@
                       <button class="chart-type-btn" class:chart-type-btn-active={(widget.chartType || 'bar') === ct} onclick={() => { const w = [...activeDashboard.widgets]; w[wi] = { ...w[wi], chartType: ct }; activeDashboard = { ...activeDashboard, widgets: w }; }}>{ct.toUpperCase()}</button>
                     {/each}
                   </div>
-                  <div style="height: 280px;"><EChartView headers={widget.headers} rows={widget.rows} chartType={widget.chartType || 'bar'} /></div>
+                  <div style="height: 280px;"><EChartView headers={widget.headers} rows={(widget.rows || []).map((r: any[]) => r.map((c: any) => String(c ?? '')))} chartType={widget.chartType || 'bar'} /></div>
                   <details style="margin-top: 8px;">
                     <summary style="font-size: 9px; font-weight: 700; text-transform: uppercase; cursor: pointer; color: var(--color-on-surface-dim);">VIEW DATA ({widget.rows?.length} rows)</summary>
                     <div style="overflow-x: auto; margin-top: 6px;"><table class="data-table" style="font-size: 10px;"><thead><tr>{#each widget.headers as h}<th style="padding: 4px 8px;">{h}</th>{/each}</tr></thead><tbody>{#each widget.rows as row}<tr>{#each row as cell}<td style="padding: 3px 8px;">{cell}</td>{/each}</tr>{/each}</tbody></table></div>
                   </details>
                 {:else if widget.type === 'metric'}
                   <div style="text-align: center; padding: 20px;"><div style="font-size: 36px; font-weight: 900; color: var(--color-primary);">{widget.content || '0'}</div></div>
+                {:else if widget.type === 'table' && widget.headers && widget.rows}
+                  <div style="overflow-x: auto;">
+                    <table class="data-table" style="font-size: 11px; width: 100%;">
+                      <thead><tr>{#each widget.headers as h}<th style="padding: 6px 10px;">{h}</th>{/each}</tr></thead>
+                      <tbody>{#each widget.rows as row}<tr>{#each row as cell}<td style="padding: 5px 10px;">{cell}</td>{/each}</tr>{/each}</tbody>
+                    </table>
+                  </div>
                 {:else}
                   <div class="prose-chat">{@html markdownToHtml(widget.content || '')}</div>
                 {/if}

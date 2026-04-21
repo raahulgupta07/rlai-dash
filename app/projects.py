@@ -291,12 +291,24 @@ def shared_with_me(request: Request):
     user = _get_user(request)
     with _engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT p.id, p.slug, p.name, p.agent_name, p.agent_role, p.schema_name, p.created_at, s.shared_by
+            SELECT p.id, p.slug, p.name, p.agent_name, p.agent_role, p.schema_name, p.created_at, s.shared_by, p.updated_at
             FROM public.dash_projects p
             JOIN public.dash_project_shares s ON s.project_id = p.id
             WHERE s.shared_with_user_id = :uid
             ORDER BY s.created_at DESC
         """), {"uid": user["user_id"]}).fetchall()
+
+    # Get last_trained for shared projects
+    last_trained_map: dict[str, str] = {}
+    with _engine.connect() as conn:
+        slugs = [r[1] for r in rows]
+        if slugs:
+            for sl in slugs:
+                tr = conn.execute(text(
+                    "SELECT finished_at FROM public.dash_training_runs WHERE project_slug = :s AND status = 'done' ORDER BY finished_at DESC LIMIT 1"
+                ), {"s": sl}).fetchone()
+                if tr and tr[0]:
+                    last_trained_map[sl] = str(tr[0])
 
     insp = inspect(_engine)
     projects = []
@@ -320,6 +332,8 @@ def shared_with_me(request: Request):
             "id": r[0], "slug": r[1], "name": r[2], "agent_name": r[3], "agent_role": r[4],
             "tables": tables, "rows": total_rows, "shared_by": r[7],
             "created_at": str(r[6]) if r[6] else None,
+            "updated_at": str(r[8]) if r[8] else str(r[6]) if r[6] else None,
+            "last_trained": last_trained_map.get(r[1]),
         })
     return {"projects": projects}
 
@@ -363,10 +377,13 @@ def get_project(slug: str, request: Request):
     if not row:
         raise HTTPException(404, "Project not found")
 
-    # Check ownership (or super admin)
-    from app.auth import SUPER_ADMIN
-    if row[9] != user["user_id"] and user.get("username") != SUPER_ADMIN:
-        raise HTTPException(403, "Not your project")
+    # Check access via permission system (supports owner, shared users, super_admin)
+    from app.auth import check_project_permission
+    perm = check_project_permission(user, slug)
+    if not perm:
+        raise HTTPException(403, "No access to this project")
+
+    user_role = perm["role"]  # "owner", "viewer", "editor", or "admin"
 
     return {
         "id": row[0], "slug": row[1], "name": row[2],
@@ -374,6 +391,7 @@ def get_project(slug: str, request: Request):
         "schema_name": row[6],
         "created_at": str(row[7]) if row[7] else None,
         "updated_at": str(row[8]) if row[8] else None,
+        "user_role": user_role,
     }
 
 
@@ -390,9 +408,12 @@ def delete_project(slug: str, request: Request):
         if not row:
             raise HTTPException(404, "Project not found")
 
-        from app.auth import SUPER_ADMIN
+        # Only owner or admin can delete
+        from app.auth import SUPER_ADMIN, check_project_permission
         if row[2] != user["user_id"] and user.get("username") != SUPER_ADMIN:
-            raise HTTPException(403, "Not your project")
+            perm = check_project_permission(user, slug, required_role="admin")
+            if not perm:
+                raise HTTPException(403, "Admin access required to delete project")
 
         schema = row[1]
 
@@ -461,9 +482,12 @@ def share_project(slug: str, username: str, request: Request, role: str = "viewe
         proj = conn.execute(text("SELECT id, user_id FROM public.dash_projects WHERE slug = :s"), {"s": slug}).fetchone()
         if not proj:
             raise HTTPException(404, "Project not found")
-        from app.auth import SUPER_ADMIN
+        # Only owner or admin can share
+        from app.auth import SUPER_ADMIN, check_project_permission
         if proj[1] != user["user_id"] and user.get("username") != SUPER_ADMIN:
-            raise HTTPException(403, "Not your project")
+            perm = check_project_permission(user, slug, required_role="admin")
+            if not perm:
+                raise HTTPException(403, "Admin access required to share project")
         target = conn.execute(text("SELECT id FROM public.dash_users WHERE username = :u"), {"u": username}).fetchone()
         if not target:
             raise HTTPException(404, f"User '{username}' not found")
