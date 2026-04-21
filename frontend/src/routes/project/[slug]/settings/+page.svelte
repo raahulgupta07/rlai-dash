@@ -41,6 +41,10 @@
   let knowledgeFiles = $state<any[]>([]);
   let workflows = $state<any[]>([]);
 
+  // Agents
+  let agentsData = $state<any>(null);
+  async function loadAgents() { try { const r = await fetch(`/api/projects/${slug}/agents`, { headers: _h() }); if (r.ok) agentsData = await r.json(); } catch {} }
+
   // Doc-to-workflow
   let docToWorkflowLoading = $state<string | null>(null);
   let docWorkflowPreview = $state<any>(null);
@@ -170,10 +174,10 @@
       case 'training': return String((training?.learnings || 0) + (training?.training_qa?.length || 0) + brainFeedback.length + brainPatterns.length + brainMemories.length);
       case 'evals': return String(brainEvals.length);
       case 'docs': return String(docs.length);
-      case 'queries': return String(knowledgeFiles.filter((f: any) => f.type === 'queries').length);
-      case 'lineage': return String(lineage?.relationships?.length || 0);
+      case 'queries': return String(brainPatterns.length || knowledgeFiles.filter((f: any) => f.type === 'queries').length);
+      case 'lineage': return String([...(lineage?.relationships || []), ...relationships].length);
       case 'rules': return String(rules.length);
-      case 'agents': return '3';
+      case 'agents': return String(agentsData?.agents?.length || 4);
       case 'workflows': return String(workflows.length);
       case 'schedules': return String(schedules.length);
       case 'users': return String(sharedUsers.length);
@@ -203,7 +207,7 @@
         const qCount = knowledgeFiles.filter((f: any) => f.type === 'queries').length;
         return qCount > 2 ? 'complete' : qCount > 0 ? 'partial' : 'empty';
       }
-      case 'lineage': return (lineage?.relationships?.length || 0) > 2 ? 'complete' : (lineage?.relationships?.length || 0) > 0 ? 'partial' : 'empty';
+      case 'lineage': { const _lc = [...(lineage?.relationships || []), ...relationships].length; return _lc > 2 ? 'complete' : _lc > 0 ? 'partial' : 'empty'; }
       case 'rules': return rules.length > 3 ? 'complete' : rules.length > 0 ? 'partial' : 'empty';
       case 'agents': return evolvedInstructions.current ? 'complete' : 'partial';
       case 'workflows': return workflows.length > 2 ? 'complete' : workflows.length > 0 ? 'partial' : 'empty';
@@ -229,7 +233,7 @@
   }
 
   onMount(async () => {
-    await Promise.all([loadDetail(), loadLineage(), loadTraining(), loadDocs(), loadKnowledgeFiles(), loadWorkflows(), loadRules(), loadSuggestedRules(), loadSchedules(), loadSharedUsers(), loadPersona(), loadBrainData(), loadTrainingRuns(), loadDriftAlerts(), loadRelationships(), loadInsights(), loadPreferences(), loadMetaLearnings(), loadConsolidationStatus(), loadEvolvedInstructions(), loadResourceRegistry(), loadEvolutionHistory(), loadQueryPlans(), loadEvalHistory(), loadTransferCandidates()]);
+    await Promise.all([loadDetail(), loadLineage(), loadTraining(), loadDocs(), loadKnowledgeFiles(), loadWorkflows(), loadRules(), loadSuggestedRules(), loadSchedules(), loadSharedUsers(), loadPersona(), loadBrainData(), loadTrainingRuns(), loadDriftAlerts(), loadRelationships(), loadInsights(), loadPreferences(), loadMetaLearnings(), loadConsolidationStatus(), loadEvolvedInstructions(), loadResourceRegistry(), loadEvolutionHistory(), loadQueryPlans(), loadEvalHistory(), loadTransferCandidates(), loadAgents()]);
     loading = false;
     // Auto-load first table details
     if (detail?.tables?.length) {
@@ -339,6 +343,10 @@
   // Train ALL stepper
   let isTraining = $state(false);
   let trainSteps = $state<{name: string; status: 'pending'|'active'|'done'|'error'}[]>([]);
+  let trainCurrentTable = $state('');
+  let trainTableIndex = $state(0);
+  let trainTotalTables = $state(0);
+  let trainCurrentStepName = $state('');
   let trainPollTimer: ReturnType<typeof setInterval> | null = null;
 
   const TRAIN_STEP_MAP: Record<string, number> = {
@@ -368,6 +376,7 @@
       if (trainPollTimer) { clearInterval(trainPollTimer); trainPollTimer = null; }
       isTraining = false;
       trainSteps = trainSteps.map(s => s.status === 'active' ? { ...s, status: 'error' as any } : s.status === 'pending' ? { ...s, status: 'error' as any } : s);
+      trainCurrentTable = ''; trainTableIndex = 0; trainTotalTables = 0; trainCurrentStepName = '';
       await Promise.all([loadDetail(), loadBrainData(), loadTrainingRuns()]);
     } catch {}
   }
@@ -407,8 +416,23 @@
           const runs = d.runs || [];
           if (runs.length > 0) {
             const latest = runs[0];
-            const step = latest.steps || '';
-            if (step !== trainLastStep) { trainLastUpdate = Date.now(); trainLastStep = step; }
+            const rawStep = latest.steps || '';
+            // Parse enhanced format: "step_name|table_name|table_index|total_tables"
+            let step = rawStep;
+            if (rawStep.includes('|')) {
+              const parts = rawStep.split('|');
+              step = parts[0];
+              trainCurrentTable = parts[1] || '';
+              trainTableIndex = parseInt(parts[2] || '0', 10);
+              trainTotalTables = parseInt(parts[3] || '0', 10);
+              trainCurrentStepName = step.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+            } else {
+              trainCurrentTable = '';
+              trainTableIndex = 0;
+              trainTotalTables = 0;
+              trainCurrentStepName = '';
+            }
+            if (rawStep !== trainLastStep) { trainLastUpdate = Date.now(); trainLastStep = rawStep; }
             const activeIdx = mapBackendStep(step);
 
             trainSteps = trainSteps.map((s, i) => ({
@@ -432,6 +456,7 @@
               if (trainPollTimer) { clearInterval(trainPollTimer); trainPollTimer = null; }
               cLog(`${ts()} ── ✓ training complete`);
               isTraining = false;
+              trainCurrentTable = ''; trainTableIndex = 0; trainTotalTables = 0; trainCurrentStepName = '';
 
               // Reload data immediately so UI updates
               await Promise.all([loadDetail(), loadRules(), loadSuggestedRules(), loadBrainData(), loadTrainingRuns(), loadWorkflows(), loadDocs()]);
@@ -632,7 +657,13 @@
       if (filesToUpload.length > 1) cLog(`${ts()} │  uploading ${fi + 1}/${filesToUpload.length}: ${currentFile.name}`);
 
       try {
-        const res = await fetch(`/api/upload?project=${slug}&action=${uploadAction}`, { method: 'POST', body: fd, headers: _h() });
+        // Route doc files to upload-doc endpoint, data files to upload endpoint
+        const ext = currentFile.name.split('.').pop()?.toLowerCase() || '';
+        const isDoc = ['pptx', 'docx', 'pdf', 'md', 'txt', 'sql', 'py'].includes(ext);
+        const uploadUrl = isDoc
+          ? `/api/upload-doc?project=${slug}`
+          : `/api/upload?project=${slug}&action=${uploadAction}`;
+        const res = await fetch(uploadUrl, { method: 'POST', body: fd, headers: _h() });
         if (!res.ok) {
           const e = await res.json().catch(() => ({ detail: 'Failed' }));
           if (res.status === 409 && e.detail?.match && filesToUpload.length === 1) {
@@ -679,6 +710,9 @@
     if (uploadResults.length === 0 && !uploadResult) {
       uploadError = 'All files failed to upload';
       uploadSteps = uploadSteps.map((s: any) => s.status === 'pending' ? { ...s, status: 'error' } : s);
+    } else {
+      // Auto-hide upload panel after success (with delay so user sees result)
+      setTimeout(() => { showUpload = false; selectedFile = null; selectedFiles = []; }, 3000);
     }
     uploading = false;
   }
@@ -759,11 +793,11 @@
   <div style="margin-bottom: 12px; padding: 10px 14px; border: 2px solid var(--color-on-surface); background: var(--color-surface-bright); font-family: var(--font-family-display);">
     <div style="display: flex; align-items: center; gap: 10px;">
       <div style="flex: 1; height: 4px; background: var(--color-surface-dim); border: 1px solid var(--color-on-surface-dim);">
-        <div style="height: 100%; background: var(--color-primary); width: {trainSteps.length > 0 ? Math.round((trainSteps.filter(s => s.status === 'done').length / trainSteps.length) * 100) : 0}%; transition: width 0.5s ease;"></div>
+        <div style="height: 100%; background: var(--color-primary); width: {trainSteps.length > 0 ? (trainTotalTables > 0 ? Math.min(100, Math.round((((trainTableIndex - 1) * trainSteps.length + trainSteps.filter(s => s.status === 'done').length) / (trainTotalTables * trainSteps.length)) * 100)) : Math.round((trainSteps.filter(s => s.status === 'done').length / trainSteps.length) * 100)) : 0}%; transition: width 0.5s ease;"></div>
       </div>
-      <span style="font-size: 10px; font-weight: 900;">{trainSteps.length > 0 ? Math.round((trainSteps.filter(s => s.status === 'done').length / trainSteps.length) * 100) : 0}%</span>
+      <span style="font-size: 10px; font-weight: 900;">{trainSteps.length > 0 ? (trainTotalTables > 0 ? Math.min(100, Math.round((((trainTableIndex - 1) * trainSteps.length + trainSteps.filter(s => s.status === 'done').length) / (trainTotalTables * trainSteps.length)) * 100)) : Math.round((trainSteps.filter(s => s.status === 'done').length / trainSteps.length) * 100)) : 0}%</span>
       {#if trainSteps.find(s => s.status === 'active')}
-        <span style="font-size: 9px; color: var(--color-warning); font-weight: 900;">● {trainSteps.find(s => s.status === 'active')?.name}</span>
+        <span style="font-size: 9px; color: var(--color-warning); font-weight: 900;">● {trainTotalTables > 0 ? `Table ${trainTableIndex}/${trainTotalTables}: ${trainCurrentTable} · ` : ''}{trainSteps.find(s => s.status === 'active')?.name}</span>
       {/if}
     </div>
   </div>
@@ -816,7 +850,8 @@
     {#if isTraining && trainSteps.length > 0}
       {@const doneCount = trainSteps.filter(s => s.status === 'done').length}
       {@const activeStep = trainSteps.find(s => s.status === 'active')}
-      {@const pct = Math.round((doneCount / trainSteps.length) * 100)}
+      {@const stepsPerTable = trainSteps.length}
+      {@const pct = trainTotalTables > 0 ? Math.min(100, Math.round((((trainTableIndex - 1) * stepsPerTable + doneCount) / (trainTotalTables * stepsPerTable)) * 100)) : Math.round((doneCount / trainSteps.length) * 100)}
       <div class="ink-border" style="padding: 10px 14px; margin-bottom: 16px; background: var(--color-surface-bright);">
         <!-- Progress bar -->
         <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
@@ -827,7 +862,7 @@
         </div>
         <!-- Current step label -->
         {#if activeStep}
-          <div style="font-size: 10px; color: var(--color-warning); font-weight: 900; margin-bottom: 6px;">● {activeStep.name}...</div>
+          <div style="font-size: 10px; color: var(--color-warning); font-weight: 900; margin-bottom: 6px;">● {trainTotalTables > 0 ? `Table ${trainTableIndex}/${trainTotalTables}: ${trainCurrentTable} · ${activeStep.name}` : activeStep.name}...</div>
         {/if}
         <!-- Step badges -->
         <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center;">
@@ -837,6 +872,21 @@
           </span>
         {/each}
         </div>
+        <!-- Table progress list -->
+        {#if trainTotalTables > 0 && detail?.tables?.length > 0}
+          <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--color-on-surface-dim);">
+            <div style="font-size: 8px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-on-surface-dim); margin-bottom: 4px;">TABLE PROGRESS</div>
+            {#each detail.tables as t, i}
+              {@const tableNum = i + 1}
+              {@const isDone = tableNum < trainTableIndex}
+              {@const isActive = tableNum === trainTableIndex}
+              {@const isPending = tableNum > trainTableIndex}
+              <div style="font-size: 9px; font-weight: 700; font-family: var(--font-family-display); padding: 1px 0; color: {isDone ? 'var(--color-primary)' : isActive ? 'var(--color-warning)' : 'var(--color-on-surface-dim)'};">
+                {isDone ? '✓' : isActive ? '●' : '○'} {t.name} · {isDone ? 'done' : isActive ? trainCurrentStepName : 'pending'}
+              </div>
+            {/each}
+          </div>
+        {/if}
       </div>
     {/if}
 
@@ -1048,7 +1098,9 @@
             </div>
           {/if}
 
-          <button class="send-btn" onclick={doUpload} disabled={uploading} style="margin-top: 10px; padding: 8px 14px; font-size: 11px; width: 100%;">{uploading ? 'UPLOADING...' : selectedFiles.length > 1 ? `▶ UPLOAD ${selectedFiles.length} FILES` : '▶ UPLOAD'}</button>
+          {#if !uploadResult && uploadResults.length === 0}
+            <button class="send-btn" onclick={doUpload} disabled={uploading} style="margin-top: 10px; padding: 8px 14px; font-size: 11px; width: 100%;">{uploading ? 'UPLOADING...' : selectedFiles.length > 1 ? `▶ UPLOAD ${selectedFiles.length} FILES` : '▶ UPLOAD'}</button>
+          {/if}
         {/if}
 
         {#if uploadSteps.length > 0}
@@ -1922,25 +1974,60 @@
       <div class="cli-line">
         <span class="cli-prompt">$</span>
         <span class="cli-command">dash queries</span>
-        <span class="cli-output">--saved</span>
-        <span class="cli-dim" style="margin-left: auto;">{knowledgeFiles.filter((f: any) => f.type === 'queries').length} patterns</span>
+        <span class="cli-output">--all</span>
+        <span class="cli-dim" style="margin-left: auto;">{brainPatterns.length} patterns · {queryPlans.length} join strategies</span>
       </div>
     </div>
-    <div style="font-size: 18px; font-weight: 900; text-transform: uppercase; margin-bottom: 16px;">Saved Queries</div>
-    {#each knowledgeFiles.filter(f => f.type === 'queries') as f}
-      {#await fetch(`/api/knowledge-file-content/${f.name}?project=${slug}&subdir=queries`, { headers: _h() }).then(r => r.json()) then data}
-        {#if data.content}
-          <div class="ink-border mb-3" style="background: var(--color-surface);">
-            <div class="dark-title-bar" style="padding: 6px 12px; font-size: 10px;">{f.name}</div>
-            <pre style="padding: 12px; font-size: 11px; font-family: 'Space Grotesk', monospace; overflow-x: auto; background: var(--color-on-surface); color: var(--color-primary-container); margin: 0; white-space: pre-wrap;">{data.content}</pre>
-          </div>
-        {/if}
-      {/await}
-    {:else}<div style="font-size: 12px; color: var(--color-on-surface-dim);">No saved queries yet. Upload data and the agent will auto-generate SQL patterns.</div>{/each}
+
+    <!-- Proven Query Patterns from DB -->
+    <div style="font-size: 18px; font-weight: 900; text-transform: uppercase; margin-bottom: 16px;">Query Patterns ({brainPatterns.length})</div>
+    {#if brainPatterns.length > 0}
+      <div style="overflow-x: auto; margin-bottom: 20px;">
+        <table class="data-table" style="font-size: 11px; width: 100%;">
+          <thead>
+            <tr>
+              <th style="text-align: left;">QUESTION</th>
+              <th>TABLES</th>
+              <th>USES</th>
+              <th>SOURCE</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each brainPatterns as p}
+              <tr>
+                <td style="max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{p.question || p.sql?.slice(0, 60)}</td>
+                <td style="text-align: center; font-size: 10px;">{p.tables_used || '—'}</td>
+                <td style="text-align: center;">{p.uses || 1}</td>
+                <td style="text-align: center;">
+                  <span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: {p.source === 'training' ? 'var(--color-warning)' : p.source === 'sql_file' ? '#6366f1' : 'var(--color-primary)'}; color: white; text-transform: uppercase;">{p.source || 'user'}</span>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {:else}
+      <div style="font-size: 12px; color: var(--color-on-surface-dim); margin-bottom: 20px;">No query patterns yet. Train the agent or chat to auto-generate SQL patterns.</div>
+    {/if}
+
+    <!-- File-based saved queries -->
+    {#if knowledgeFiles.filter(f => f.type === 'queries').length > 0}
+      <div style="font-size: 13px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">SAVED SQL FILES</div>
+      {#each knowledgeFiles.filter(f => f.type === 'queries') as f}
+        {#await fetch(`/api/knowledge-file-content/${f.name}?project=${slug}&subdir=queries`, { headers: _h() }).then(r => r.json()) then data}
+          {#if data.content}
+            <div class="ink-border mb-3" style="background: var(--color-surface);">
+              <div class="dark-title-bar" style="padding: 6px 12px; font-size: 10px;">{f.name}</div>
+              <pre style="padding: 12px; font-size: 11px; font-family: 'Space Grotesk', monospace; overflow-x: auto; background: var(--color-on-surface); color: var(--color-primary-container); margin: 0; white-space: pre-wrap;">{data.content}</pre>
+            </div>
+          {/if}
+        {/await}
+      {/each}
+    {/if}
 
     <!-- Query Plan Memory -->
     {#if queryPlans.length > 0}
-      <div style="margin-top: 20px; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">PROVEN JOIN STRATEGIES (auto-learned)</div>
+      <div style="margin-top: 16px; font-size: 13px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">PROVEN JOIN STRATEGIES</div>
       <div style="overflow-x: auto;">
         <table class="data-table" style="font-size: 10px;">
           <thead><tr><th>TABLES</th><th>JOIN STRATEGY</th><th>FILTERS</th><th>STATUS</th></tr></thead>
@@ -2019,29 +2106,69 @@
       {/if}
     {/if}
 
-    <!-- Relationship Details List -->
+    <!-- CLI Terminal Header -->
+    {@const fkRels = lineage?.relationships || []}
+    {@const aiRels = relationships}
+    {@const allRelsLineage = [...fkRels, ...aiRels]}
     <div style="font-size: 13px; font-weight: 900; text-transform: uppercase; margin-bottom: 8px;">Relationships</div>
     <div class="cli-terminal" style="margin-bottom: 16px; padding: 10px 14px;">
       <div class="cli-line">
         <span class="cli-prompt">$</span>
         <span class="cli-command">dash lineage</span>
-        <span class="cli-output">--scan</span>
-        <span class="cli-dim" style="margin-left: auto;">{[...(lineage?.relationships || []), ...relationships].length} relationships</span>
+        <span class="cli-output">--discover</span>
       </div>
-      {#each [...(lineage?.relationships || []), ...relationships] as rel}
-        <div class="cli-line">
-          <span style="color: #555;">&gt;</span>
-          <span class="cli-command">{rel.from_table}.{rel.from_column}</span>
-          <span class="cli-info">→</span>
-          <span class="cli-command">{rel.to_table}.{rel.to_column}</span>
-          {#if rel.confidence}<span class="cli-dim" style="margin-left: auto;">{Math.round((rel.confidence || 0) * 100)}%</span>{/if}
-          {#if rel.source === 'ai'}<span style="color: #00fc40; font-size: 8px; margin-left: 4px;">AI</span>{/if}
-        </div>
-      {/each}
-      {#if [...(lineage?.relationships || []), ...relationships].length === 0}
-        <div class="cli-line"><span class="cli-dim">No relationships found. Train your data to discover connections.</span></div>
-      {/if}
+      <div class="cli-line">
+        <span style="color: #555;">&gt;</span>
+        <span class="cli-dim">{fkRels.length} FK relationships (SQL introspection)</span>
+      </div>
+      <div class="cli-line">
+        <span style="color: #555;">&gt;</span>
+        <span class="cli-dim">{aiRels.length} AI-discovered relationships</span>
+      </div>
+      <div class="cli-line">
+        <span style="color: #555;">&gt;</span>
+        <span class="cli-check">&#10003;</span>
+        <span class="cli-command">{allRelsLineage.length} total connections</span>
+      </div>
     </div>
+
+    <!-- Discovered Relationships Table -->
+    {#if allRelsLineage.length > 0}
+      <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">DISCOVERED RELATIONSHIPS ({allRelsLineage.length})</div>
+      <div class="ink-border" style="overflow-x: auto; margin-bottom: 16px;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 11px; font-family: var(--font-family-display);">
+          <thead>
+            <tr style="border-bottom: 2px solid var(--color-on-surface); text-transform: uppercase; font-size: 9px; font-weight: 900; letter-spacing: 0.1em;">
+              <th style="text-align: left; padding: 8px 12px;">FROM</th>
+              <th style="text-align: left; padding: 8px 12px;">TO</th>
+              <th style="text-align: left; padding: 8px 12px;">TYPE</th>
+              <th style="text-align: left; padding: 8px 12px;">CONFIDENCE</th>
+              <th style="text-align: left; padding: 8px 12px;">SOURCE</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each fkRels as rel}
+              <tr style="border-bottom: 1px solid var(--color-surface-dim);">
+                <td style="padding: 6px 12px; font-weight: 700;">{rel.from_table}{rel.from_column ? '.' + rel.from_column : ''}</td>
+                <td style="padding: 6px 12px; font-weight: 700;">{rel.to_table}{rel.to_column ? '.' + rel.to_column : ''}</td>
+                <td style="padding: 6px 12px; color: var(--color-on-surface-dim);">FK</td>
+                <td style="padding: 6px 12px; color: var(--color-on-surface-dim);">{rel.confidence ? Math.round((rel.confidence || 0) * 100) + '%' : '100%'}</td>
+                <td style="padding: 6px 12px;"><span style="font-size: 9px; font-weight: 900; padding: 1px 6px; background: var(--color-surface-dim); border: 1px solid var(--color-on-surface);">SQL</span></td>
+              </tr>
+            {/each}
+            {#each aiRels as rel}
+              <tr style="border-bottom: 1px solid var(--color-surface-dim);">
+                <td style="padding: 6px 12px; font-weight: 700;">{rel.table1 || rel.from_table}</td>
+                <td style="padding: 6px 12px; font-weight: 700;">{rel.table2 || rel.to_table}</td>
+                <td style="padding: 6px 12px; color: var(--color-on-surface-dim);">{rel.join_type || rel.relationship || 'topic'}</td>
+                <td style="padding: 6px 12px; color: var(--color-on-surface-dim);">{rel.confidence ? rel.confidence + '%' : '—'}</td>
+                <td style="padding: 6px 12px;"><span style="font-size: 9px; font-weight: 900; padding: 1px 6px; background: #00fc40; color: #000; border: 1px solid #000;">AI</span></td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
 
   <!-- ═══ AGENTS ═══ -->
   {:else if activeTab === 'agents'}
@@ -2065,38 +2192,32 @@
         <span class="cli-dim" style="margin-left: 8px;">{project?.schema_name || slug}</span>
       </div>
       <div style="border-top: 1px solid #333; margin: 6px 0;"></div>
-      <div class="cli-line">
-        <span style="color: #555;">&gt;</span>
-        <span class="cli-check">&#10003;</span>
-        <span class="cli-command">Leader</span>
-        <span class="cli-dim">routes requests · synthesizes answers · no DB access</span>
-      </div>
-      <div class="cli-line">
-        <span style="color: #555;">&gt;</span>
-        <span class="cli-check">&#10003;</span>
-        <span class="cli-command">Analyst</span>
-        <span class="cli-dim">READ-ONLY · SQL · reasoning · knowledge search</span>
-      </div>
-      <div class="cli-line">
-        <span style="color: #555;">&gt;</span>
-        <span class="cli-check">&#10003;</span>
-        <span class="cli-command">Engineer</span>
-        <span class="cli-dim">WRITE · views · computed data · schema updates</span>
-      </div>
+      {#each agentsData?.agents || [{name:'Leader',role:'routes requests',status:'active'},{name:'Analyst',role:'SQL · reasoning',status:'active'},{name:'Engineer',role:'views · computed data',status:'active'},{name:'Researcher',role:'document RAG · vision',status:'active'}] as agent}
+        <div class="cli-line">
+          <span style="color: #555;">&gt;</span>
+          {#if agent.status === 'active'}
+            <span class="cli-check">&#10003;</span>
+          {:else}
+            <span style="color: #888;">○</span>
+          {/if}
+          <span class="cli-command">{agent.name}</span>
+          <span class="cli-dim">{agent.role}</span>
+          {#if agent.status === 'standby'}
+            <span style="font-size: 8px; color: #888; margin-left: 4px;">(standby)</span>
+          {/if}
+        </div>
+      {/each}
       <div style="border-top: 1px solid #333; margin: 6px 0;"></div>
       <div class="cli-line">
         <span class="cli-info">REASONING</span>
       </div>
+      {#each agentsData?.reasoning || [{mode:'FAST',description:'direct SQL → answer (simple questions)'},{mode:'DEEP',description:'think() + analyze() → multi-step reasoning (complex questions)'}] as r}
       <div class="cli-line">
         <span style="color: #555;">&gt;</span>
-        <span style="color: #00fc40;">FAST</span>
-        <span class="cli-dim">direct SQL → answer (simple questions)</span>
+        <span style="color: #00fc40;">{r.mode}</span>
+        <span class="cli-dim">{r.description}</span>
       </div>
-      <div class="cli-line">
-        <span style="color: #555;">&gt;</span>
-        <span style="color: #ff9d00;">DEEP</span>
-        <span class="cli-dim">think() + analyze() → multi-step reasoning (complex questions)</span>
-      </div>
+      {/each}
       <div class="cli-line">
         <span class="cli-prompt">$</span>
         <span class="cli-success">all agents online</span>
@@ -2386,7 +2507,7 @@
               {:else if wf.source === 'user'}
                 <span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: var(--color-primary); color: white; text-transform: uppercase;">USER</span>
               {:else}
-                <span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: var(--color-on-surface-dim); color: white; text-transform: uppercase;">TRAINING</span>
+                <span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: var(--color-on-surface-dim); color: white; text-transform: uppercase;">AUTO</span>
               {/if}
             </div>
             <button class="send-btn" style="font-size: 9px; padding: 3px 10px;" onclick={async () => {

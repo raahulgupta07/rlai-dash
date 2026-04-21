@@ -249,11 +249,11 @@
 
               <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-top: 8px; text-transform: uppercase;">
                 {#if p.last_trained}
-                  <span style="color: var(--color-primary);">Trained {timeAgo(p.last_trained)}</span> ·
+                  <span style="color: var(--color-primary);">Trained {new Date(p.last_trained).toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'})}</span> ·
                 {:else}
                   <span style="color: var(--color-warning);">Not trained</span> ·
                 {/if}
-                Updated {timeAgo(p.updated_at)}
+                Updated {new Date(p.updated_at).toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'})}
               </div>
             </div>
 

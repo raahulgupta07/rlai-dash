@@ -582,6 +582,36 @@ def list_relationships(slug: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Agents
+# ---------------------------------------------------------------------------
+
+@router.get("/{slug}/agents")
+def list_agents(slug: str, request: Request):
+    """Return the agent team configuration for this project."""
+    user = _get_user(request)
+    _check_access(user, slug)
+    # Check if project has data tables or is doc-only
+    from dash.paths import KNOWLEDGE_DIR
+    has_tables = (KNOWLEDGE_DIR / slug / "tables").exists() and list((KNOWLEDGE_DIR / slug / "tables").glob("*.json"))
+    has_docs = (KNOWLEDGE_DIR / slug / "docs").exists() and list((KNOWLEDGE_DIR / slug / "docs").iterdir())
+    agents = [
+        {"name": "Leader", "role": "routes requests · synthesizes answers · no DB access", "type": "coordinator", "status": "active"},
+        {"name": "Analyst", "role": "READ-ONLY · SQL · reasoning · knowledge search" if has_tables else "document analysis · knowledge search", "type": "member", "status": "active"},
+        {"name": "Engineer", "role": "WRITE · views · computed data · schema updates", "type": "member", "status": "active" if has_tables else "standby"},
+        {"name": "Researcher", "role": "document RAG · PPTX/PDF/DOCX analysis · vision", "type": "member", "status": "active" if has_docs else "standby"},
+    ]
+    return {
+        "agents": agents,
+        "team_mode": "TeamMode.coordinate",
+        "model": "openai/gpt-5.4-mini",
+        "schema": slug,
+        "reasoning": [
+            {"mode": "FAST", "description": "direct SQL → answer (simple questions)"},
+            {"mode": "DEEP", "description": "think() + analyze() → multi-step reasoning (complex questions)"},
+        ],
+    }
+
+
 # Workflows (DB-backed)
 # ---------------------------------------------------------------------------
 

@@ -425,6 +425,13 @@ def delete_project(slug: str, request: Request):
         conn.execute(text("DELETE FROM public.dash_projects WHERE slug = :s"), {"s": slug})
         conn.commit()
 
+    # Clean up files on disk
+    import shutil
+    from dash.paths import KNOWLEDGE_DIR
+    project_dir = KNOWLEDGE_DIR / slug
+    if project_dir.exists():
+        shutil.rmtree(project_dir, ignore_errors=True)
+
     from app.auth import log_action
     log_action(user, "delete_project", "project", slug)
     return {"status": "ok", "deleted": slug}

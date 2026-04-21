@@ -497,6 +497,28 @@ def build_leader_instructions(user_id: str | None = None, project_slug: str | No
         if persona_context:
             instructions = persona_context + "\n\n---\n\n" + instructions
 
+    # Inject document awareness for doc-only projects
+    if project_slug:
+        from dash.paths import KNOWLEDGE_DIR
+        docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
+        has_tables = (KNOWLEDGE_DIR / project_slug / "tables").exists() and list((KNOWLEDGE_DIR / project_slug / "tables").glob("*.json"))
+        if docs_dir.exists() and not has_tables:
+            doc_names = [f.name for f in sorted(docs_dir.iterdir()) if f.is_file()]
+            if doc_names:
+                doc_list = ", ".join(doc_names)
+                instructions += (
+                    f"\n\n## PROJECT DOCUMENTS — CRITICAL ROUTING RULES\n"
+                    f"This is a DOCUMENT-ONLY project with {len(doc_names)} file(s): **{doc_list}**\n"
+                    f"There are NO SQL tables. The Analyst CANNOT help.\n\n"
+                    f"**ROUTING:**\n"
+                    f"- 'which documents' / 'what files' → answer directly with the file names above\n"
+                    f"- ALL other questions → ALWAYS delegate to **Researcher**\n"
+                    f"- 'summarize' / 'summary' / 'key points' → delegate to **Researcher**\n"
+                    f"- 'what is' / 'tell me about' / 'explain' → delegate to **Researcher**\n"
+                    f"- NEVER answer content questions yourself — you don't have the document text\n"
+                    f"- NEVER say 'I need more context' — the Researcher has all the content\n"
+                )
+
     if SLACK_TOKEN:
         instructions += SLACK_LEADER_INSTRUCTIONS
     else:
@@ -580,8 +602,10 @@ def build_analyst_instructions(user_id: str | None = None, project_slug: str | N
         docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
         if docs_dir.exists():
             doc_texts = []
+            doc_names = []
             for f in sorted(docs_dir.iterdir()):
                 if f.is_file():
+                    doc_names.append(f.name)
                     try:
                         content = f.read_text(errors='ignore')[:3000]
                         if content.strip():
@@ -589,10 +613,13 @@ def build_analyst_instructions(user_id: str | None = None, project_slug: str | N
                     except Exception:
                         pass
             if doc_texts:
+                doc_list = ", ".join(doc_names)
                 parts.append(
-                    "## ⚠️ UPLOADED DOCUMENTS — YOUR PRIMARY DATA SOURCE\n\n"
-                    "**This project has NO SQL tables. The documents below ARE your data. "
-                    "Answer EVERY question from this text. Do NOT ask for more info.**\n\n"
+                    f"## ⚠️ UPLOADED DOCUMENTS — YOUR PRIMARY DATA SOURCE\n\n"
+                    f"**This project has {len(doc_names)} uploaded document(s): {doc_list}**\n\n"
+                    f"These documents ARE your data. Answer EVERY question from this text. "
+                    f"Do NOT say 'I need more info' or 'I don't have data'. "
+                    f"If asked 'which documents do we have' — list them by name.\n\n"
                     + "\n\n---\n\n".join(doc_texts[:5])
                 )
 

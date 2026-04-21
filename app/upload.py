@@ -408,24 +408,20 @@ Return ONLY valid JSON:
 
 
 def process_sql_file(project_slug: str, content: str) -> dict:
-    """Parse SQL file and save queries as patterns."""
+    """Parse SQL file and save queries as patterns with metadata extraction."""
     # Split by semicolons or double newlines
     queries = [q.strip() for q in re.split(r';|\n\n', content) if q.strip()]
     saved = 0
 
     try:
-        with _engine.connect() as conn:
-            for q in queries[:20]:
-                if not q.upper().startswith(("SELECT", "WITH")):
-                    continue
-                # Generate a question from the SQL
-                question = f"Run: {q[:100]}"
-                conn.execute(text(
-                    "INSERT INTO public.dash_query_patterns (project_slug, question, sql) VALUES (:s, :q, :sql) "
-                    "ON CONFLICT DO NOTHING"
-                ), {"s": project_slug, "q": question, "sql": q})
+        engine = _engine
+        for q in queries[:20]:
+            if not q.upper().startswith(("SELECT", "WITH")):
+                continue
+            # Generate a question from the SQL
+            question = f"Run: {q[:100]}"
+            if _save_query_pattern_with_metadata(engine, project_slug, question, q, source='sql_file'):
                 saved += 1
-            conn.commit()
     except Exception:
         pass
 
@@ -1112,6 +1108,76 @@ def _detect_data_drift(project_slug: str, table_name: str, col_analyses: list[di
         pass
 
 
+def _extract_sql_metadata(sql: str) -> dict:
+    """Extract tables, join strategy, and filters from a SQL query using simple regex."""
+    sql_upper = sql.upper()
+    tables = set()
+
+    # Extract tables from FROM clauses
+    for m in re.finditer(r'\bFROM\s+([a-zA-Z_][a-zA-Z0-9_.]*)', sql, re.IGNORECASE):
+        tables.add(m.group(1).strip().lower())
+    # Extract tables from JOIN clauses
+    for m in re.finditer(r'\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_.]*)', sql, re.IGNORECASE):
+        tables.add(m.group(1).strip().lower())
+
+    # Determine join strategy
+    if re.search(r'\bLEFT\s+JOIN\b', sql_upper):
+        join_strategy = 'LEFT JOIN'
+    elif re.search(r'\bRIGHT\s+JOIN\b', sql_upper):
+        join_strategy = 'RIGHT JOIN'
+    elif re.search(r'\bFULL\s+(OUTER\s+)?JOIN\b', sql_upper):
+        join_strategy = 'FULL JOIN'
+    elif re.search(r'\bCROSS\s+JOIN\b', sql_upper):
+        join_strategy = 'CROSS JOIN'
+    elif re.search(r'\bJOIN\b', sql_upper):
+        join_strategy = 'INNER JOIN'
+    else:
+        join_strategy = 'NONE'
+
+    # Detect filter/aggregation clauses
+    filters_found = []
+    if re.search(r'\bWHERE\b', sql_upper):
+        filters_found.append('WHERE')
+    if re.search(r'\bGROUP\s+BY\b', sql_upper):
+        filters_found.append('GROUP BY')
+    if re.search(r'\bORDER\s+BY\b', sql_upper):
+        filters_found.append('ORDER BY')
+    if re.search(r'\bHAVING\b', sql_upper):
+        filters_found.append('HAVING')
+    if re.search(r'\bLIMIT\b', sql_upper):
+        filters_found.append('LIMIT')
+    if re.search(r'\bWINDOW\b|\bOVER\s*\(', sql_upper):
+        filters_found.append('WINDOW')
+
+    return {
+        "tables_used": ", ".join(sorted(tables)) if tables else "",
+        "join_strategy": join_strategy,
+        "filters": ", ".join(filters_found) if filters_found else "NONE",
+    }
+
+
+def _save_query_pattern_with_metadata(engine, project_slug: str, question: str, sql: str, source: str = 'training'):
+    """Save a Q&A pair to dash_query_patterns with extracted SQL metadata."""
+    meta = _extract_sql_metadata(sql)
+    try:
+        engine_conn = engine.connect()
+        engine_conn.execute(text(
+            "INSERT INTO public.dash_query_patterns "
+            "(project_slug, question, sql, tables_used, join_strategy, filters, source) "
+            "VALUES (:s, :q, :sql, :tables, :join, :filt, :src) "
+            "ON CONFLICT DO NOTHING"
+        ), {
+            "s": project_slug, "q": question, "sql": sql,
+            "tables": meta["tables_used"], "join": meta["join_strategy"],
+            "filt": meta["filters"], "src": source,
+        })
+        engine_conn.commit()
+        engine_conn.close()
+        return True
+    except Exception:
+        return False
+
+
 def _save_to_db(project_slug: str, table_name: str, metadata: dict, biz_rules: dict, training_qa: list | None = None, persona: dict | None = None):
     """Persist all training data to PostgreSQL alongside files."""
     try:
@@ -1168,35 +1234,41 @@ def _save_to_db(project_slug: str, table_name: str, metadata: dict, biz_rules: d
 
 def _run_auto_training(project_slug: str, table_name: str, col_analyses: list[dict],
                        metadata: dict, biz_rules: dict, sample_rows: list[dict],
-                       tables_dir: Path, business_dir: Path):
+                       tables_dir: Path, business_dir: Path,
+                       master_run_id: int | None = None, table_index: int = 0, total_tables: int = 1):
     """Background task: LLM deep analysis + training Q&A generation."""
     import time as _time
 
     # Single shared engine for all DB operations in this training run
     train_engine = create_engine(db_url, pool_size=2, max_overflow=3, pool_recycle=3600)
 
-    # Track training run
-    run_id = None
-    try:
-        with train_engine.connect() as conn:
-            result = conn.execute(text(
-                "INSERT INTO public.dash_training_runs (project_slug, status, steps) VALUES (:s, 'running', 'starting') RETURNING id"
-            ), {"s": project_slug})
-            run_id = result.fetchone()[0]
-            conn.commit()
-    except Exception:
-        pass
+    # Track training run — reuse master run if provided, otherwise create one
+    run_id = master_run_id
+    if not run_id:
+        try:
+            with train_engine.connect() as conn:
+                result = conn.execute(text(
+                    "INSERT INTO public.dash_training_runs (project_slug, status, steps) VALUES (:s, 'running', 'starting') RETURNING id"
+                ), {"s": project_slug})
+                run_id = result.fetchone()[0]
+                conn.commit()
+        except Exception:
+            pass
 
     def _update_run(status: str, steps: str = "", error: str = ""):
         if not run_id:
             return
+        # Encode table tracking into the steps field: step_name|table_name|table_index|total_tables
+        steps_with_table = f"{steps}|{table_name}|{table_index}|{total_tables}"
         try:
             with train_engine.connect() as conn:
-                if status == 'done' or status == 'failed':
-                    conn.execute(text("UPDATE public.dash_training_runs SET status = :st, steps = :steps, error = :err, tables_trained = 1, finished_at = NOW() WHERE id = :id"),
-                                 {"st": status, "steps": steps, "err": error, "id": run_id})
+                if (status == 'done' or status == 'failed') and not master_run_id:
+                    # Only set terminal status if this is a standalone run (no master)
+                    conn.execute(text("UPDATE public.dash_training_runs SET status = :st, steps = :steps, error = :err, tables_trained = :trained, finished_at = NOW() WHERE id = :id"),
+                                 {"st": status, "steps": steps_with_table, "err": error, "trained": table_index, "id": run_id})
                 else:
-                    conn.execute(text("UPDATE public.dash_training_runs SET steps = :steps WHERE id = :id"), {"steps": steps, "id": run_id})
+                    # For master-managed runs, only update steps (master controls status)
+                    conn.execute(text("UPDATE public.dash_training_runs SET steps = :steps WHERE id = :id"), {"steps": steps_with_table, "id": run_id})
                 conn.commit()
         except Exception:
             pass
@@ -1209,7 +1281,7 @@ def _run_auto_training(project_slug: str, table_name: str, col_analyses: list[di
             with train_engine.connect() as conn:
                 conn.execute(text(
                     "UPDATE public.dash_training_runs SET logs = COALESCE(logs, '[]'::jsonb) || CAST(:entry AS jsonb) WHERE id = :id"
-                ), {"entry": json.dumps([{"ts": _time.strftime('%H:%M:%S'), "msg": msg}]), "id": run_id})
+                ), {"entry": json.dumps([{"ts": _time.strftime('%H:%M:%S'), "msg": msg, "table": table_name, "table_index": table_index, "total_tables": total_tables}]), "id": run_id})
                 conn.commit()
         except Exception:
             pass
@@ -1658,7 +1730,7 @@ Return ONLY valid JSON (no markdown):
     except Exception as e:
         _log(f"  ⚠ memories error: {str(e)[:80]}")
 
-    # 2. Auto-Patterns: generate SQL patterns from Q&A
+    # 2. Auto-Patterns: generate SQL patterns from Q&A (with metadata extraction)
     try:
         _log("  generating query patterns...")
         training_dir = KNOWLEDGE_DIR / project_slug / "training"
@@ -1667,18 +1739,13 @@ Return ONLY valid JSON (no markdown):
         if qa_file.exists():
             with open(qa_file) as f:
                 qa_pairs = json.load(f)
-            with engine.connect() as conn:
-                for qa in qa_pairs[:5]:
-                    q = qa.get("question", "")
-                    s = qa.get("sql", "")
-                    if q and s:
-                        conn.execute(text(
-                            "INSERT INTO public.dash_query_patterns (project_slug, question, sql) VALUES (:s, :q, :sql) "
-                            "ON CONFLICT DO NOTHING"
-                        ), {"s": project_slug, "q": q, "sql": s})
+            for qa in qa_pairs[:5]:
+                q = qa.get("question", "")
+                s = qa.get("sql", "")
+                if q and s:
+                    if _save_query_pattern_with_metadata(engine, project_slug, q, s, source='training'):
                         patterns_saved += 1
-                conn.commit()
-        _log(f"  ✓ {patterns_saved} query patterns saved")
+        _log(f"  ✓ {patterns_saved} query patterns saved (with metadata)")
     except Exception as e:
         _log(f"  ⚠ patterns error: {str(e)[:80]}")
 
@@ -2718,6 +2785,15 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
         file_type_check = classify_file(file.filename, raw_headers, df=df, project_slug=project or "")
         if file_type_check == "column_definition" and project:
             result = process_column_definitions(project, df)
+            # Save record so file appears in docs list
+            docs_dir = KNOWLEDGE_DIR / project / "docs"
+            docs_dir.mkdir(parents=True, exist_ok=True)
+            (docs_dir / file.filename).write_text(
+                f"[Column Definition File: {file.filename}]\n"
+                f"Annotations saved: {result.get('annotations', 0)}\n"
+                f"Memories saved: {result.get('memories', 0)}\n"
+                f"Rules saved: {result.get('rules', 0)}"
+            )
             return {"status": "ok", "file_type": "column_definition", "smart": result}
 
         # Column names already cleaned by _clean_dataframe() in _read_file()
@@ -4274,10 +4350,39 @@ def retrain_project(slug: str, request: Request):
     _training_cancel_flags[slug] = False  # Reset cancel flag
 
     def _bg():
+        import time as _time
         skipped = 0
         trained = 0
+        total_tables = len(tables)
 
-        for tbl in tables:
+        # Create a single master training run for the entire retrain batch
+        master_run_id = None
+        master_engine = create_engine(db_url, pool_size=2, max_overflow=3, pool_recycle=3600)
+        try:
+            with master_engine.connect() as conn:
+                result = conn.execute(text(
+                    "INSERT INTO public.dash_training_runs (project_slug, status, steps) "
+                    "VALUES (:s, 'running', :steps) RETURNING id"
+                ), {"s": slug, "steps": f"starting||0|{total_tables}"})
+                master_run_id = result.fetchone()[0]
+                conn.commit()
+        except Exception:
+            pass
+
+        def _master_log(msg: str, tbl_name: str = "", tbl_idx: int = 0):
+            """Log to the master training run."""
+            if not master_run_id:
+                return
+            try:
+                with master_engine.connect() as conn:
+                    conn.execute(text(
+                        "UPDATE public.dash_training_runs SET logs = COALESCE(logs, '[]'::jsonb) || CAST(:entry AS jsonb) WHERE id = :id"
+                    ), {"entry": json.dumps([{"ts": _time.strftime('%H:%M:%S'), "msg": msg, "table": tbl_name, "table_index": tbl_idx, "total_tables": total_tables}]), "id": master_run_id})
+                    conn.commit()
+            except Exception:
+                pass
+
+        for tbl_idx, tbl in enumerate(tables, start=1):
             if _training_cancel_flags.get(slug):
                 break
             try:
@@ -4290,21 +4395,22 @@ def retrain_project(slug: str, request: Request):
                 change_type = check_fingerprint_changed(slug, tbl, row_count, tbl_cols)
 
                 if change_type == "unchanged":
-                    # Log skip via training run
-                    try:
-                        run_engine = create_engine(db_url)
-                        with run_engine.connect() as conn:
-                            result = conn.execute(text(
-                                "INSERT INTO public.dash_training_runs (project_slug, status, steps, logs) "
-                                "VALUES (:s, 'done', 'skipped', CAST(:logs AS jsonb)) RETURNING id"
-                            ), {"s": slug, "logs": json.dumps([{"ts": __import__('time').strftime('%H:%M:%S'), "msg": f"⊘ skipping {tbl} — unchanged (fingerprint match)"}])})
-                            conn.commit()
-                    except Exception:
-                        pass
+                    _master_log(f"⊘ skipping {tbl} — unchanged (fingerprint match)", tbl, tbl_idx)
+                    # Update master run step to show skip
+                    if master_run_id:
+                        try:
+                            with master_engine.connect() as conn:
+                                conn.execute(text(
+                                    "UPDATE public.dash_training_runs SET steps = :steps WHERE id = :id"
+                                ), {"steps": f"skipped|{tbl}|{tbl_idx}|{total_tables}", "id": master_run_id})
+                                conn.commit()
+                        except Exception:
+                            pass
                     skipped += 1
                     continue
 
                 # Table changed or new — run training
+                _master_log(f"training table {tbl} ({tbl_idx}/{total_tables})...", tbl, tbl_idx)
                 df = pd.read_sql(f'SELECT * FROM "{schema}"."{tbl}" LIMIT 100', engine)
                 col_analyses = [_analyze_column(df[col]) for col in df.columns]
                 sample_rows = df.head(10).to_dict('records')
@@ -4323,14 +4429,29 @@ def retrain_project(slug: str, request: Request):
                     metadata = _generate_metadata(tbl, df, col_analyses)
 
                 biz_rules = _generate_business_rules(tbl, col_analyses)
-                _run_auto_training(slug, tbl, col_analyses, metadata, biz_rules, sample_rows, tables_dir, business_dir)
+                _run_auto_training(slug, tbl, col_analyses, metadata, biz_rules, sample_rows, tables_dir, business_dir,
+                                   master_run_id=master_run_id, table_index=tbl_idx, total_tables=total_tables)
 
                 # Save new fingerprint after training
                 save_fingerprint(slug, tbl, row_count, tbl_cols)
                 trained += 1
+                _master_log(f"✓ table {tbl} training complete ({tbl_idx}/{total_tables})", tbl, tbl_idx)
             except Exception as e:
                 import logging
                 logging.error(f"Retrain failed for {slug}/{tbl}: {e}")
+                _master_log(f"⚠ table {tbl} training failed: {str(e)[:80]}", tbl, tbl_idx)
+
+        # Mark master run as done
+        if master_run_id:
+            try:
+                with master_engine.connect() as conn:
+                    conn.execute(text(
+                        "UPDATE public.dash_training_runs SET status = 'done', steps = :steps, "
+                        "tables_trained = :trained, finished_at = NOW() WHERE id = :id"
+                    ), {"steps": f"complete||{total_tables}|{total_tables}", "trained": trained, "id": master_run_id})
+                    conn.commit()
+            except Exception:
+                pass
 
     _bg_executor.submit(_bg)
     return {"status": "ok", "tables": len(tables), "message": "Delta retraining started — unchanged tables will be skipped"}

@@ -110,8 +110,10 @@ def create_project_team(
     docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
     if docs_dir.exists():
         doc_texts = []
+        doc_names = []
         for f in sorted(docs_dir.iterdir()):
             if f.is_file():
+                doc_names.append(f.name)
                 try:
                     content = f.read_text(errors='ignore')[:3000]
                     if content.strip():
@@ -119,7 +121,12 @@ def create_project_team(
                 except Exception:
                     pass
         if doc_texts:
-            doc_instructions = "\n\n## UPLOADED DOCUMENTS\n\n" + "\n\n---\n\n".join(doc_texts[:5])
+            doc_list = ", ".join(doc_names)
+            doc_instructions = (
+                f"\n\n## UPLOADED DOCUMENTS ({len(doc_names)} files: {doc_list})\n\n"
+                f"If asked 'which documents do we have' — list these file names.\n\n"
+                + "\n\n---\n\n".join(doc_texts[:5])
+            )
 
     researcher = create_researcher(knowledge=knowledge, instructions=doc_instructions, project_slug=project_slug)
 

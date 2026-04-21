@@ -39,6 +39,7 @@ TRAINING_CONFIGS = {
     "mining":           {"temp": 0.2, "tokens": 1000, "thinking": "low"},
     "meta_learning":    {"temp": 0.0, "tokens": 300,  "thinking": "none"},
     "vision":           {"temp": 0.1, "tokens": 1000, "thinking": "none"},
+    "dashboard":        {"temp": 0.2, "tokens": 3000, "thinking": "minimal"},
 }
 
 

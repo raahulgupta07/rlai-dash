@@ -7,11 +7,12 @@
   interface Props {
     dashboardId: number | null;
     projectSlug: string;
+    generating?: boolean;
     onClose: () => void;
     onSelectDashboard: (id: number) => void;
   }
 
-  let { dashboardId, projectSlug, onClose, onSelectDashboard }: Props = $props();
+  let { dashboardId, projectSlug, generating = false, onClose, onSelectDashboard }: Props = $props();
 
   let dashboard = $state<any>(null);
   let dashboards = $state<any[]>([]);
@@ -138,7 +139,36 @@
             </div>
             <!-- Widget body -->
             <div class="panel-widget-body">
-              {#if widget.type === 'chart' && widget.headers && widget.rows}
+              {#if widget.type === 'text' && widget.config?.items}
+                <div style="padding: 10px;">
+                  {#each widget.config.items as item}
+                    <div style="display: flex; gap: 6px; margin-bottom: 6px; font-size: 11px; padding: 4px 8px; border-left: 2px solid var(--color-warning); background: #fff8e1;">
+                      <span style="color: var(--color-warning);">●</span>
+                      <span>{item}</span>
+                    </div>
+                  {/each}
+                </div>
+              {:else if widget.type === 'metric' && widget.config?.questions !== undefined}
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px;">
+                  <div style="text-align: center; padding: 8px; background: var(--color-surface-dim);">
+                    <div style="font-size: 18px; font-weight: 900;">{widget.config.questions}</div>
+                    <div style="font-size: 8px; text-transform: uppercase; color: var(--color-on-surface-dim);">Questions</div>
+                  </div>
+                  <div style="text-align: center; padding: 8px; background: var(--color-surface-dim);">
+                    <div style="font-size: 18px; font-weight: 900;">{widget.config.queries}</div>
+                    <div style="font-size: 8px; text-transform: uppercase; color: var(--color-on-surface-dim);">SQL Queries</div>
+                  </div>
+                </div>
+              {:else if widget.type === 'chart' && widget.config?.data?.labels && widget.config?.data?.values}
+                <div style="display: flex; gap: 0; margin-bottom: 4px;">
+                  {#each ['bar', 'line', 'pie', 'scatter', 'area'] as ct}
+                    <button class="chart-type-btn" class:chart-type-btn-active={(widget.chartType || 'bar') === ct} onclick={() => changeChartType(wi, ct)} style="font-size: 8px; padding: 2px 6px;">{ct.toUpperCase()}</button>
+                  {/each}
+                </div>
+                <div style="height: 200px;">
+                  <EChartView headers={['Label', 'Value']} rows={widget.config.data.labels.map((l, i) => [l, String(widget.config.data.values[i] ?? 0)])} chartType={widget.chartType || 'bar'} />
+                </div>
+              {:else if widget.type === 'chart' && widget.headers && widget.rows}
                 <div style="display: flex; gap: 0; margin-bottom: 4px;">
                   {#each ['bar', 'line', 'pie', 'scatter', 'area'] as ct}
                     <button class="chart-type-btn" class:chart-type-btn-active={(widget.chartType || 'bar') === ct} onclick={() => changeChartType(wi, ct)} style="font-size: 8px; padding: 2px 6px;">{ct.toUpperCase()}</button>
@@ -178,7 +208,19 @@
 
     {:else}
       <!-- Dashboard list view -->
-      {#if dashboards.length === 0}
+      {#if generating}
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; gap: 16px;">
+          <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-primary);">GENERATING DASHBOARD</div>
+          <div style="width: 200px; height: 4px; background: var(--color-surface-dim); overflow: hidden;">
+            <div style="height: 100%; width: 60%; background: var(--color-primary); animation: dash-progress 2s ease-in-out infinite;"></div>
+          </div>
+          <div style="font-size: 10px; color: var(--color-on-surface-dim); text-align: center; line-height: 1.6;">
+            Analyzing chat responses...<br>
+            Extracting metrics & charts...<br>
+            Building dashboard layout...
+          </div>
+        </div>
+      {:else if dashboards.length === 0}
         <div style="text-align: center; padding: 40px; color: var(--color-on-surface-dim);">
           <div style="font-size: 14px; font-weight: 900; margin-bottom: 6px;">NO DASHBOARDS</div>
           <div style="font-size: 10px;">Ask the agent to create a dashboard or pin charts from chat.</div>

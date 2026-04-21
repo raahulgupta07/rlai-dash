@@ -549,6 +549,7 @@
   // Dashboard side panel
   let dashboardPanelOpen = $state(false);
   let activeDashboardId = $state<number | null>(null);
+  let dashboardGenerating = $state(false);
 
   // Slide Agent panel
   let slidesPanelOpen = $state(false);
@@ -562,6 +563,41 @@
   let pptxSteps = $state<{label: string; status: 'pending'|'active'|'done'|'error'}[]>([]);
   let pptxGenerating = $state(false);
   let pptxSavedVersion = $state(0);
+
+  async function generateDashboardFromChat() {
+    if (dashboardGenerating || messages.length < 2) return;
+    dashboardGenerating = true;
+    dashboardPanelOpen = true;
+    activeDashboardId = null;
+
+    try {
+      const chatContent = messages
+        .filter(m => m.role === 'assistant' && m.status === 'done')
+        .map(m => m.content)
+        .join('\n\n---\n\n');
+      const sqlQueries = messages
+        .filter(m => m.sqlQueries?.length)
+        .flatMap(m => m.sqlQueries || []);
+
+      const res = await fetch(`/api/projects/${projectSlug}/generate-dashboard-from-chat`, {
+        method: 'POST',
+        headers: { ..._headers(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_content: chatContent.slice(0, 10000),
+          sql_queries: sqlQueries.slice(0, 20),
+          session_id: sessionId,
+          message_count: messages.length
+        })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.dashboard_id) {
+          activeDashboardId = data.dashboard_id;
+        }
+      }
+    } catch {}
+    dashboardGenerating = false;
+  }
 
   async function generateSlides() {
     if (messages.length < 2 || slidesLoading) return;
@@ -1197,15 +1233,45 @@
                         </div>
                       </button>
                     {:else if msg.status === 'done' && (!msg.toolCalls || msg.toolCalls.length === 0)}
-                      <!-- No tools used — show minimal CLI -->
-                      <div class="cli-terminal">
+                      <!-- No tools used — expandable CLI -->
+                      <button class="cli-terminal" style="cursor: pointer; width: 100%; text-align: left;" onclick={() => toggleWorkflow(i)}>
                         <div class="cli-line">
                           <span class="cli-prompt">$</span>
                           <span class="cli-command">dash exec</span>
                           <span class="cli-output">--agent {projectInfo?.agent_name || 'agent'}{(() => { const m = msg.content?.match(/\[MODE:(\w+)\]/); return m ? ' --' + m[1] : msg.reasoningUsed ? ' --' + msg.reasoningUsed : ''; })()}</span>
                           <span class="cli-success" style="margin-left: auto;">&#10003; direct response{msg.qualityScore ? ' · ' + renderStars(msg.qualityScore) : ''}</span>
+                          <span class="cli-dim" style="margin-left: 6px;">{msg.workflowExpanded ? '▲' : '▼'}</span>
                         </div>
-                      </div>
+                        {#if msg.workflowExpanded}
+                          <div class="cli-line" style="margin-top: 4px;">
+                            <span style="color: #555;">&gt;</span>
+                            <span class="cli-output">model:</span>
+                            <span class="cli-command">{projectInfo?.model || 'openai/gpt-5.4-mini'}</span>
+                          </div>
+                          <div class="cli-line">
+                            <span style="color: #555;">&gt;</span>
+                            <span class="cli-output">mode:</span>
+                            <span class="cli-command">{(() => { const m = msg.content?.match(/\[MODE:(\w+)\]/); return m ? m[1] : msg.reasoningUsed || 'fast'; })()}</span>
+                          </div>
+                          <div class="cli-line">
+                            <span style="color: #555;">&gt;</span>
+                            <span class="cli-output">routing:</span>
+                            <span class="cli-command">leader → direct (no delegation)</span>
+                          </div>
+                          <div class="cli-line">
+                            <span style="color: #555;">&gt;</span>
+                            <span class="cli-output">tools:</span>
+                            <span class="cli-command">0 (answered from context)</span>
+                          </div>
+                          {#if msg.qualityScore}
+                            <div class="cli-line">
+                              <span style="color: #555;">&gt;</span>
+                              <span class="cli-output">quality:</span>
+                              <span class="cli-command">{msg.qualityScore}/5 {renderStars(msg.qualityScore)}</span>
+                            </div>
+                          {/if}
+                        {/if}
+                      </button>
                     {:else}
                       <!-- Expanded / streaming CLI terminal -->
                       <div class="cli-terminal" onclick={() => msg.status === 'done' && toggleWorkflow(i)} style="{msg.status === 'done' ? 'cursor: pointer;' : ''}">
@@ -1786,6 +1852,11 @@
             <text x="12" y="16" text-anchor="middle" fill="white" font-size="13" font-weight="900" font-family="Arial">P</text>
           </svg>
         </button>
+        <!-- Dashboard from Chat button -->
+        <button style="width: 32px; height: 32px; border-radius: 50%; border: 2px solid var(--color-on-surface); background: #2196f3; color: white; cursor: pointer; font-size: 14px; display: flex; align-items: center; justify-content: center; font-weight: 900;"
+          title="Generate Dashboard from Chat"
+          disabled={dashboardGenerating || messages.length < 2}
+          onclick={generateDashboardFromChat}>D</button>
         <!-- Excel Export button -->
         <button onclick={async () => {
           if (messages.length < 2) return;
@@ -2141,6 +2212,7 @@
     <DashboardPanel
       dashboardId={activeDashboardId}
       projectSlug={projectSlug}
+      generating={dashboardGenerating}
       onClose={() => { dashboardPanelOpen = false; activeDashboardId = null; }}
       onSelectDashboard={(id) => { activeDashboardId = id || null; }}
     />
