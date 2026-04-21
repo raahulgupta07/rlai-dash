@@ -34,7 +34,8 @@ dash/
 ├── paths.py               # Path constants
 ├── agents/
 │   ├── analyst.py         # Analyst (read-only SQL, reasoning, self-correction loop)
-│   └── engineer.py        # Engineer (views, computed data)
+│   ├── engineer.py        # Engineer (views, computed data)
+│   └── researcher.py      # Document RAG specialist
 ├── context/
 │   ├── semantic_model.py  # Table metadata (Codex-enriched: purpose, grain, PKs, FKs, usage patterns, freshness)
 │   └── business_rules.py  # Business rules + user rules
@@ -87,7 +88,7 @@ frontend/src/routes/
 
 ## Agent System
 
-**Team:** Leader (persona + routing + result review) → Analyst (read-only SQL, self-correction) + Engineer (write views + create dashboards)
+**Team:** Leader → Analyst (SQL + forecasting) + Engineer (views + dashboards) + Researcher (document RAG)
 **Modes:** FAST (direct SQL) / DEEP (think + analyze, auto-selected based on query complexity)
 
 **Self-Correction Loop (Analyst):**
@@ -279,6 +280,8 @@ All steps tracked in dash_training_runs for UI progress bar.
 50. **Complete Doc-Only Training** — 14-step training pipeline for document-only projects fills all brain layers: memories, persona, workflows, evals, feedback, rules, domain knowledge, insights, negative examples, Q&A, synthesis, relationships.
 
 51. **Training Progress for Docs** — Doc-only training creates training runs with step tracking so the UI progress bar updates in real-time.
+
+52. **Researcher Agent** — Dedicated document RAG agent for PPTX/PDF/DOCX. Leader auto-routes document questions to Researcher, data queries to Analyst. Doc text injected directly into Researcher's context.
 
 ## Self-Evolution Architecture
 

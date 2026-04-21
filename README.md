@@ -24,6 +24,7 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **INSIGHT Tab** -- badge parsing with MODE, ANALYSIS, UP/DOWN/FLAT trends, and RISK indicators
 - **Icon Picker** -- SVG Lucide icons selectable on project cards
 - **PIN to Dashboard** -- pin charts, tables, and text from both project chat and Dash Agent to any dashboard
+- **Researcher Agent** -- dedicated document RAG specialist for uploaded files
 
 ## Quick Start
 
@@ -94,18 +95,23 @@ Set both in `.env` before first deploy. Change password from UI after login.
 ## Architecture
 
 ```
-Internet --> Caddy (auto-SSL, ports 80/443)
+Internet --> Caddy (auto-SSL)
                |
-            Dash API (FastAPI, port 8000, N workers)
+            Dash API (FastAPI, N workers)
                |
             PgBouncer (transaction pooling)
                |
-            PostgreSQL 18 + PgVector (port 5432)
+            PostgreSQL 18 + PgVector
+
+Agent Team: Leader → Analyst (SQL) + Engineer (views) + Researcher (docs)
 ```
 
-Each project gets an isolated PostgreSQL schema (`proj_{slug}`), its own PgVector knowledge store, an agent team (Leader, Analyst, Engineer), a generated persona, and a self-learning pipeline. 35+ database tables across system, content, learning, and evolution domains.
+Each project gets an isolated PostgreSQL schema (`proj_{slug}`), its own PgVector knowledge store, an agent team (Leader, Analyst, Engineer, Researcher), a generated persona, and a self-learning pipeline. 35+ database tables across system, content, learning, and evolution domains.
 
-**Agent Team:** Leader (persona + routing + result review) dispatches to Analyst (read-only SQL + self-correction loop) and Engineer (write views + create dashboards).
+**Agent Team:** Leader (persona + routing + result review) dispatches to:
+- **Analyst** — SQL queries on data tables, 11 analysis types, Prophet forecasting
+- **Engineer** — Create views, dashboards
+- **Researcher** — Document RAG — answers from uploaded PPTX/PDF/DOCX
 
 ## Tech Stack
 
