@@ -658,6 +658,7 @@
         } else {
           cLog(`${ts()} │  ✓ ${currentFile.name} uploaded`);
         }
+        if (result?.tables_extracted) cLog(`${ts()} │  ✓ ${result.tables_extracted} tables extracted from document`);
       } catch (e: any) {
         cLog(`${ts()} │  ✗ ${currentFile.name}: ${e.message}`);
       }
@@ -1062,6 +1063,11 @@
                   {#if uploadResult.smart?.rows_upserted > 0} ({uploadResult.smart.rows_upserted} updated){/if}
                 {/if}
               </div>
+              {#if uploadResult?.tables_extracted}
+                <div style="font-size: 11px; color: var(--color-primary);">
+                  ✓ {uploadResult.tables_extracted} tables extracted from document
+                </div>
+              {/if}
             {/if}
             {#if uploadError}<div style="margin-top: 6px; font-size: 11px; color: var(--color-error);">{uploadError}</div>{/if}
           </div>

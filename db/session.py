@@ -85,9 +85,9 @@ def get_sql_engine() -> Engine:
     _dash_engine = create_engine(
         db_url,
         connect_args={"options": f"-c search_path={DASH_SCHEMA},public"},
-        pool_size=10,
-        max_overflow=20,
-        pool_recycle=3600,
+        pool_size=5,
+        max_overflow=10,
+        pool_recycle=1800,
         pool_pre_ping=True,
     )
     event.listen(_dash_engine, "before_cursor_execute", _guard_public_schema)
@@ -106,9 +106,9 @@ def get_readonly_engine() -> Engine:
     _readonly_engine = create_engine(
         db_url,
         connect_args={"options": "-c default_transaction_read_only=on -c statement_timeout=30000"},
-        pool_size=10,
-        max_overflow=20,
-        pool_recycle=3600,
+        pool_size=5,
+        max_overflow=10,
+        pool_recycle=1800,
         pool_pre_ping=True,
     )
     return _readonly_engine
@@ -226,7 +226,7 @@ def create_project_schema(slug: str) -> str:
 
 
 def get_project_engine(slug: str) -> Engine:
-    """Engine scoped to project schema (cached)."""
+    """Engine scoped to project schema (cached, small pool for multi-tenant)."""
     safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
     if safe in _project_engines:
         return _project_engines[safe]
@@ -234,15 +234,15 @@ def get_project_engine(slug: str) -> Engine:
     eng = create_engine(
         db_url,
         connect_args={"options": f'-c search_path="{safe}"'},
-        pool_size=5, max_overflow=10,
-        pool_recycle=3600, pool_pre_ping=True,
+        pool_size=2, max_overflow=3,
+        pool_recycle=1800, pool_pre_ping=True,
     )
     _project_engines[safe] = eng
     return eng
 
 
 def get_project_readonly_engine(slug: str) -> Engine:
-    """Read-only engine scoped to project schema ONLY (cached)."""
+    """Read-only engine scoped to project schema ONLY (cached, small pool)."""
     safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
     if safe in _project_ro_engines:
         return _project_ro_engines[safe]
@@ -250,8 +250,8 @@ def get_project_readonly_engine(slug: str) -> Engine:
     eng = create_engine(
         db_url,
         connect_args={"options": f'-c search_path="{safe}" -c default_transaction_read_only=on -c statement_timeout=30000'},
-        pool_size=5, max_overflow=10,
-        pool_recycle=3600, pool_pre_ping=True,
+        pool_size=2, max_overflow=3,
+        pool_recycle=1800, pool_pre_ping=True,
     )
     _project_ro_engines[safe] = eng
     return eng

@@ -3,7 +3,7 @@ services:
     image: pgvector/pgvector:pg18-trixie
     container_name: dash-db
     restart: always
-    command: postgres -c max_connections=300 -c shared_buffers=256MB -c work_mem=8MB
+    command: postgres -c max_connections=500 -c shared_buffers=512MB -c work_mem=8MB -c effective_cache_size=1536MB
     environment:
       POSTGRES_USER: ${DB_USER:-ai}
       POSTGRES_PASSWORD: ${DB_PASS:-ai}

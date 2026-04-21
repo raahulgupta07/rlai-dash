@@ -38,7 +38,7 @@
     showChart?: boolean;
     chartType?: ChartType;
     routing?: RoutingInfo;
-    activeTab?: 'analysis' | 'data' | 'query' | 'graph';
+    activeTab?: 'insight' | 'analysis' | 'data' | 'query' | 'graph';
     qualityScore?: number;
     showTrace?: boolean;
     proposedLearnings?: string[];
@@ -598,6 +598,54 @@
   let pptxSteps = $state<{label: string; status: 'pending'|'active'|'done'|'error'}[]>([]);
   let pptxGenerating = $state(false);
   let pptxSavedVersion = $state(0);
+
+  // PIN modal
+  let showPinModal = $state(false);
+  let pinModalData = $state<{msgIndex: number; tables: any[]; content: string} | null>(null);
+  let pinDashboards = $state<any[]>([]);
+  let pinSelectedDash = $state<number | null>(null);
+  let pinNewDashName = $state('');
+  let pinWidgetTitle = $state('');
+  let pinProjectSlug = $state('');
+
+  async function openPinModal(msgIndex: number, tables: any[], content: string, projectSlug: string) {
+    pinModalData = { msgIndex, tables, content };
+    pinWidgetTitle = tables?.[0]?.headers?.join(' / ') || content.slice(0, 50);
+    pinProjectSlug = projectSlug || '';
+    showPinModal = true;
+    pinDashboards = [];
+    if (pinProjectSlug) {
+      try {
+        const res = await fetch(`/api/projects/${pinProjectSlug}/dashboards`, { headers: _headers() });
+        if (res.ok) { const d = await res.json(); pinDashboards = d.dashboards || []; }
+      } catch {}
+    }
+    pinSelectedDash = pinDashboards.length > 0 ? pinDashboards[0].id : null;
+  }
+
+  async function confirmPin() {
+    if (!pinModalData || !pinProjectSlug) return;
+    const { tables, content } = pinModalData;
+    let dashId = pinSelectedDash;
+    if (!dashId && pinNewDashName.trim()) {
+      try {
+        const res = await fetch(`/api/projects/${pinProjectSlug}/dashboards?name=${encodeURIComponent(pinNewDashName.trim())}`, { method: 'POST', headers: _headers() });
+        if (res.ok) { const d = await res.json(); dashId = d.id; }
+      } catch {}
+    }
+    if (!dashId) return;
+    const hasTable = tables?.length > 0 && tables[0].headers?.length > 0;
+    const widget = hasTable
+      ? { type: 'chart', title: pinWidgetTitle, chartType: 'bar', headers: tables[0].headers, rows: tables[0].rows }
+      : { type: 'text', title: pinWidgetTitle, content, full: true };
+    await fetch(`/api/projects/${pinProjectSlug}/dashboards/${dashId}/widgets`, {
+      method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(widget),
+    });
+    showPinModal = false;
+    pinModalData = null;
+    pinNewDashName = '';
+  }
 
   async function generateSlides() {
     if (messages.length < 2 || slidesLoading) return;
@@ -1182,17 +1230,109 @@
                       {@const hasTables = tables.length > 0 && tables[0].headers?.length > 0}
                       {@const hasChartData = hasTables && hasNumericData(tables[0])}
                       {@const hasQueries = msg.sqlQueries && msg.sqlQueries.length > 0}
-                      {@const currentTab = msg.activeTab || 'analysis'}
+                      {@const currentTab = msg.activeTab || 'insight'}
 
                       <div class="response-tabs">
+                        <button class="response-tab" class:response-tab-active={currentTab === 'insight'} onclick={() => { messages = [...messages.slice(0, i), { ...msg, activeTab: 'insight' }, ...messages.slice(i + 1)]; }}>Insight</button>
                         <button class="response-tab" class:response-tab-active={currentTab === 'analysis'} onclick={() => { messages = [...messages.slice(0, i), { ...msg, activeTab: 'analysis' }, ...messages.slice(i + 1)]; }}>Analysis</button>
                         <button class="response-tab" class:response-tab-active={currentTab === 'data'} class:response-tab-dim={!hasTables} onclick={() => { if (hasTables) messages = [...messages.slice(0, i), { ...msg, activeTab: 'data' }, ...messages.slice(i + 1)]; }}>Data{#if hasTables}<span class="tab-badge">{tables[0].rows.length}</span>{/if}</button>
                         <button class="response-tab" class:response-tab-active={currentTab === 'query'} class:response-tab-dim={!hasQueries} onclick={() => { if (hasQueries) messages = [...messages.slice(0, i), { ...msg, activeTab: 'query' }, ...messages.slice(i + 1)]; }}>Query{#if hasQueries}<span class="tab-badge">{msg.sqlQueries?.length}</span>{/if}</button>
                         <button class="response-tab" class:response-tab-active={currentTab === 'graph'} class:response-tab-dim={!hasChartData} onclick={() => { if (hasChartData) messages = [...messages.slice(0, i), { ...msg, activeTab: 'graph', chartType: msg.chartType || detectChartType(tables[0]) }, ...messages.slice(i + 1)]; }}>Graph</button>
                       </div>
 
+                      <!-- TAB: Insight -->
+                      {#if currentTab === 'insight'}
+                        {@const insightAnalysisMatch = msg.content.match(/\[ANALYSIS:([^\]]+)\]/)}
+                        {@const insightAnalysisTypes = insightAnalysisMatch ? insightAnalysisMatch[1].split(',').map((t: string) => t.trim()) : []}
+                        {@const modeMatch = msg.content.match(/\[MODE:(\w+)\]/)}
+                        {@const actualMode = modeMatch ? modeMatch[1] : 'auto'}
+                        {@const insightContent = msg.content
+                          .replace(/\[ANALYSIS:[^\]]+\]/g, '')
+                          .replace(/\[MODE:\w+\]/g, '')
+                          .replace(/\[CHART:[^\]]+\]/g, '')
+                          .replace(/\[DASHBOARD:\d+\]/g, '')
+                          .replace(/---\s*\n\s*SOURCES:[\s\S]*$/, '')
+                          .replace(/```sql[\s\S]*?```/g, '')
+                          .trim()}
+                        <div class="bubble-assistant">
+                          <div style="margin-bottom: 10px; display: flex; gap: 4px; flex-wrap: wrap;">
+                            <span style="font-size: 8px; font-weight: 900; padding: 2px 8px; background: {actualMode === 'fast' ? '#00fc40' : actualMode === 'deep' ? '#007518' : '#383832'}; color: {actualMode === 'fast' ? '#383832' : 'white'}; text-transform: uppercase; letter-spacing: 0.06em;">{actualMode}</span>
+                          {#if insightAnalysisTypes.length > 0}
+                              {#each insightAnalysisTypes as atype}
+                                <span style="font-size: 8px; font-weight: 900; padding: 2px 8px; background: var(--color-secondary); color: white; text-transform: uppercase;">{atype}</span>
+                              {/each}
+                          {/if}
+                          </div>
+                          <div class="prose-chat">
+                            {@html markdownToHtml(insightContent)
+                              .replace(/\[UP:([^\]]+)\]/g, '<span style="color: #007518; font-weight: 900;">▲ $1</span>')
+                              .replace(/\[DOWN:([^\]]+)\]/g, '<span style="color: #be2d06; font-weight: 900;">▼ $1</span>')
+                              .replace(/\[FLAT:([^\]]+)\]/g, '<span style="color: #ff9d00; font-weight: 900;">● $1</span>')
+                              .replace(/\[RISK:HIGH\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#be2d06;color:white;">⚠ HIGH</span>')
+                              .replace(/\[RISK:MEDIUM\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#ff9d00;color:#383832;">⚠ MEDIUM</span>')
+                              .replace(/\[RISK:LOW\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#007518;color:white;">✓ LOW</span>')
+                            }
+                          </div>
+                          <div class="flex items-center justify-between" style="margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--color-on-surface); opacity: 0.6;">
+                            <div class="flex items-center gap-2" style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
+                              HELPFUL?
+                              <button class="feedback-btn" title="Helpful" onclick={async () => {
+                                const rSlug = msg.routing?.slug || (selectedMode !== 'auto' ? selectedMode : projects[0]?.slug);
+                                if (!rSlug) return;
+                                const q = i > 0 ? messages[i-1]?.content : '';
+                                await fetch(`/api/projects/${rSlug}/feedback`, { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, answer: msg.content, rating: 'up' }) });
+                                if (msg.sqlQueries?.length) { for (const sql of msg.sqlQueries) { await fetch(`/api/projects/${rSlug}/save-query-pattern`, { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, sql }) }); } }
+                              }}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg></button>
+                              <button class="feedback-btn" title="Not helpful" onclick={async () => {
+                                const rSlug = msg.routing?.slug || (selectedMode !== 'auto' ? selectedMode : projects[0]?.slug);
+                                if (!rSlug) return;
+                                const q = i > 0 ? messages[i-1]?.content : '';
+                                await fetch(`/api/projects/${rSlug}/feedback`, { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, answer: msg.content, rating: 'down' }) });
+                              }}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/></svg></button>
+                            </div>
+                            <div class="flex items-center gap-2">
+                              <button class="feedback-btn flex items-center gap-1" onclick={() => copyMessage(i)} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="0"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                {copiedIndex === i ? 'COPIED' : 'COPY'}
+                              </button>
+                              {#if hasTables}
+                                <button class="feedback-btn flex items-center gap-1" onclick={() => {
+                                  const csv = tableToCsv(tables[0]);
+                                  const blob = new Blob([csv], { type: 'text/csv' });
+                                  const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `dash-export-${Date.now()}.csv`; a.click(); URL.revokeObjectURL(url);
+                                }} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">CSV</button>
+                              {/if}
+                              <button class="feedback-btn flex items-center gap-1" onclick={() => {
+                                const fact = prompt('Save a fact the agent should remember:', '');
+                                const slug = msg.routing?.slug || (selectedMode !== 'auto' ? selectedMode : projects[0]?.slug);
+                                if (fact && slug) { fetch(`/api/projects/${slug}/memories`, { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ fact, scope: 'project' }) }); }
+                              }} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v10M12 12l4-4M12 12l-4-4M5 17h14M5 21h14"/></svg>
+                                SAVE
+                              </button>
+                              <button class="feedback-btn flex items-center gap-1" onclick={() => {
+                                const tables = parseMarkdownTables(msg.content);
+                                const slug = msg.routing?.slug || (selectedMode !== 'auto' ? selectedMode : '');
+                                if (slug) openPinModal(mi, tables, msg.content, slug);
+                              }} disabled={!msg.routing?.slug && selectedMode === 'auto'} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; {(!msg.routing?.slug && selectedMode === 'auto') ? 'opacity: 0.4;' : ''}">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v10M12 12l4-4M12 12l-4-4M5 17h14M5 21h14"/></svg>
+                                PIN
+                              </button>
+                              <button class="feedback-btn flex items-center gap-1" onclick={async () => {
+                                try {
+                                  const res = await fetch('/api/export/pdf', { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ content: msg.content, title: 'Dash Agent Report' }) });
+                                  if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `dash-report-${Date.now()}.pdf`; a.click(); URL.revokeObjectURL(url); }
+                                } catch {}
+                              }} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                PDF
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
                       <!-- TAB: Analysis -->
-                      {#if currentTab === 'analysis'}
+                      {:else if currentTab === 'analysis'}
                         <div class="bubble-assistant">
                           <div class="prose-chat">
                             {@html markdownToHtml(msg.content)}
@@ -1564,11 +1704,75 @@
       </div>
 
       <div style="text-align: center; margin-top: 4px; font-size: 9px; color: var(--color-on-surface-dim); text-transform: uppercase; letter-spacing: 0.1em;">
-        DASH AGENT CAN MAKE MISTAKES. VERIFY CRITICAL INFORMATION.
+        <button onclick={async () => {
+          if (messages.length < 2) return;
+          const res = await fetch('/api/export/report-from-chat', {
+            method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: 'Dash Agent Report' })
+          });
+          if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `report-${Date.now()}.pdf`; a.click(); URL.revokeObjectURL(url); }
+        }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-on-surface-dim); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline;">GENERATE REPORT</button>
+        <button onclick={async () => {
+          const res = await fetch('/api/export/pptx-from-chat', {
+            method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: 'Dash Agent Analysis' })
+          });
+          if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `analysis-${Date.now()}.pptx`; a.click(); URL.revokeObjectURL(url); }
+        }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-on-surface-dim); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline; margin-left: 6px;">CREATE PPTX</button>
+        <button onclick={async () => {
+          const res = await fetch('/api/export/slides-from-chat', {
+            method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: 'Dash Agent Analysis', agent_name: 'Dash Agent' })
+          });
+          if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); window.open(url, '_blank'); }
+        }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-primary); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline; margin-left: 6px; font-weight: 900;">PRESENT</button>
+        <span style="margin-left: 8px;">DASH AGENT CAN MAKE MISTAKES. VERIFY CRITICAL INFORMATION.</span>
       </div>
     </div>
   </div>
 </div>
+
+<!-- PIN to Dashboard Modal -->
+{#if showPinModal}
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div style="position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; display: flex; align-items: center; justify-content: center;" onclick={(e) => { if (e.target === e.currentTarget) showPinModal = false; }}>
+  <div style="background: var(--color-surface); border: 3px solid var(--color-on-surface); width: 400px; box-shadow: 6px 6px 0 rgba(0,0,0,0.3);">
+    <div style="padding: 10px 16px; background: #1a1a1a; color: #fff; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; display: flex; justify-content: space-between; align-items: center;">
+      <span>PIN TO DASHBOARD</span>
+      <button onclick={() => showPinModal = false} style="background: none; border: none; color: #fff; cursor: pointer; font-size: 14px;">✕</button>
+    </div>
+    <div style="padding: 16px;">
+      <!-- Project info -->
+      <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">PROJECT</div>
+      <div style="padding: 6px 10px; border: 2px solid var(--color-on-surface); background: var(--color-surface-dim); font-size: 12px; margin-bottom: 12px; font-weight: 700;">{pinProjectSlug}</div>
+
+      <!-- Widget title -->
+      <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">WIDGET TITLE</div>
+      <input type="text" bind:value={pinWidgetTitle} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 12px; background: var(--color-surface); margin-bottom: 12px;" />
+
+      <!-- Select dashboard -->
+      <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 6px;">SELECT DASHBOARD</div>
+      {#if pinDashboards.length > 0}
+        <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; max-height: 120px; overflow-y: auto;">
+          {#each pinDashboards as d}
+            <button style="text-align: left; padding: 6px 10px; border: 2px solid {pinSelectedDash === d.id ? 'var(--color-primary)' : 'var(--color-on-surface)'}; background: {pinSelectedDash === d.id ? 'var(--color-primary-container)' : 'var(--color-surface-bright)'}; cursor: pointer; font-family: var(--font-family-display);" onclick={() => { pinSelectedDash = d.id; pinNewDashName = ''; }}>
+              <div style="font-size: 11px; font-weight: 900; text-transform: uppercase;">{d.name}</div>
+            </button>
+          {/each}
+        </div>
+      {/if}
+
+      <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">OR CREATE NEW</div>
+      <input type="text" bind:value={pinNewDashName} placeholder="New dashboard name..." onfocus={() => { pinSelectedDash = null; }} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 12px; background: var(--color-surface); margin-bottom: 16px;" />
+
+      <div style="display: flex; gap: 8px; justify-content: flex-end;">
+        <button onclick={() => showPinModal = false} style="padding: 8px 16px; font-size: 11px; font-weight: 900; border: 2px solid var(--color-on-surface); background: none; cursor: pointer; font-family: var(--font-family-display); text-transform: uppercase;">CANCEL</button>
+        <button onclick={confirmPin} disabled={!pinSelectedDash && !pinNewDashName.trim()} style="padding: 8px 16px; font-size: 11px; font-weight: 900; border: 2px solid var(--color-on-surface); background: var(--color-on-surface); color: var(--color-surface); cursor: pointer; font-family: var(--font-family-display); text-transform: uppercase;">PIN</button>
+      </div>
+    </div>
+  </div>
+</div>
+{/if}
 
 <!-- Save Presentation Modal -->
 {#if showSaveModal}

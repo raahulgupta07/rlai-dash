@@ -2229,18 +2229,104 @@ def _get_project_schema(request: Request, project: str | None = None) -> str | N
     return None
 
 
-def _extract_text(file_path: str, ext: str, raw_content: bytes) -> str:
-    """Extract text from various file formats."""
+def _extract_tables_pptx(file_path: str) -> list:
+    """Extract tables from PowerPoint slides as list of DataFrames."""
+    tables = []
+    try:
+        from pptx import Presentation
+        import pandas as pd
+        prs = Presentation(file_path)
+        for si, slide in enumerate(prs.slides):
+            for shape in slide.shapes:
+                if shape.has_table:
+                    tbl = shape.table
+                    rows_data = []
+                    for row in tbl.rows:
+                        rows_data.append([cell.text.strip() for cell in row.cells])
+                    if len(rows_data) > 1 and len(rows_data[0]) > 1:
+                        headers = rows_data[0]
+                        data = rows_data[1:]
+                        df = pd.DataFrame(data, columns=headers)
+                        # Clean column names
+                        df.columns = [str(c).strip().lower().replace(' ', '_').replace('.', '_')[:50] for c in df.columns]
+                        tables.append({
+                            'source': f'slide_{si+1}',
+                            'df': df,
+                            'rows': len(data),
+                            'cols': len(headers)
+                        })
+    except Exception:
+        pass
+    return tables
+
+
+def _extract_tables_pdf(file_path: str) -> list:
+    """Extract tables from PDF pages as list of DataFrames."""
+    tables = []
+    try:
+        import pdfplumber
+        import pandas as pd
+        with pdfplumber.open(file_path) as pdf:
+            for pi, page in enumerate(pdf.pages):
+                page_tables = page.extract_tables()
+                for ti, tbl in enumerate(page_tables or []):
+                    if tbl and len(tbl) > 1 and len(tbl[0]) > 1:
+                        headers = [str(h).strip().lower().replace(' ', '_').replace('.', '_')[:50] for h in tbl[0]]
+                        data = tbl[1:]
+                        df = pd.DataFrame(data, columns=headers)
+                        tables.append({
+                            'source': f'page_{pi+1}_table_{ti+1}',
+                            'df': df,
+                            'rows': len(data),
+                            'cols': len(headers)
+                        })
+    except Exception:
+        pass
+    return tables
+
+
+def _extract_tables_docx(file_path: str) -> list:
+    """Extract tables from DOCX as list of DataFrames."""
+    tables = []
+    try:
+        from docx import Document
+        import pandas as pd
+        doc = Document(file_path)
+        for ti, tbl in enumerate(doc.tables):
+            rows_data = []
+            for row in tbl.rows:
+                rows_data.append([cell.text.strip() for cell in row.cells])
+            if len(rows_data) > 1 and len(rows_data[0]) > 1:
+                headers = [str(h).strip().lower().replace(' ', '_').replace('.', '_')[:50] for h in rows_data[0]]
+                data = rows_data[1:]
+                df = pd.DataFrame(data, columns=headers)
+                tables.append({
+                    'source': f'table_{ti+1}',
+                    'df': df,
+                    'rows': len(data),
+                    'cols': len(headers)
+                })
+    except Exception:
+        pass
+    return tables
+
+
+def _extract_content(file_path: str, ext: str, raw_content: bytes) -> dict:
+    """Extract text AND tables from various file formats."""
+    # Get text (existing logic)
     if ext in (".md", ".txt", ".sql", ".py"):
-        return raw_content.decode("utf-8", errors="ignore")
+        text = raw_content.decode("utf-8", errors="ignore")
+        return {"text": text, "tables": []}
 
     if ext == ".docx":
         try:
             from docx import Document
             doc = Document(file_path)
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         except Exception:
-            return raw_content.decode("utf-8", errors="ignore")
+            text = raw_content.decode("utf-8", errors="ignore")
+        tables = _extract_tables_docx(file_path)
+        return {"text": text, "tables": tables}
 
     if ext == ".pptx":
         try:
@@ -2254,23 +2340,27 @@ def _extract_text(file_path: str, ext: str, raw_content: bytes) -> str:
                             t = para.text.strip()
                             if t:
                                 texts.append(t)
-            return "\n".join(texts)
+            text = "\n".join(texts)
         except Exception:
-            return ""
+            text = ""
+        tables = _extract_tables_pptx(file_path)
+        return {"text": text, "tables": tables}
 
     if ext == ".pdf":
         try:
-            import fitz  # PyMuPDF
+            import fitz
             doc = fitz.open(file_path)
             texts = []
             for page in doc:
                 texts.append(page.get_text())
             doc.close()
-            return "\n".join(texts)
+            text = "\n".join(texts)
         except Exception:
-            return ""
+            text = ""
+        tables = _extract_tables_pdf(file_path)
+        return {"text": text, "tables": tables}
 
-    return raw_content.decode("utf-8", errors="ignore")
+    return {"text": raw_content.decode("utf-8", errors="ignore"), "tables": []}
 
 
 @router.post("/upload")
@@ -2285,20 +2375,29 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported format: {ext}. Allowed: {', '.join(ALLOWED_EXTENSIONS)}")
 
-    # Read file
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(400, f"File too large. Max: {MAX_FILE_SIZE // (1024*1024)} MB")
-
-    # Save to temp
+    # Stream to temp file instead of loading to memory
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-        tmp.write(content)
+        size = 0
+        while chunk := await file.read(1024 * 1024):  # 1MB chunks
+            size += len(chunk)
+            if size > MAX_FILE_SIZE:
+                raise HTTPException(400, f"File too large. Max: {MAX_FILE_SIZE // (1024*1024)} MB")
+            tmp.write(chunk)
         tmp_path = tmp.name
+
+    # For text files, read content from temp file (needed by _extract_content)
+    if ext in ('.md', '.txt', '.sql', '.py'):
+        with open(tmp_path, 'rb') as f:
+            content = f.read()
+    else:
+        content = b''  # Don't hold file content in memory
 
     # Smart routing for non-data files (SQL, MD, TXT, DOCX, PPTX, PDF)
     if ext in (".sql", ".md", ".txt", ".docx", ".pptx", ".pdf") and project:
         try:
-            text_content = _extract_text(tmp_path, ext, content)
+            extracted = _extract_content(tmp_path, ext, content)
+            text_content = extracted["text"]
+            doc_tables = extracted["tables"]
             file_type = classify_file(file.filename, content_sample=text_content[:500])
 
             if file_type == "sql_patterns":
@@ -2344,8 +2443,33 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                         indexed = True
                     except Exception:
                         pass
+                # Save extracted tables to PostgreSQL
+                tables_saved = 0
+                if doc_tables and project:
+                    try:
+                        import pandas as pd
+                        from db import get_project_engine
+                        from db.session import create_project_schema
+                        schema = create_project_schema(project)
+                        engine = get_project_engine(project)
+                        for tbl_info in doc_tables:
+                            df = tbl_info["df"]
+                            if len(df) < 2 or len(df.columns) < 2:
+                                continue
+                            # Generate table name from filename + source
+                            base_name = Path(file.filename).stem.lower()
+                            base_name = re.sub(r'[^a-z0-9_]', '_', base_name)[:30]
+                            tbl_name = f"{base_name}_{tbl_info['source']}"
+                            tbl_name = re.sub(r'_+', '_', tbl_name).strip('_')
+                            try:
+                                df.to_sql(tbl_name, engine, schema=schema, if_exists='replace', index=False)
+                                tables_saved += 1
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 Path(tmp_path).unlink(missing_ok=True)
-                return {"status": "ok", "file_type": "documentation", "filename": save_name, "indexed": indexed}
+                return {"status": "ok", "file_type": "documentation", "filename": save_name, "indexed": indexed, "tables_saved": tables_saved}
         except Exception:
             pass
 
@@ -2708,15 +2832,18 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large")
 
-    # Extract text from binary formats
+    # Extract text and tables from binary formats
     if ext in (".pptx", ".docx", ".pdf"):
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             tmp.write(content)
             tmp_path = tmp.name
-        text_content = _extract_text(tmp_path, ext, content)
+        extracted = _extract_content(tmp_path, ext, content)
+        text_content = extracted["text"]
+        doc_tables = extracted["tables"]
         import os; os.unlink(tmp_path)
     else:
         text_content = content.decode("utf-8", errors="replace")
+        doc_tables = []
     doc_name = Path(file.filename).stem
 
     # Per-project or global docs dir
@@ -2748,7 +2875,33 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
     except Exception as e:
         raise HTTPException(500, f"Indexing failed: {str(e)}")
 
-    return {"status": "ok", "filename": file.filename, "type": ext, "size": len(text_content), "indexed": True}
+    # Save extracted tables to PostgreSQL
+    tables_saved = 0
+    if doc_tables and project:
+        try:
+            import pandas as pd
+            from db import get_project_engine
+            from db.session import create_project_schema
+            schema = create_project_schema(project)
+            engine = get_project_engine(project)
+            for tbl_info in doc_tables:
+                df = tbl_info["df"]
+                if len(df) < 2 or len(df.columns) < 2:
+                    continue
+                # Generate table name from filename + source
+                base_name = Path(file.filename).stem.lower()
+                base_name = re.sub(r'[^a-z0-9_]', '_', base_name)[:30]
+                tbl_name = f"{base_name}_{tbl_info['source']}"
+                tbl_name = re.sub(r'_+', '_', tbl_name).strip('_')
+                try:
+                    df.to_sql(tbl_name, engine, schema=schema, if_exists='replace', index=False)
+                    tables_saved += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return {"status": "ok", "filename": file.filename, "type": ext, "size": len(text_content), "indexed": True, "tables_saved": tables_saved}
 
 
 @router.get("/docs")
