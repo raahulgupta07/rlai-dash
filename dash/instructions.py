@@ -140,12 +140,21 @@ that answers the question faster than querying raw tables.
 
 ## Workflow
 
-1. **Search knowledge** — check for validated queries, table schemas, business rules, and dash views.
+1. **ALWAYS search knowledge base first** — check for documents, validated queries, table schemas, business rules, and dash views. This is CRITICAL — uploaded documents (PPTX, PDF, DOCX) are stored here.
 2. **Search learnings** — check for error patterns, type gotchas, column quirks.
-3. **Write SQL** — LIMIT 50 by default, no SELECT *, ORDER BY for rankings.
-4. **Execute** via SQLTools.
-5. **On error** → use `introspect_schema` to inspect the actual schema → fix → `save_learning`.
-6. **On success** → provide **insights**, not just data. Offer `save_validated_query` if reusable.
+3. **If data tables exist** → Write SQL, LIMIT 50 by default, no SELECT *, ORDER BY for rankings.
+4. **If NO data tables exist** → Answer from knowledge base search results and agent memories. Do NOT say "I don't have data" — search the knowledge base first.
+5. **Execute** via SQLTools (only if tables exist).
+6. **On error** → use `introspect_schema` to inspect the actual schema → fix → `save_learning`.
+7. **On success** → provide **insights**, not just data. Offer `save_validated_query` if reusable.
+
+## IMPORTANT: Document-Only Projects
+When there are NO SQL tables but documents have been uploaded (PPTX, PDF, DOCX):
+- ALWAYS use `search_knowledge_base` to find information from uploaded documents
+- Answer questions using the document content found in knowledge search
+- Use agent memories (facts extracted during training) to supplement answers
+- NEVER say "I don't have data" without searching knowledge first
+- You CAN answer questions about project scope, goals, KPIs, rules, and context from documents
 
 ## When to save_learning
 
@@ -562,6 +571,25 @@ def build_analyst_instructions(user_id: str | None = None, project_slug: str | N
         sl = _build_self_learning_context(project_slug, actual_user_id=actual_user_id)
         if sl:
             parts.append(sl)
+
+    # For doc-only projects: inject document summaries directly into prompt
+    has_project_tables = project_slug and (KNOWLEDGE_DIR / project_slug / "tables").exists() and list((KNOWLEDGE_DIR / project_slug / "tables").glob("*.json"))
+    if project_slug and not has_project_tables:
+        from dash.paths import KNOWLEDGE_DIR
+        docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
+        if docs_dir.exists():
+            doc_texts = []
+            for f in sorted(docs_dir.iterdir()):
+                if f.is_file():
+                    try:
+                        content = f.read_text(errors='ignore')[:3000]
+                        if content.strip():
+                            doc_texts.append(f"### Document: {f.name}\n{content}")
+                    except Exception:
+                        pass
+            if doc_texts:
+                doc_section = "## UPLOADED DOCUMENTS\n\nThis project has NO data tables — only uploaded documents. Answer ALL questions from this context.\n\n" + "\n\n---\n\n".join(doc_texts[:5])
+                parts.append(doc_section)
 
     final_prompt = "\n\n---\n\n".join(parts)
 
