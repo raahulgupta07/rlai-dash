@@ -3541,27 +3541,168 @@ def retrain_project(slug: str, request: Request):
 
     tables = insp.get_table_names(schema=schema)
     if not tables:
-        # Doc-only project — still index knowledge base
+        # Doc-only project — index knowledge + fill brain from doc text
         import threading
+        import time as _time
         def _bg_docs_only():
+            _log_entries = []
+            def _dlog(msg):
+                _log_entries.append({"ts": _time.strftime('%H:%M:%S'), "msg": msg})
+
             try:
-                # Index knowledge
-                _reload_project_knowledge(slug, timeout_sec=60)
-                # Create training run record
                 eng = create_engine(db_url)
+
+                # Step 1: Index knowledge
+                _dlog("indexing documents into knowledge base...")
+                _reload_project_knowledge(slug, timeout_sec=60)
+                _dlog("✓ knowledge indexed")
+
+                # Step 2: Read all doc text for LLM context
+                docs_dir = KNOWLEDGE_DIR / slug / "docs"
+                all_text = ""
+                if docs_dir.exists():
+                    for f in docs_dir.iterdir():
+                        if f.is_file():
+                            try:
+                                all_text += f.read_text(errors='ignore')[:5000] + "\n\n"
+                            except Exception:
+                                pass
+                all_text = all_text[:8000]
+
+                if not all_text.strip():
+                    _dlog("· no document text found — skipping brain fill")
+                else:
+                    # Step 3: Generate memories from docs
+                    _dlog("generating memories from documents...")
+                    try:
+                        result = training_llm_call(
+                            f"Extract 5-8 key facts from this document that a data analyst should remember.\n\n"
+                            f"DOCUMENT:\n{all_text[:4000]}\n\n"
+                            f"Return ONLY valid JSON array of strings:\n"
+                            f'["fact 1", "fact 2", "fact 3"]',
+                            "extraction"
+                        )
+                        if result:
+                            facts = json.loads(result)
+                            if isinstance(facts, list):
+                                saved = 0
+                                with eng.connect() as conn:
+                                    for fact in facts[:8]:
+                                        if isinstance(fact, str) and len(fact) > 10:
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_memories (project_slug, scope, fact, source) "
+                                                "VALUES (:s, 'project', :f, 'auto_training') ON CONFLICT DO NOTHING"
+                                            ), {"s": slug, "f": fact})
+                                            saved += 1
+                                    conn.commit()
+                                _dlog(f"✓ {saved} memories saved")
+                    except Exception as e:
+                        _dlog(f"⚠ memories error: {str(e)[:60]}")
+
+                    # Step 4: Generate persona
+                    _dlog("generating agent persona...")
+                    try:
+                        result = training_llm_call(
+                            f"Based on this document, generate a JSON persona for an AI agent:\n\n"
+                            f"DOCUMENT:\n{all_text[:3000]}\n\n"
+                            f'Return: {{"persona_prompt": "You are an expert...", "domain_terms": ["term1"], "expertise_areas": ["area1"], "greeting": "Hi! ..."}}',
+                            "persona"
+                        )
+                        if result:
+                            persona = json.loads(result)
+                            if isinstance(persona, dict) and persona.get("persona_prompt"):
+                                persona_file = KNOWLEDGE_DIR / slug / "persona.json"
+                                persona_file.parent.mkdir(parents=True, exist_ok=True)
+                                with open(persona_file, "w") as f:
+                                    json.dump(persona, f, indent=2)
+                                with eng.connect() as conn:
+                                    conn.execute(text(
+                                        "INSERT INTO public.dash_personas (project_slug, persona) VALUES (:s, CAST(:p AS jsonb)) "
+                                        "ON CONFLICT (project_slug) DO UPDATE SET persona = CAST(:p AS jsonb)"
+                                    ), {"s": slug, "p": json.dumps(persona)})
+                                    conn.commit()
+                                _dlog("✓ persona generated")
+                    except Exception as e:
+                        _dlog(f"⚠ persona error: {str(e)[:60]}")
+
+                    # Step 5: Generate workflows
+                    _dlog("generating sample workflows...")
+                    try:
+                        result = training_llm_call(
+                            f"Based on this document, generate 3 analysis workflows an analyst might run.\n\n"
+                            f"DOCUMENT:\n{all_text[:3000]}\n\n"
+                            f'Return JSON array: [{{"name": "Workflow Name", "description": "What it does", "steps": ["Step 1 question", "Step 2 question", "Step 3 question"]}}]',
+                            "extraction"
+                        )
+                        if result:
+                            wfs = json.loads(result)
+                            if isinstance(wfs, list):
+                                saved = 0
+                                with eng.connect() as conn:
+                                    for wf in wfs[:3]:
+                                        if isinstance(wf, dict) and wf.get("name"):
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_workflows_db (project_slug, name, description, steps, source) "
+                                                "VALUES (:s, :n, :d, CAST(:st AS jsonb), 'training') ON CONFLICT DO NOTHING"
+                                            ), {"s": slug, "n": wf["name"], "d": wf.get("description", ""), "st": json.dumps(wf.get("steps", []))})
+                                            saved += 1
+                                    conn.commit()
+                                _dlog(f"✓ {saved} workflows saved")
+                    except Exception as e:
+                        _dlog(f"⚠ workflows error: {str(e)[:60]}")
+
+                    # Step 6: Generate evals
+                    _dlog("generating eval questions...")
+                    try:
+                        result = training_llm_call(
+                            f"Based on this document, generate 3 test questions an analyst might ask.\n\n"
+                            f"DOCUMENT:\n{all_text[:3000]}\n\n"
+                            f'Return JSON array: [{{"question": "What is X?", "expected_answer": "X is..."}}]',
+                            "extraction"
+                        )
+                        if result:
+                            evals = json.loads(result)
+                            if isinstance(evals, list):
+                                saved = 0
+                                with eng.connect() as conn:
+                                    for ev in evals[:5]:
+                                        if isinstance(ev, dict) and ev.get("question"):
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_evals (project_slug, question, expected_sql) VALUES (:s, :q, :a)"
+                                            ), {"s": slug, "q": ev["question"], "a": ev.get("expected_answer", "")})
+                                            saved += 1
+                                    conn.commit()
+                                _dlog(f"✓ {saved} eval questions saved")
+                    except Exception as e:
+                        _dlog(f"⚠ evals error: {str(e)[:60]}")
+
+                    # Step 7: Seed feedback
+                    _dlog("seeding sample feedback...")
+                    try:
+                        with eng.connect() as conn:
+                            conn.execute(text(
+                                "INSERT INTO public.dash_feedback (project_slug, question, answer, rating) "
+                                "VALUES (:s, 'What is this project about?', :a, 'up')"
+                            ), {"s": slug, "a": all_text[:500]})
+                            conn.commit()
+                        _dlog("✓ 1 seed feedback saved")
+                    except Exception:
+                        pass
+
+                _dlog("✓ doc-only training complete")
+
+                # Save training run
                 with eng.connect() as conn:
                     conn.execute(text(
                         "INSERT INTO public.dash_training_runs (project_slug, status, steps, logs) "
                         "VALUES (:s, 'done', 'complete', CAST(:logs AS jsonb))"
-                    ), {"s": slug, "logs": json.dumps([
-                        {"ts": __import__('time').strftime('%H:%M:%S'), "msg": "No data tables — indexing docs only"},
-                        {"ts": __import__('time').strftime('%H:%M:%S'), "msg": "✓ knowledge indexed from documents"},
-                    ])})
+                    ), {"s": slug, "logs": json.dumps(_log_entries)})
                     conn.commit()
+
             except Exception:
                 pass
         threading.Thread(target=_bg_docs_only, daemon=True).start()
-        return {"status": "ok", "tables": 0, "message": "No data tables — indexing documents only"}
+        return {"status": "ok", "tables": 0, "message": "Doc-only project — indexing documents and filling brain"}
 
     import pandas as pd
 
