@@ -3588,7 +3588,32 @@ def retrain_project(slug: str, request: Request):
             try:
                 eng = create_engine(db_url)
 
+                # Create training run for UI tracking
+                run_id = None
+                try:
+                    with eng.connect() as conn:
+                        r = conn.execute(text(
+                            "INSERT INTO public.dash_training_runs (project_slug, status, steps) "
+                            "VALUES (:s, 'running', 'reindex') RETURNING id"
+                        ), {"s": slug})
+                        run_id = r.fetchone()[0]
+                        conn.commit()
+                except Exception:
+                    pass
+
+                def _update_step(step_name):
+                    if run_id:
+                        try:
+                            with eng.connect() as conn:
+                                conn.execute(text(
+                                    "UPDATE public.dash_training_runs SET steps = :s, logs = CAST(:logs AS jsonb) WHERE id = :id"
+                                ), {"s": step_name, "logs": json.dumps(_log_entries), "id": run_id})
+                                conn.commit()
+                        except Exception:
+                            pass
+
                 # Step 1: Index knowledge
+                _update_step("reindex")
                 _dlog("indexing documents into knowledge base...")
                 _reload_project_knowledge(slug, timeout_sec=60)
                 _dlog("✓ knowledge indexed")
@@ -3609,6 +3634,7 @@ def retrain_project(slug: str, request: Request):
                     _dlog("· no document text found — skipping brain fill")
                 else:
                     # Step 3: Generate memories from docs
+                    _update_step("brain_fill")
                     _dlog("generating memories from documents...")
                     try:
                         result = training_llm_call(
@@ -3636,6 +3662,7 @@ def retrain_project(slug: str, request: Request):
                         _dlog(f"⚠ memories error: {str(e)[:60]}")
 
                     # Step 4: Generate persona
+                    _update_step("persona")
                     _dlog("generating agent persona...")
                     try:
                         result = training_llm_call(
@@ -3662,6 +3689,7 @@ def retrain_project(slug: str, request: Request):
                         _dlog(f"⚠ persona error: {str(e)[:60]}")
 
                     # Step 5: Generate workflows
+                    _update_step("synthesis")
                     _dlog("generating sample workflows...")
                     try:
                         result = training_llm_call(
@@ -3726,6 +3754,7 @@ def retrain_project(slug: str, request: Request):
                         pass
 
                     # Step 8: Extract business rules from docs
+                    _update_step("domain_knowledge")
                     _dlog("extracting business rules from documents...")
                     try:
                         result = training_llm_call(
@@ -3826,6 +3855,7 @@ def retrain_project(slug: str, request: Request):
                         _dlog(f"⚠ insights error: {str(e)[:60]}")
 
                     # Step 11: Cross-document relationships
+                    _update_step("relationships")
                     _dlog("discovering cross-document relationships...")
                     try:
                         doc_summaries = []
@@ -3866,19 +3896,93 @@ def retrain_project(slug: str, request: Request):
                     except Exception as e:
                         _dlog(f"⚠ relationships error: {str(e)[:60]}")
 
+                    # Step 12: Negative examples
+                    _dlog("extracting negative examples...")
+                    try:
+                        result = training_llm_call(
+                            f"Based on this document, what are common mistakes someone might make when interpreting this information?\n\n"
+                            f"DOCUMENT:\n{all_text[:3000]}\n\n"
+                            f'Return JSON array of "DON\'T / DO" pairs:\n'
+                            f'["DON\'T confuse X with Y — DO use Z instead", "DON\'T assume A — DO check B"]',
+                            "extraction"
+                        )
+                        if result:
+                            negs = json.loads(result)
+                            if isinstance(negs, list):
+                                saved = 0
+                                with eng.connect() as conn:
+                                    for neg in negs[:5]:
+                                        if isinstance(neg, str) and len(neg) > 10:
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_memories (project_slug, scope, fact, source) "
+                                                "VALUES (:s, 'project', :f, 'negative_example') ON CONFLICT DO NOTHING"
+                                            ), {"s": slug, "f": f"⚠ {neg}"})
+                                            saved += 1
+                                    conn.commit()
+                                _dlog(f"✓ {saved} negative examples saved")
+                    except Exception as e:
+                        _dlog(f"⚠ negative examples error: {str(e)[:60]}")
+
+                    # Step 13: Training Q&A from docs
+                    _dlog("generating training Q&A...")
+                    try:
+                        result = training_llm_call(
+                            f"Generate 5 question-answer pairs that test understanding of this document.\n\n"
+                            f"DOCUMENT:\n{all_text[:3000]}\n\n"
+                            f'Return JSON array: [{{"question": "What is...?", "answer": "It is..."}}]',
+                            "extraction"
+                        )
+                        if result:
+                            qas = json.loads(result)
+                            if isinstance(qas, list):
+                                qa_file = KNOWLEDGE_DIR / slug / "training"
+                                qa_file.mkdir(parents=True, exist_ok=True)
+                                with open(qa_file / "doc_qa.json", "w") as f:
+                                    json.dump(qas, f, indent=2)
+                                _dlog(f"✓ {len(qas)} training Q&A pairs generated")
+                    except Exception as e:
+                        _dlog(f"⚠ Q&A error: {str(e)[:60]}")
+
+                    # Step 14: Multi-doc synthesis
+                    if len([f for f in docs_dir.iterdir() if f.is_file()]) >= 2:
+                        _dlog("running multi-document synthesis...")
+                        try:
+                            doc_names = [f.name for f in docs_dir.iterdir() if f.is_file()]
+                            result = training_llm_call(
+                                f"These documents are part of the same project. Create a unified understanding.\n\n"
+                                f"DOCUMENTS: {', '.join(doc_names)}\n\n"
+                                f"CONTENT:\n{all_text[:5000]}\n\n"
+                                f"Write a 3-4 sentence synthesis that explains how these documents relate and what the overall project is about.",
+                                "persona"
+                            )
+                            if result:
+                                with eng.connect() as conn:
+                                    conn.execute(text(
+                                        "INSERT INTO public.dash_memories (project_slug, scope, fact, source) "
+                                        "VALUES (:s, 'project', :f, 'synthesis') ON CONFLICT DO NOTHING"
+                                    ), {"s": slug, "f": f"Project synthesis: {result[:500]}"})
+                                    conn.commit()
+                                _dlog("✓ multi-document synthesis complete")
+                        except Exception as e:
+                            _dlog(f"⚠ synthesis error: {str(e)[:60]}")
+
                 _dlog("✓ doc-only training complete")
 
-                # Save training run
+                # Save training run with proper step tracking
+                run_id = None
                 with eng.connect() as conn:
-                    conn.execute(text(
-                        "INSERT INTO public.dash_training_runs (project_slug, status, steps, logs) "
-                        "VALUES (:s, 'done', 'complete', CAST(:logs AS jsonb))"
+                    r = conn.execute(text(
+                        "INSERT INTO public.dash_training_runs (project_slug, status, steps, logs, finished_at) "
+                        "VALUES (:s, 'done', 'complete', CAST(:logs AS jsonb), NOW()) RETURNING id"
                     ), {"s": slug, "logs": json.dumps(_log_entries)})
+                    run_id = r.fetchone()[0]
                     conn.commit()
 
             except Exception:
                 pass
-        threading.Thread(target=_bg_docs_only, daemon=True).start()
+        from concurrent.futures import ThreadPoolExecutor
+        _bg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="dash-bg")
+        _bg_executor.submit(_bg_docs_only)
         return {"status": "ok", "tables": 0, "message": "Doc-only project — indexing documents and filling brain"}
 
     import pandas as pd
