@@ -514,6 +514,10 @@
             </button>
             <!-- Dashboard picker removed — now uses global /ui/dashboard -->
           </div>
+          <button onclick={() => window.location.href = '/ui/presentations'} class="nav-btn" class:nav-btn-active={page.url.pathname.includes('/presentations')} style="cursor: pointer;">
+            <svg width="12" height="12" viewBox="0 0 24 24"><defs><linearGradient id="navpg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#D24726"/><stop offset="100%" stop-color="#F0A030"/></linearGradient></defs><rect x="2" y="2" width="20" height="20" rx="3" fill="url(#navpg)"/><text x="12" y="16" text-anchor="middle" fill="#fff" font-size="11" font-weight="900" font-family="Arial">P</text></svg>
+            PRESENTATIONS
+          </button>
           {#if isSuper}
             <button onclick={() => window.location.href = '/ui/command-center'} class="nav-btn" class:nav-btn-active={isDashboard} style="cursor: pointer;">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>

@@ -553,7 +553,23 @@ def _bootstrap_tables():
             conn.execute(text("ALTER TABLE public.dash_table_metadata ADD COLUMN IF NOT EXISTS row_count INTEGER DEFAULT 0"))
             conn.execute(text("ALTER TABLE public.dash_table_metadata ADD COLUMN IF NOT EXISTS col_hash TEXT"))
         except Exception:
-            pass
+            conn.rollback()
+        try:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS public.dash_presentations (
+                    id SERIAL PRIMARY KEY,
+                    project_slug TEXT NOT NULL,
+                    user_id INTEGER,
+                    title TEXT NOT NULL,
+                    version INTEGER DEFAULT 1,
+                    thinking JSONB,
+                    slides JSONB NOT NULL DEFAULT '[]',
+                    source_messages JSONB,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+        except Exception:
+            conn.rollback()
         conn.commit()
 
 

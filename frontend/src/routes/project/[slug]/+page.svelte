@@ -6,6 +6,11 @@
   import type { ParsedTable } from '$lib/table-parser';
   import type { ChartType } from '$lib/chart-detect';
   import EChartView from '$lib/echart.svelte';
+  import * as echarts from 'echarts/core';
+  import { BarChart, LineChart, PieChart, ScatterChart } from 'echarts/charts';
+  import { TitleComponent, TooltipComponent, LegendComponent, GridComponent } from 'echarts/components';
+  import { CanvasRenderer } from 'echarts/renderers';
+  echarts.use([BarChart, LineChart, PieChart, ScatterChart, TitleComponent, TooltipComponent, LegendComponent, GridComponent, CanvasRenderer]);
   import TracePanel from '$lib/trace-panel.svelte';
   import DashboardPanel from '$lib/dashboard-panel.svelte';
 
@@ -538,16 +543,44 @@
   let slidesLoading = $state(false);
   let slidesProgress = $state('');
   let currentSlide = $state(0);
+  let showSaveModal = $state(false);
+  let saveTitle = $state('');
+  let pptxSteps = $state<{label: string; status: 'pending'|'active'|'done'|'error'}[]>([]);
+  let pptxGenerating = $state(false);
+  let pptxSavedVersion = $state(0);
 
   async function generateSlides() {
     if (messages.length < 2 || slidesLoading) return;
     slidesLoading = true;
-    slidesProgress = 'Analyzing conversation...';
+    pptxGenerating = true;
     slidesPanelOpen = true;
     slidesData = [];
+    slidesThinking = null;
     currentSlide = 0;
+    pptxSavedVersion = 0;
+
+    pptxSteps = [
+      { label: `Reading conversation (${messages.filter(m => m.role === 'user').length} questions)`, status: 'active' },
+      { label: 'Analyzing narrative and key insights', status: 'pending' },
+      { label: 'Planning slide structure', status: 'pending' },
+      { label: 'Generating slide content', status: 'pending' },
+    ];
+
+    const updateStep = (idx: number, status: 'done'|'active'|'error', label?: string) => {
+      pptxSteps = pptxSteps.map((s, i) => {
+        if (i === idx) return { ...s, status, label: label || s.label };
+        if (i < idx && s.status !== 'error') return { ...s, status: 'done' };
+        return s;
+      });
+    };
 
     try {
+      await new Promise(r => setTimeout(r, 300));
+      updateStep(0, 'done');
+      updateStep(1, 'active');
+      await new Promise(r => setTimeout(r, 200));
+      updateStep(2, 'active');
+
       const res = await fetch('/api/export/slides-agent', {
         method: 'POST',
         headers: { ..._headers(), 'Content-Type': 'application/json' },
@@ -562,14 +595,264 @@
         const data = await res.json();
         slidesThinking = data.thinking;
         slidesData = data.slides || [];
-        slidesProgress = 'Done';
+        updateStep(1, 'done');
+        updateStep(2, 'done', `Planned ${slidesData.length} slides`);
+        updateStep(3, 'done');
       } else {
-        slidesProgress = 'Failed to generate slides';
+        updateStep(2, 'error', 'Failed to generate slides');
       }
     } catch (e) {
-      slidesProgress = 'Error generating slides';
+      const failIdx = pptxSteps.findIndex(s => s.status === 'active');
+      if (failIdx >= 0) pptxSteps = pptxSteps.map((s, i) => i === failIdx ? { ...s, status: 'error' as const, label: 'Error' } : s);
     }
     slidesLoading = false;
+    pptxGenerating = false;
+    // Auto-show slides after 1 second
+    if (slidesData.length > 0) {
+      setTimeout(() => { pptxSteps = []; }, 1500);
+    }
+  }
+
+  async function savePresentation() {
+    if (slidesData.length === 0) return;
+    saveTitle = (projectInfo?.agent_name || 'Agent') + ' Analysis';
+    showSaveModal = true;
+  }
+
+  async function confirmSave() {
+    if (!saveTitle.trim()) return;
+    try {
+      const res = await fetch('/api/export/presentations', {
+        method: 'POST',
+        headers: { ..._headers(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_slug: projectSlug,
+          title: saveTitle.trim(),
+          thinking: slidesThinking,
+          slides: slidesData,
+          source_messages: messages.map(m => ({ role: m.role, content: m.content }))
+        })
+      });
+      if (res.ok) {
+        const d = await res.json();
+        showSaveModal = false;
+        slidesProgress = `Saved as v${d.version}`;
+        setTimeout(() => slidesProgress = '', 3000);
+      }
+    } catch {}
+  }
+
+  async function downloadPptx() {
+    if (messages.length < 2 || pptxGenerating) return;
+    pptxGenerating = true;
+    slidesPanelOpen = true;
+    slidesData = [];
+    slidesThinking = null;
+    pptxSavedVersion = 0;
+    const agentTitle = (projectInfo?.agent_name || 'Agent') + ' Analysis';
+
+    pptxSteps = [
+      { label: `Reading conversation (${messages.filter(m => m.role === 'user').length} questions)`, status: 'active' },
+      { label: 'Analyzing narrative and key insights', status: 'pending' },
+      { label: 'Planning slides', status: 'pending' },
+      { label: 'Generating slide content', status: 'pending' },
+      { label: 'Creating PowerPoint file', status: 'pending' },
+      { label: 'Saving to presentations', status: 'pending' },
+      { label: 'Downloading PPTX', status: 'pending' },
+    ];
+
+    const updateStep = (idx: number, status: 'done'|'active'|'error', label?: string) => {
+      pptxSteps = pptxSteps.map((s, i) => {
+        if (i === idx) return { ...s, status, label: label || s.label };
+        if (i < idx && s.status !== 'error') return { ...s, status: 'done' };
+        return s;
+      });
+    };
+
+    try {
+      // Step 1: Read conversation
+      await new Promise(r => setTimeout(r, 300));
+      updateStep(0, 'done');
+      updateStep(1, 'active');
+
+      // Step 2-4: Call slides-agent (think + generate)
+      await new Promise(r => setTimeout(r, 200));
+      updateStep(2, 'active');
+      const agentRes = await fetch('/api/export/slides-agent', {
+        method: 'POST',
+        headers: { ..._headers(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: messages.map(m => ({ role: m.role, content: m.content })),
+          title: agentTitle,
+          agent_name: projectInfo?.agent_name || 'Agent'
+        })
+      });
+
+      if (!agentRes.ok) { updateStep(2, 'error', 'Failed to analyze conversation'); pptxGenerating = false; return; }
+      const agentData = await agentRes.json();
+      slidesThinking = agentData.thinking;
+      slidesData = agentData.slides || [];
+      updateStep(1, 'done');
+      updateStep(2, 'done', `Planning ${slidesData.length} slides`);
+      updateStep(3, 'done');
+      updateStep(4, 'active');
+
+      // Step 5: Save to DB
+      await new Promise(r => setTimeout(r, 300));
+      updateStep(5, 'active');
+      const saveRes = await fetch('/api/export/presentations', {
+        method: 'POST',
+        headers: { ..._headers(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_slug: projectSlug,
+          title: agentTitle,
+          thinking: slidesThinking,
+          slides: slidesData,
+          source_messages: messages.map(m => ({ role: m.role, content: m.content }))
+        })
+      });
+
+      let presId = 0;
+      if (saveRes.ok) {
+        const d = await saveRes.json();
+        presId = d.id;
+        pptxSavedVersion = d.version;
+        updateStep(5, 'done', `Saved as "${agentTitle} v${d.version}"`);
+      } else {
+        updateStep(5, 'error', 'Save failed');
+      }
+
+      // Step 6: Create and download PPTX
+      updateStep(4, 'done');
+      updateStep(6, 'active');
+      if (presId) {
+        const pptxRes = await fetch(`/api/export/presentations/${presId}/pptx`, {
+          method: 'POST', headers: _headers()
+        });
+        if (pptxRes.ok) {
+          const blob = await pptxRes.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${projectInfo?.agent_name || 'presentation'}-v${pptxSavedVersion}.pptx`;
+          a.click();
+          URL.revokeObjectURL(url);
+          updateStep(6, 'done', `Downloaded ${projectInfo?.agent_name}-v${pptxSavedVersion}.pptx`);
+        } else {
+          updateStep(6, 'error', 'Download failed');
+        }
+      }
+    } catch (e) {
+      const failIdx = pptxSteps.findIndex(s => s.status === 'active');
+      if (failIdx >= 0) updateStep(failIdx, 'error', 'Failed');
+    }
+    pptxGenerating = false;
+  }
+
+  function downloadHTML() {
+    if (slidesData.length === 0) return;
+    const title = (projectInfo?.agent_name || 'Presentation') + ' Analysis';
+    const date = new Date().toLocaleDateString('en-US', {month: 'long', day: 'numeric', year: 'numeric'});
+    const agent = projectInfo?.agent_name || 'Agent';
+    const narrative = slidesThinking?.narrative || '';
+    const keyInsight = slidesThinking?.key_insight || '';
+
+    let slidesHTML = '';
+    for (let i = 0; i < slidesData.length; i++) {
+      const s = slidesData[i];
+      const layout = s.layout || 'bullets';
+      const sTitle = s.title || '';
+      const bullets = (s.bullets || []).map((b: string, bi: number) => `<div style="font-size:16px;color:#333;padding:10px 14px;border-left:4px solid #D24726;margin-bottom:8px;background:#fafaf8;"><span style="font-weight:800;color:#D24726;">${bi+1}.</span> ${b}</div>`).join('');
+      const actionLine = s.action_line ? `<div style="margin-top:20px;padding:12px 16px;border-top:2px solid #1a1a1a;font-size:13px;font-weight:700;">${s.action_line}</div>` : '';
+      const topic = s.topic || 'ANALYSIS';
+
+      let content = '';
+      if (layout === 'cover') {
+        content = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;text-align:center;">
+          <div style="font-size:42px;font-weight:900;color:#1a1a1a;max-width:700px;">${sTitle}</div>
+          <div style="width:80px;height:3px;background:linear-gradient(90deg,#D24726,#F0A030);margin:24px auto;"></div>
+          ${s.bullets?.[0] ? `<div style="font-size:18px;color:#666;">${s.bullets[0]}</div>` : ''}
+          <div style="font-size:12px;color:#999;margin-top:40px;text-transform:uppercase;letter-spacing:0.1em;">${agent} &middot; ${date}</div>
+          <div style="font-size:10px;color:#bbb;margin-top:8px;letter-spacing:0.15em;">POWERED BY RLAI DASH</div>
+        </div>`;
+      } else if (layout === 'kpi' && s.kpis?.length) {
+        const kpis = s.kpis.map((k: any) => `<div style="flex:1;text-align:center;padding:24px;border:2px solid #e0e0d8;">
+          <div style="font-size:42px;font-weight:900;">${k.value}</div>
+          <div style="font-size:11px;color:#888;text-transform:uppercase;margin-top:6px;">${k.label}</div>
+          ${k.change ? `<div style="font-size:16px;font-weight:700;color:${k.change?.startsWith('+') ? '#00873c' : '#d32f2f'};margin-top:4px;">${k.change}</div>` : ''}
+        </div>`).join('');
+        content = `<div style="font-size:22px;font-weight:800;margin-bottom:20px;">${sTitle}</div>
+          <div style="width:100%;height:2px;background:#1a1a1a;margin-bottom:24px;"></div>
+          <div style="display:flex;gap:16px;margin:20px 0;">${kpis}</div>${bullets}${actionLine}`;
+      } else if (s.chart) {
+        const chartId = 'chart_' + i;
+        const chartType = s.chart.type === 'horizontal_bar' ? 'bar' : (s.chart.type || 'bar');
+        const labels = JSON.stringify(s.chart.labels || []);
+        const values = JSON.stringify(s.chart.values || []);
+        let chartOpt = '';
+        if (chartType === 'pie') {
+          chartOpt = `{tooltip:{trigger:'item',formatter:'{b}: {c} ({d}%)'},series:[{type:'pie',radius:['35%','60%'],data:${labels}.map((l,i)=>({name:l,value:${values}[i]})),label:{fontSize:11},itemStyle:{borderRadius:4,borderColor:'#fff',borderWidth:2}}]}`;
+        } else {
+          chartOpt = `{tooltip:{trigger:'axis'},xAxis:{type:'category',data:${labels},axisLabel:{fontSize:10,rotate:${labels}.length>5?25:0}},yAxis:{type:'value'},series:[{type:'${chartType}',data:${values},itemStyle:{color:'#D24726',borderRadius:[4,4,0,0]}${chartType==='line'?',smooth:true,areaStyle:{opacity:0.08}':''}}],grid:{left:'10%',right:'5%',bottom:'15%',top:'12%'}}`;
+        }
+        content = `<div style="font-size:22px;font-weight:800;margin-bottom:20px;">${sTitle}</div>
+          <div style="width:100%;height:2px;background:#1a1a1a;margin-bottom:20px;"></div>
+          <div style="display:flex;gap:24px;">
+            <div style="flex:3;"><div style="font-size:10px;font-weight:700;text-transform:uppercase;color:#888;margin-bottom:8px;">${s.chart.title || 'EXHIBIT'}</div><div id="${chartId}" style="width:100%;height:300px;"></div><div style="font-size:9px;color:#aaa;margin-top:4px;">Source: Project data</div></div>
+            <div style="flex:2;border-left:2px solid #e0e0d8;padding-left:16px;"><div style="font-size:10px;font-weight:700;text-transform:uppercase;color:#888;margin-bottom:12px;">KEY TAKEAWAYS</div>${bullets}</div>
+          </div>${actionLine}
+          <script>echarts.init(document.getElementById('${chartId}')).setOption(${chartOpt});<\/script>`;
+      } else if (s.table) {
+        const headers = (s.table.headers||[]).map((h: string) => `<th style="padding:8px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#666;border-bottom:2px solid #1a1a1a;">${h}</th>`).join('');
+        const rows = (s.table.rows||[]).slice(0,12).map((r: string[], ri: number) => `<tr style="background:${ri%2===0?'#fafaf8':'#fff'};">${r.map((c: string) => `<td style="padding:7px 12px;font-size:12px;border-bottom:1px solid #eee;">${c}</td>`).join('')}</tr>`).join('');
+        content = `<div style="font-size:22px;font-weight:800;margin-bottom:20px;">${sTitle}</div>
+          <div style="width:100%;height:2px;background:#1a1a1a;margin-bottom:20px;"></div>
+          <table style="width:100%;border-collapse:collapse;"><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table>${bullets}${actionLine}`;
+      } else if (layout === 'recommendations') {
+        const cards = (s.bullets||[]).map((b: string, bi: number) => `<div style="padding:16px;border:2px solid #e0e0d8;background:#fff;"><div style="font-size:10px;font-weight:900;color:#D24726;text-transform:uppercase;margin-bottom:6px;">PRIORITY ${bi+1}</div><div style="font-size:14px;color:#333;">${b}</div></div>`).join('');
+        content = `<div style="font-size:22px;font-weight:800;margin-bottom:20px;">${sTitle}</div>
+          <div style="width:100%;height:2px;background:#1a1a1a;margin-bottom:20px;"></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">${cards}</div>${actionLine}`;
+      } else if (layout === 'comparison' && s.comparison) {
+        const left = (s.comparison.left?.items||[]).map((i: string) => `<div style="font-size:13px;color:#444;padding:4px 0;">${i}</div>`).join('');
+        const right = (s.comparison.right?.items||[]).map((i: string) => `<div style="font-size:13px;color:#444;padding:4px 0;">${i}</div>`).join('');
+        content = `<div style="font-size:22px;font-weight:800;margin-bottom:20px;">${sTitle}</div>
+          <div style="width:100%;height:2px;background:#1a1a1a;margin-bottom:20px;"></div>
+          <div style="display:flex;gap:16px;">
+            <div style="flex:1;border:2px solid #e0e0d8;padding:16px;"><div style="font-size:14px;font-weight:900;margin-bottom:12px;padding-bottom:8px;border-bottom:2px solid #D24726;">${s.comparison.left?.title||'A'}</div>${left}</div>
+            <div style="display:flex;align-items:center;font-size:20px;color:#ccc;font-weight:900;">vs</div>
+            <div style="flex:1;border:2px solid #e0e0d8;padding:16px;"><div style="font-size:14px;font-weight:900;margin-bottom:12px;padding-bottom:8px;border-bottom:2px solid #00873c;">${s.comparison.right?.title||'B'}</div>${right}</div>
+          </div>${actionLine}`;
+      } else {
+        content = `<div style="font-size:22px;font-weight:800;margin-bottom:20px;">${sTitle}</div>
+          <div style="width:100%;height:2px;background:#1a1a1a;margin-bottom:20px;"></div>${bullets}${actionLine}`;
+      }
+
+      slidesHTML += `<div class="slide" style="page-break-after:always;padding:40px 50px;min-height:${layout==='cover'?'100vh':'auto'};">
+        ${layout !== 'cover' ? `<div style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.15em;color:#888;margin-bottom:16px;display:flex;justify-content:space-between;"><span>${topic}</span><span>${i+1} / ${slidesData.length}</span></div>` : ''}
+        ${content}
+      </div>`;
+    }
+
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"><\/script>
+<style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:'Helvetica Neue',Arial,sans-serif;background:#fff;}
+.slide{border-bottom:1px solid #eee;} @media print{.slide{page-break-after:always;border:none;} .no-print{display:none!important;}}</style>
+</head><body>
+<div class="no-print" style="position:fixed;top:0;left:0;right:0;background:#1a1a1a;color:#fff;padding:8px 20px;display:flex;justify-content:space-between;align-items:center;z-index:100;">
+  <span style="font-size:12px;font-weight:700;">${title}</span>
+  <button onclick="window.print()" style="font-size:10px;padding:4px 12px;background:none;border:1px solid #555;color:#fff;cursor:pointer;">PRINT / SAVE AS PDF</button>
+</div>
+<div style="padding-top:40px;">${slidesHTML}</div>
+</body></html>`;
+
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${agent}-slides.html`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   $effect(() => {
@@ -577,26 +860,34 @@
     if (slide?.chart) {
       setTimeout(() => {
         const el = document.getElementById(`slide-chart-${currentSlide}`);
-        const echarts = (window as any).echarts;
-        if (!el || !echarts) return;
+        if (!el) return;
         const existing = echarts.getInstanceByDom(el);
         if (existing) existing.dispose();
         const chart = echarts.init(el);
-        const type = slide.chart.type || 'bar';
+        const type = slide.chart.type === 'horizontal_bar' ? 'bar' : (slide.chart.type || 'bar');
+        const isHorizontal = slide.chart.type === 'horizontal_bar';
         const option: any = {
           tooltip: { trigger: 'axis' },
-          title: { text: slide.chart.title || '', left: 'center', textStyle: { fontSize: 13 } },
-          xAxis: { type: 'category', data: slide.chart.labels || [], axisLabel: { fontSize: 10 } },
-          yAxis: { type: 'value' },
-          series: [{ type, data: slide.chart.values || [], itemStyle: { color: '#D24726', borderRadius: type === 'bar' ? [4,4,0,0] : undefined }, smooth: type === 'line' }],
-          grid: { left: '10%', right: '5%', bottom: '15%', top: '15%' }
+          title: { text: slide.chart.title || '', left: 'center', textStyle: { fontSize: 12, fontWeight: 700 } },
+          xAxis: isHorizontal
+            ? { type: 'value', axisLabel: { fontSize: 10 } }
+            : { type: 'category', data: slide.chart.labels || [], axisLabel: { fontSize: 10, rotate: (slide.chart.labels?.length || 0) > 5 ? 25 : 0 } },
+          yAxis: isHorizontal
+            ? { type: 'category', data: slide.chart.labels || [], axisLabel: { fontSize: 10 } }
+            : { type: 'value', axisLabel: { fontSize: 10 } },
+          series: [{ type: 'bar', data: slide.chart.values || [], itemStyle: { color: '#D24726', borderRadius: [4,4,0,0] }, smooth: type === 'line', areaStyle: type === 'line' ? { opacity: 0.08 } : undefined }],
+          grid: { left: isHorizontal ? '25%' : '10%', right: '5%', bottom: '12%', top: '15%' }
         };
+        if (type === 'line') {
+          option.series[0].type = 'line';
+        }
         if (type === 'pie') {
-          delete option.xAxis; delete option.yAxis;
-          option.series = [{ type: 'pie', radius: ['35%','60%'], data: (slide.chart.labels||[]).map((l:string,i:number) => ({name:l, value:(slide.chart.values||[])[i]})) }];
+          delete option.xAxis; delete option.yAxis; delete option.grid;
+          option.series = [{ type: 'pie', radius: ['35%','60%'], data: (slide.chart.labels||[]).map((l:string,i:number) => ({name:l, value:(slide.chart.values||[])[i]})), label: { fontSize: 10 }, itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 } }];
+          option.tooltip = { trigger: 'item', formatter: '{b}: {c} ({d}%)' };
         }
         chart.setOption(option);
-      }, 150);
+      }, 200);
     }
   });
 
@@ -1492,140 +1783,295 @@
   </div>
 </div>
 
-  <!-- Slide Panel -->
-  {#if slidesPanelOpen}
-  <div style="position: fixed; top: 0; right: 0; width: 50%; height: 100vh; background: var(--color-surface); border-left: 3px solid var(--color-on-surface); z-index: 90; display: flex; flex-direction: column; box-shadow: -4px 0 20px rgba(0,0,0,0.2);">
-    <!-- Header -->
-    <div style="padding: 12px 16px; border-bottom: 2px solid var(--color-on-surface); display: flex; align-items: center; justify-content: space-between; background: var(--color-surface-bright);">
-      <div style="display: flex; align-items: center; gap: 8px;">
-        <svg width="20" height="20" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="4" fill="#D24726"/><text x="12" y="16" text-anchor="middle" fill="white" font-size="12" font-weight="900" font-family="Arial">P</text></svg>
-        <span style="font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.05em;">PRESENTATION</span>
-        {#if slidesData.length > 0}
-          <span style="font-size: 10px; color: var(--color-on-surface-dim);">{currentSlide + 1} / {slidesData.length}</span>
-        {/if}
-      </div>
-      <div style="display: flex; gap: 6px; align-items: center;">
-        {#if slidesData.length > 0}
-          <button onclick={() => { const w = window.open('', '_blank'); if (w) { w.document.write('<html><head><title>Slides</title><script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"><\/script></head><body>' + document.querySelector('.slide-render-area')?.innerHTML + '</body></html>'); w.document.close(); }}} style="font-size: 9px; font-weight: 900; padding: 4px 8px; border: 1px solid var(--color-on-surface); background: none; cursor: pointer; text-transform: uppercase;">Fullscreen</button>
-        {/if}
-        <button onclick={() => slidesPanelOpen = false} style="background: none; border: none; cursor: pointer; font-size: 18px; font-weight: 900; color: var(--color-on-surface);">&#x2715;</button>
+<!-- Save Presentation Modal -->
+{#if showSaveModal}
+<div style="position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; display: flex; align-items: center; justify-content: center;" onclick={(e) => { if (e.target === e.currentTarget) showSaveModal = false; }}>
+  <div style="background: var(--color-surface); border: 3px solid var(--color-on-surface); width: 400px; box-shadow: 6px 6px 0 rgba(0,0,0,0.3);">
+    <div style="padding: 10px 16px; background: #1a1a1a; color: #fff; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; display: flex; justify-content: space-between; align-items: center;">
+      <span>SAVE PRESENTATION</span>
+      <button onclick={() => showSaveModal = false} style="background: none; border: none; color: #fff; cursor: pointer; font-size: 14px;">✕</button>
+    </div>
+    <div style="padding: 20px;">
+      <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; color: var(--color-on-surface-dim); margin-bottom: 6px;">PRESENTATION NAME</div>
+      <input type="text" bind:value={saveTitle} style="width: 100%; padding: 8px 12px; border: 2px solid var(--color-on-surface); font-family: var(--font-family-display); font-size: 13px; background: var(--color-surface-dim);" />
+      <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-top: 6px;">Same name = new version (v1, v2, v3...)</div>
+      <div style="display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end;">
+        <button onclick={() => showSaveModal = false} style="padding: 8px 16px; font-size: 11px; font-weight: 900; border: 2px solid var(--color-on-surface); background: none; cursor: pointer; font-family: var(--font-family-display); text-transform: uppercase;">CANCEL</button>
+        <button onclick={confirmSave} style="padding: 8px 16px; font-size: 11px; font-weight: 900; border: 2px solid var(--color-on-surface); background: var(--color-on-surface); color: var(--color-surface); cursor: pointer; font-family: var(--font-family-display); text-transform: uppercase;">SAVE</button>
       </div>
     </div>
+  </div>
+</div>
+{/if}
 
-    <!-- Loading state -->
-    {#if slidesLoading}
-      <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;">
-        <svg width="24" height="24" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="4" fill="#D24726"/><text x="12" y="16" text-anchor="middle" fill="white" font-size="12" font-weight="900" font-family="Arial">P</text></svg>
-        <div style="font-size: 12px; font-weight: 900; text-transform: uppercase;">{slidesProgress}</div>
-        <div style="width: 200px; height: 4px; background: var(--color-surface-dim); border: 1px solid var(--color-on-surface-dim);">
-          <div style="height: 100%; background: #D24726; width: {slidesProgress.includes('Analyz') ? '33' : slidesProgress.includes('Structur') ? '66' : slidesProgress.includes('Done') ? '100' : '15'}%; transition: width 0.5s;"></div>
-        </div>
+  <!-- Slide Panel -->
+{#if slidesPanelOpen}
+<div style="position: fixed; top: 0; right: 0; width: 55%; height: 100vh; background: #fff; border-left: 3px solid #1a1a1a; z-index: 90; display: flex; flex-direction: column; box-shadow: -4px 0 30px rgba(0,0,0,0.15);">
+  <!-- Header -->
+  <div style="padding: 8px 16px; background: #1a1a1a; color: #fff; display: flex; align-items: center; justify-content: space-between;">
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <svg width="18" height="18" viewBox="0 0 24 24"><defs><linearGradient id="pg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#D24726"/><stop offset="100%" stop-color="#F0A030"/></linearGradient></defs><rect x="2" y="2" width="20" height="20" rx="3" fill="url(#pg)"/><text x="12" y="16" text-anchor="middle" fill="#fff" font-size="12" font-weight="900" font-family="Arial">P</text></svg>
+      <span style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em;">PRESENTATION</span>
+      {#if slidesData.length > 0}
+        <span style="font-size: 10px; opacity: 0.6;">{currentSlide + 1} / {slidesData.length}</span>
+      {/if}
+    </div>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <button onclick={savePresentation} disabled={slidesData.length === 0} style="font-size: 9px; padding: 3px 8px; background: none; border: 1px solid #555; color: #fff; cursor: pointer; text-transform: uppercase;">SAVE</button>
+      <button onclick={downloadHTML} disabled={slidesData.length === 0} style="font-size: 9px; padding: 3px 8px; background: none; border: 1px solid #555; color: #fff; cursor: pointer; text-transform: uppercase;">HTML</button>
+      <button onclick={downloadPptx} disabled={slidesData.length === 0} style="font-size: 9px; padding: 3px 8px; background: none; border: 1px solid #555; color: #fff; cursor: pointer; text-transform: uppercase;">PPTX</button>
+      <button onclick={() => { downloadHTML(); }} style="font-size: 9px; padding: 3px 8px; background: none; border: 1px solid #555; color: #fff; cursor: pointer; text-transform: uppercase;">PDF</button>
+      <button onclick={() => slidesPanelOpen = false} style="background: none; border: none; cursor: pointer; color: #fff; font-size: 16px;">✕</button>
+    </div>
+  </div>
+
+  <!-- Loading / PPTX Generation Steps -->
+  {#if slidesLoading || pptxGenerating}
+    <div style="flex: 1; display: flex; flex-direction: column; background: #1a1a1a; color: #e0e0e0; padding: 24px; font-family: 'SF Mono', 'Menlo', monospace;">
+      <!-- Header -->
+      <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
+        <svg width="24" height="24" viewBox="0 0 24 24"><defs><linearGradient id="pg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#D24726"/><stop offset="100%" stop-color="#F0A030"/></linearGradient></defs><rect x="2" y="2" width="20" height="20" rx="3" fill="url(#pg2)"/><text x="12" y="16" text-anchor="middle" fill="#fff" font-size="12" font-weight="900" font-family="Arial">P</text></svg>
+        <span style="font-size: 13px; font-weight: 700; color: #fff; text-transform: uppercase; letter-spacing: 0.1em;">
+          {pptxGenerating ? (pptxSteps.every(s => s.status === 'done') ? 'PRESENTATION READY' : 'GENERATING PRESENTATION') : 'CREATING SLIDES'}
+        </span>
       </div>
 
-    <!-- Thinking summary + slides -->
-    {:else if slidesThinking && slidesData.length > 0}
-      <div style="flex: 1; overflow-y: auto;" class="slide-render-area">
-        <!-- Thinking bar -->
-        <div style="padding: 8px 16px; background: #FFF8E1; border-bottom: 1px solid #FFE082; font-size: 10px;">
-          <strong>NARRATIVE:</strong> {slidesThinking.narrative || ''}
-          {#if slidesThinking.key_insight} &middot; <strong>KEY INSIGHT:</strong> {slidesThinking.key_insight}{/if}
-        </div>
-
-        <!-- Current slide -->
-        {#if slidesData[currentSlide]}
-          {@const slide = slidesData[currentSlide]}
-          <div style="padding: 30px; min-height: 400px;">
-            <!-- Title -->
-            <h2 style="font-size: 24px; font-weight: 900; margin-bottom: 16px; color: #1a1a1a;">{slide.title || ''}</h2>
-
-            {#if slide.layout === 'title'}
-              <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 300px;">
-                <div style="font-size: 36px; font-weight: 900; text-align: center;">{slide.title}</div>
-                <div style="font-size: 16px; color: #666; margin-top: 12px; text-align: center;">{slide.bullets?.join(' · ') || ''}</div>
-              </div>
-
-            {:else if slide.layout === 'kpi' && slide.kpi}
-              <div style="display: flex; align-items: center; justify-content: center; height: 200px; gap: 40px;">
-                <div style="text-align: center;">
-                  <div style="font-size: 56px; font-weight: 900;">{slide.kpi.value}</div>
-                  <div style="font-size: 14px; color: #666; margin-top: 4px;">{slide.kpi.label}</div>
-                  {#if slide.kpi.change}
-                    <div style="font-size: 20px; font-weight: 700; color: {slide.kpi.change?.startsWith('+') ? '#00c853' : '#ff1744'}; margin-top: 4px;">{slide.kpi.change}</div>
-                  {/if}
-                </div>
-              </div>
-              {#each (slide.bullets || []) as b}
-                <div style="font-size: 13px; color: #555; padding: 6px 12px; border-left: 3px solid #D24726; margin-bottom: 6px; background: #fafaf8;">&middot; {b}</div>
-              {/each}
-
-            {:else if slide.chart}
-              <div style="display: flex; gap: 20px;">
-                <div id="slide-chart-{currentSlide}" style="flex: 1; height: 280px;"></div>
-                <div style="flex: 0 0 200px;">
-                  {#each (slide.bullets || []) as b}
-                    <div style="font-size: 12px; color: #333; padding: 8px; border-left: 3px solid #D24726; margin-bottom: 8px; background: #fafaf8;">{b}</div>
-                  {/each}
-                </div>
-              </div>
-
-            {:else if slide.table}
-              <div style="overflow-x: auto;">
-                <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
-                  <thead>
-                    <tr>
-                      {#each (slide.table.headers || []) as h}
-                        <th style="padding: 8px 12px; text-align: left; border-bottom: 2px solid #1a1a1a; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #666;">{h}</th>
-                      {/each}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {#each (slide.table.rows || []).slice(0, 10) as row, ri}
-                      <tr style="background: {ri % 2 === 0 ? '#fafaf8' : '#fff'};">
-                        {#each row as cell}
-                          <td style="padding: 6px 12px; border-bottom: 1px solid #eee;">{cell}</td>
-                        {/each}
-                      </tr>
-                    {/each}
-                  </tbody>
-                </table>
-              </div>
-              {#each (slide.bullets || []) as b}
-                <div style="font-size: 12px; color: #555; margin-top: 8px;">&middot; {b}</div>
-              {/each}
-
-            {:else}
-              <!-- bullets/summary layout -->
-              {#each (slide.bullets || []) as b}
-                <div style="font-size: 14px; color: #333; padding: 10px 14px; border-left: 4px solid #D24726; margin-bottom: 8px; background: #fafaf8;">{b}</div>
-              {/each}
-            {/if}
-
-            <!-- So what -->
-            {#if slide.so_what}
-              <div style="margin-top: 20px; padding: 10px 14px; background: #E3F2FD; border-left: 4px solid #1976D2; font-size: 12px; font-weight: 700; color: #1565C0;">
-                SO WHAT: {slide.so_what}
-              </div>
-            {/if}
+      <!-- Progress bar -->
+      {#if pptxSteps.length > 0}
+        {@const doneCount = pptxSteps.filter(s => s.status === 'done').length}
+        {@const pct = Math.round((doneCount / pptxSteps.length) * 100)}
+        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
+          <div style="flex: 1; height: 4px; background: #333;">
+            <div style="height: 100%; background: linear-gradient(90deg, #D24726, #F0A030); width: {pct}%; transition: width 0.5s;"></div>
           </div>
-        {/if}
-      </div>
+          <span style="font-size: 12px; font-weight: 700; color: #D24726;">{pct}%</span>
+        </div>
 
-      <!-- Navigation -->
-      <div style="padding: 10px 16px; border-top: 2px solid var(--color-on-surface); display: flex; align-items: center; justify-content: space-between; background: var(--color-surface-bright);">
-        <button onclick={() => currentSlide = Math.max(0, currentSlide - 1)} disabled={currentSlide === 0} style="font-size: 10px; font-weight: 900; padding: 4px 12px; border: 1px solid var(--color-on-surface); background: none; cursor: pointer;">&#x2190; PREV</button>
-        <div style="display: flex; gap: 4px;">
-          {#each slidesData as _, si}
-            <button onclick={() => currentSlide = si} style="width: 8px; height: 8px; border-radius: 50%; border: 1px solid #999; background: {si === currentSlide ? '#D24726' : 'none'}; cursor: pointer; padding: 0;"></button>
+        <!-- Steps -->
+        <div style="flex: 1;">
+          {#each pptxSteps as step}
+            <div style="display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 12px;">
+              {#if step.status === 'done'}
+                <span style="color: #00fc40;">✓</span>
+              {:else if step.status === 'active'}
+                <span style="color: #F0A030;">●</span>
+              {:else if step.status === 'error'}
+                <span style="color: #ff4444;">✗</span>
+              {:else}
+                <span style="color: #555;">○</span>
+              {/if}
+              <span style="color: {step.status === 'done' ? '#00fc40' : step.status === 'active' ? '#fff' : step.status === 'error' ? '#ff4444' : '#555'};">{step.label}</span>
+            </div>
           {/each}
         </div>
-        <button onclick={() => currentSlide = Math.min(slidesData.length - 1, currentSlide + 1)} disabled={currentSlide >= slidesData.length - 1} style="font-size: 10px; font-weight: 900; padding: 4px 12px; border: 1px solid var(--color-on-surface); background: none; cursor: pointer;">NEXT &#x2192;</button>
-      </div>
 
-    {:else}
-      <div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--color-on-surface-dim); font-size: 12px;">No slides generated</div>
+        <!-- After complete -->
+        {#if pptxSteps.every(s => s.status === 'done') && pptxSavedVersion > 0}
+          <div style="margin-top: 16px; padding: 10px 14px; border: 1px solid #333; background: #222; font-size: 11px; color: #aaa;">
+            Saved to <span style="color: #D24726; font-weight: 700;">PRESENTATIONS</span> tab as v{pptxSavedVersion}
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 12px;">
+            <button onclick={() => { pptxSteps = []; currentSlide = 0; }} style="flex: 1; padding: 8px; font-size: 11px; font-weight: 900; background: #D24726; color: #fff; border: none; cursor: pointer; text-transform: uppercase;">OPEN SLIDES</button>
+            <button onclick={() => { slidesPanelOpen = false; pptxSteps = []; }} style="flex: 1; padding: 8px; font-size: 11px; font-weight: 900; background: none; border: 1px solid #555; color: #aaa; cursor: pointer; text-transform: uppercase;">CLOSE</button>
+          </div>
+        {/if}
+
+      {:else}
+        <!-- Simple loading for generateSlides -->
+        <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;">
+          <div style="font-size: 13px; color: #aaa;">{slidesProgress}</div>
+          <div style="width: 200px; height: 3px; background: #333;">
+            <div style="height: 100%; background: linear-gradient(90deg, #D24726, #F0A030); width: {slidesProgress.includes('Analyz') ? '30' : slidesProgress.includes('Structur') ? '60' : slidesProgress.includes('Done') ? '100' : '15'}%; transition: width 0.8s;"></div>
+          </div>
+        </div>
+      {/if}
+    </div>
+
+  {:else if slidesData.length > 0}
+    <!-- Narrative bar -->
+    {#if slidesThinking}
+      <div style="padding: 6px 16px; background: #f5f5f0; border-bottom: 1px solid #e0e0d8; font-size: 10px; color: #555; line-height: 1.4;">
+        <strong style="color: #1a1a1a;">NARRATIVE:</strong> {slidesThinking.narrative || ''}
+        {#if slidesThinking.key_insight} &middot; <strong style="color: #D24726;">KEY INSIGHT:</strong> {slidesThinking.key_insight}{/if}
+      </div>
     {/if}
-  </div>
+
+    <!-- Slide content -->
+    <div style="flex: 1; overflow-y: auto; background: #fafaf8;" class="slide-render-area">
+      {#if slidesData[currentSlide]}
+        {@const slide = slidesData[currentSlide]}
+
+        <!-- Topic bar -->
+        <div style="padding: 6px 24px; background: #f0f0eb; border-bottom: 1px solid #ddd; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.15em; color: #888; display: flex; justify-content: space-between;">
+          <span>{slide.topic || 'ANALYSIS'}</span>
+          <span>{currentSlide + 1} / {slidesData.length}</span>
+        </div>
+
+        <div style="padding: 24px 28px;">
+
+          {#if slide.layout === 'cover'}
+            <!-- COVER SLIDE -->
+            <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 380px; text-align: center;">
+              <div style="font-size: 32px; font-weight: 900; color: #1a1a1a; line-height: 1.2; max-width: 500px;">{slide.title}</div>
+              <div style="width: 60px; height: 3px; background: linear-gradient(90deg, #D24726, #F0A030); margin: 20px auto;"></div>
+              {#if slide.bullets?.length}
+                <div style="font-size: 15px; color: #666; margin-top: 8px;">{slide.bullets[0]}</div>
+              {/if}
+              <div style="font-size: 11px; color: #999; margin-top: 30px; text-transform: uppercase; letter-spacing: 0.1em;">{projectInfo?.agent_name || 'Agent'} &middot; {new Date().toLocaleDateString('en-US', {month: 'long', day: 'numeric', year: 'numeric'})}</div>
+              <div style="font-size: 9px; color: #bbb; margin-top: 8px; letter-spacing: 0.15em;">POWERED BY RLAI DASH</div>
+            </div>
+
+          {:else if slide.layout === 'kpi' && slide.kpis?.length}
+            <!-- KPI SLIDE -->
+            <div style="font-size: 18px; font-weight: 800; color: #1a1a1a; line-height: 1.3; margin-bottom: 20px;">{slide.title}</div>
+            <div style="width: 100%; height: 2px; background: #1a1a1a; margin-bottom: 24px;"></div>
+            <div style="display: flex; gap: 16px; justify-content: center; margin: 20px 0;">
+              {#each slide.kpis as kpi}
+                <div style="flex: 1; text-align: center; padding: 20px; border: 2px solid #e0e0d8;">
+                  <div style="font-size: 36px; font-weight: 900; color: #1a1a1a;">{kpi.value}</div>
+                  <div style="font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 6px;">{kpi.label}</div>
+                  {#if kpi.change}
+                    <div style="font-size: 14px; font-weight: 700; color: {kpi.change?.startsWith('+') || kpi.change?.startsWith('▲') ? '#00873c' : '#d32f2f'}; margin-top: 4px;">{kpi.change}</div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+            {#each (slide.bullets || []) as b, bi}
+              <div style="font-size: 13px; color: #444; padding: 6px 0; border-bottom: 1px solid #eee;">{bi + 1}. {b}</div>
+            {/each}
+            {#if slide.action_line}
+              <div style="margin-top: 20px; padding: 10px 14px; border-top: 2px solid #1a1a1a; font-size: 12px; font-weight: 700; color: #1a1a1a;">{slide.action_line}</div>
+            {/if}
+
+          {:else if slide.layout === 'exhibit' || slide.chart}
+            <!-- EXHIBIT SLIDE (chart + takeaways) -->
+            <div style="font-size: 18px; font-weight: 800; color: #1a1a1a; line-height: 1.3; margin-bottom: 20px;">{slide.title}</div>
+            <div style="width: 100%; height: 2px; background: #1a1a1a; margin-bottom: 20px;"></div>
+            <div style="display: flex; gap: 24px;">
+              <div style="flex: 3;">
+                {#if slide.chart}
+                  <div style="font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #888; margin-bottom: 8px;">{slide.chart.title || 'EXHIBIT'}</div>
+                  <div id="slide-chart-{currentSlide}" style="width: 100%; height: 260px;"></div>
+                  <div style="font-size: 9px; color: #aaa; margin-top: 4px;">Source: Project data</div>
+                {/if}
+              </div>
+              <div style="flex: 2; border-left: 2px solid #e0e0d8; padding-left: 16px;">
+                <div style="font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #888; margin-bottom: 12px;">KEY TAKEAWAYS</div>
+                {#each (slide.bullets || []) as b, bi}
+                  <div style="font-size: 12px; color: #333; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #eee;">
+                    <span style="font-weight: 800; color: #D24726;">{bi + 1}.</span> {b}
+                  </div>
+                {/each}
+              </div>
+            </div>
+            {#if slide.action_line}
+              <div style="margin-top: 16px; padding: 10px 14px; border-top: 2px solid #1a1a1a; font-size: 12px; font-weight: 700; color: #1a1a1a;">{slide.action_line}</div>
+            {/if}
+
+          {:else if slide.layout === 'data' || slide.table}
+            <!-- DATA SLIDE (table) -->
+            <div style="font-size: 18px; font-weight: 800; color: #1a1a1a; line-height: 1.3; margin-bottom: 20px;">{slide.title}</div>
+            <div style="width: 100%; height: 2px; background: #1a1a1a; margin-bottom: 20px;"></div>
+            {#if slide.table}
+              <table style="width: 100%; border-collapse: collapse;">
+                <thead>
+                  <tr style="border-bottom: 2px solid #1a1a1a;">
+                    {#each (slide.table.headers || []) as h}
+                      <th style="padding: 8px 12px; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #666; font-weight: 700;">{h}</th>
+                    {/each}
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each (slide.table.rows || []).slice(0, 10) as row, ri}
+                    <tr style="border-bottom: 1px solid #eee; background: {ri % 2 === 0 ? '#fafaf8' : '#fff'};">
+                      {#each row as cell}
+                        <td style="padding: 7px 12px; font-size: 12px; color: #333;">{cell}</td>
+                      {/each}
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {/if}
+            {#each (slide.bullets || []) as b}
+              <div style="font-size: 12px; color: #555; margin-top: 6px;">· {b}</div>
+            {/each}
+            {#if slide.action_line}
+              <div style="margin-top: 16px; padding: 10px 14px; border-top: 2px solid #1a1a1a; font-size: 12px; font-weight: 700; color: #1a1a1a;">{slide.action_line}</div>
+            {/if}
+
+          {:else if slide.layout === 'comparison' && slide.comparison}
+            <!-- COMPARISON SLIDE -->
+            <div style="font-size: 18px; font-weight: 800; color: #1a1a1a; line-height: 1.3; margin-bottom: 20px;">{slide.title}</div>
+            <div style="width: 100%; height: 2px; background: #1a1a1a; margin-bottom: 20px;"></div>
+            <div style="display: flex; gap: 16px;">
+              <div style="flex: 1; border: 2px solid #e0e0d8; padding: 16px;">
+                <div style="font-size: 14px; font-weight: 900; color: #1a1a1a; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 2px solid #D24726;">{slide.comparison.left?.title || 'A'}</div>
+                {#each (slide.comparison.left?.items || []) as item}
+                  <div style="font-size: 12px; color: #444; padding: 4px 0;">{item}</div>
+                {/each}
+              </div>
+              <div style="display: flex; align-items: center; font-size: 20px; color: #ccc; font-weight: 900;">vs</div>
+              <div style="flex: 1; border: 2px solid #e0e0d8; padding: 16px;">
+                <div style="font-size: 14px; font-weight: 900; color: #1a1a1a; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 2px solid #00873c;">{slide.comparison.right?.title || 'B'}</div>
+                {#each (slide.comparison.right?.items || []) as item}
+                  <div style="font-size: 12px; color: #444; padding: 4px 0;">{item}</div>
+                {/each}
+              </div>
+            </div>
+            {#if slide.action_line}
+              <div style="margin-top: 16px; padding: 10px 14px; border-top: 2px solid #1a1a1a; font-size: 12px; font-weight: 700; color: #1a1a1a;">{slide.action_line}</div>
+            {/if}
+
+          {:else if slide.layout === 'recommendations'}
+            <!-- RECOMMENDATIONS SLIDE -->
+            <div style="font-size: 18px; font-weight: 800; color: #1a1a1a; line-height: 1.3; margin-bottom: 20px;">{slide.title}</div>
+            <div style="width: 100%; height: 2px; background: #1a1a1a; margin-bottom: 20px;"></div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+              {#each (slide.bullets || []) as b, bi}
+                <div style="padding: 14px; border: 2px solid #e0e0d8; background: #fff;">
+                  <div style="font-size: 10px; font-weight: 900; color: #D24726; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px;">PRIORITY {bi + 1}</div>
+                  <div style="font-size: 13px; color: #333; line-height: 1.4;">{b}</div>
+                </div>
+              {/each}
+            </div>
+            {#if slide.action_line}
+              <div style="margin-top: 16px; padding: 10px 14px; border-top: 2px solid #1a1a1a; font-size: 12px; font-weight: 700; color: #1a1a1a;">{slide.action_line}</div>
+            {/if}
+
+          {:else}
+            <!-- GENERIC BULLETS -->
+            <div style="font-size: 18px; font-weight: 800; color: #1a1a1a; line-height: 1.3; margin-bottom: 20px;">{slide.title}</div>
+            <div style="width: 100%; height: 2px; background: #1a1a1a; margin-bottom: 20px;"></div>
+            {#each (slide.bullets || []) as b, bi}
+              <div style="font-size: 14px; color: #333; padding: 10px 14px; border-left: 3px solid #D24726; margin-bottom: 8px; background: #fafaf8;">
+                <span style="font-weight: 800; color: #D24726;">{bi + 1}.</span> {b}
+              </div>
+            {/each}
+            {#if slide.action_line}
+              <div style="margin-top: 16px; padding: 10px 14px; border-top: 2px solid #1a1a1a; font-size: 12px; font-weight: 700; color: #1a1a1a;">{slide.action_line}</div>
+            {/if}
+          {/if}
+
+        </div>
+      {/if}
+    </div>
+
+    <!-- Thumbnail navigation -->
+    <div style="padding: 8px 16px; border-top: 2px solid #1a1a1a; background: #f5f5f0; display: flex; align-items: center; justify-content: space-between;">
+      <button onclick={() => currentSlide = Math.max(0, currentSlide - 1)} disabled={currentSlide === 0} style="font-size: 9px; font-weight: 900; padding: 4px 10px; border: 1px solid #ccc; background: #fff; cursor: pointer;">← PREV</button>
+      <div style="display: flex; gap: 3px; align-items: center;">
+        {#each slidesData as s, si}
+          <button onclick={() => currentSlide = si} style="width: 28px; height: 18px; border: {si === currentSlide ? '2px solid #D24726' : '1px solid #ccc'}; background: {si === currentSlide ? '#FFF3E0' : '#fff'}; cursor: pointer; padding: 0; font-size: 7px; font-weight: 700; color: {si === currentSlide ? '#D24726' : '#999'};">{si + 1}</button>
+        {/each}
+      </div>
+      <button onclick={() => currentSlide = Math.min(slidesData.length - 1, currentSlide + 1)} disabled={currentSlide >= slidesData.length - 1} style="font-size: 9px; font-weight: 900; padding: 4px 10px; border: 1px solid #ccc; background: #fff; cursor: pointer;">NEXT →</button>
+    </div>
+
+  {:else}
+    <div style="flex: 1; display: flex; align-items: center; justify-content: center; color: #999; font-size: 12px;">No slides generated</div>
   {/if}
+</div>
+{/if}
 
   <!-- Dashboard Side Panel -->
   {#if dashboardPanelOpen}
@@ -1678,3 +2124,20 @@
     </div>
   </div>
 {/if}
+
+<style>
+@media print {
+  :global(nav), :global(.input-bar), :global(.nav-btn),
+  :global([style*="CHAT HISTORY"]), :global(header) {
+    display: none !important;
+  }
+  :global(body) {
+    overflow: visible !important;
+    background: white !important;
+  }
+  .slide-render-area {
+    overflow: visible !important;
+    height: auto !important;
+  }
+}
+</style>
