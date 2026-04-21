@@ -339,18 +339,7 @@
           </div>
         </div>
 
-        <div style="margin-bottom: 16px;">
-          <div class="tag-label mb-1" style="font-size: 9px;">UPLOAD DATA (optional)</div>
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div class="drop-zone" style="padding: 16px;" onclick={() => fileInput?.click()} ondragover={(e) => e.preventDefault()} ondrop={(e) => { e.preventDefault(); const f = e.dataTransfer?.files?.[0]; if (f) selectedFile = f; }}>
-            <input type="file" accept=".csv,.xlsx,.xls,.json" onchange={(e) => { const f = (e.target as HTMLInputElement).files?.[0]; if (f) selectedFile = f; }} bind:this={fileInput} style="display: none;" />
-            {#if selectedFile}
-              <span style="font-weight: 900;">{selectedFile.name}</span> <span style="font-size: 11px; color: var(--color-on-surface-dim);">({(selectedFile.size / 1024).toFixed(1)} KB)</span>
-            {:else}
-              <div style="font-size: 11px; text-transform: uppercase;">Drop CSV, Excel, or JSON — or click to browse</div>
-            {/if}
-          </div>
-        </div>
+        <!-- Upload moved to Settings page after project creation -->
 
         {#if createError}<div style="font-size: 11px; color: var(--color-error); margin-bottom: 8px; font-weight: 700;">{createError}</div>{/if}
 
