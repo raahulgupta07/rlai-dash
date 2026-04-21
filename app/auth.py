@@ -1190,6 +1190,219 @@ def user_projects(username: str, request: Request):
     return {"username": username, "projects": projects}
 
 
+# ---------------------------------------------------------------------------
+# Command Center Admin Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/admin/projects")
+def admin_list_projects(request: Request):
+    """List ALL projects across all users with details."""
+    _require_super(request)
+    with _engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT p.id, p.slug, p.name, p.agent_name, p.schema_name, p.created_at, p.updated_at, p.user_id,
+                   u.username as owner,
+                   (SELECT COUNT(*) FROM public.dash_project_shares s WHERE s.project_id = p.id) as shared_count,
+                   (SELECT finished_at FROM public.dash_training_runs t WHERE t.project_slug = p.slug AND t.status = 'done' ORDER BY t.finished_at DESC LIMIT 1) as last_trained
+            FROM public.dash_projects p
+            LEFT JOIN public.dash_users u ON u.id = p.user_id
+            ORDER BY p.updated_at DESC
+        """)).fetchall()
+    projects = []
+    from sqlalchemy import inspect as sa_inspect
+    insp = sa_inspect(_engine)
+    for r in rows:
+        tables = 0; total_rows = 0
+        try:
+            tbl_names = insp.get_table_names(schema=r[4])
+            tables = len(tbl_names)
+            with _engine.connect() as c:
+                for t in tbl_names:
+                    try: total_rows += c.execute(text(f'SELECT COUNT(*) FROM "{r[4]}"."{t}"')).scalar() or 0
+                    except: pass
+        except: pass
+        # Get brain health
+        brain = {}
+        try:
+            with _engine.connect() as c:
+                for tbl, key in [('dash_memories','memory'), ('dash_query_patterns','pattern'), ('dash_rules_db','rule'), ('dash_evals','eval'), ('dash_workflows_db','workflow'), ('dash_feedback','feedback')]:
+                    cnt = c.execute(text(f"SELECT COUNT(*) FROM public.{tbl} WHERE project_slug = :s"), {"s": r[1]}).scalar() or 0
+                    brain[key] = cnt
+        except: pass
+        projects.append({
+            "id": r[0], "slug": r[1], "name": r[2], "agent_name": r[3], "schema": r[4],
+            "created_at": str(r[5]) if r[5] else None, "updated_at": str(r[6]) if r[6] else None,
+            "owner": r[8], "shared_count": r[9], "last_trained": str(r[10]) if r[10] else None,
+            "tables": tables, "rows": total_rows, "brain": brain,
+        })
+    return {"projects": projects}
+
+
+@router.get("/admin/user/{user_id}/detail")
+def admin_user_detail(user_id: int, request: Request):
+    """Get deep insights for a specific user."""
+    _require_super(request)
+    with _engine.connect() as conn:
+        user = conn.execute(text("SELECT id, username, email, created_at, last_login FROM public.dash_users WHERE id = :id"), {"id": user_id}).fetchone()
+        if not user: raise HTTPException(404, "User not found")
+
+        # Projects owned
+        projects = conn.execute(text("SELECT slug, name, agent_name FROM public.dash_projects WHERE user_id = :id"), {"id": user_id}).fetchall()
+
+        # Projects shared with
+        shared = conn.execute(text("""
+            SELECT p.slug, p.name, s.role, s.shared_by FROM public.dash_project_shares s
+            JOIN public.dash_projects p ON p.id = s.project_id WHERE s.shared_with_user_id = :id
+        """), {"id": user_id}).fetchall()
+
+        # Chat sessions
+        sessions = conn.execute(text("""
+            SELECT session_id, project_slug, created_at, updated_at FROM public.dash_chat_sessions
+            WHERE user_id = :id ORDER BY updated_at DESC LIMIT 20
+        """), {"id": user_id}).fetchall()
+
+        # Feedback given
+        feedback_up = conn.execute(text("SELECT COUNT(*) FROM public.dash_feedback WHERE rating = 'up'")).scalar() or 0
+        feedback_down = conn.execute(text("SELECT COUNT(*) FROM public.dash_feedback WHERE rating = 'down'")).scalar() or 0
+
+        # Audit log
+        logs = conn.execute(text("""
+            SELECT action, resource_type, resource_id, created_at FROM public.dash_audit_log
+            WHERE user_id = :id ORDER BY created_at DESC LIMIT 30
+        """), {"id": user_id}).fetchall()
+
+    return {
+        "user": {"id": user[0], "username": user[1], "email": user[2], "created_at": str(user[3]) if user[3] else None, "last_login": str(user[4]) if user[4] else None},
+        "projects": [{"slug": p[0], "name": p[1], "agent_name": p[2]} for p in projects],
+        "shared_with": [{"slug": s[0], "name": s[1], "role": s[2], "shared_by": s[3]} for s in shared],
+        "sessions": [{"session_id": s[0], "project": s[1], "created_at": str(s[2]) if s[2] else None, "updated_at": str(s[3]) if s[3] else None} for s in sessions],
+        "feedback": {"up": feedback_up, "down": feedback_down},
+        "recent_activity": [{"action": l[0], "type": l[1], "resource": l[2], "time": str(l[3]) if l[3] else None} for l in logs],
+    }
+
+
+@router.get("/admin/chat-logs")
+def admin_chat_logs(request: Request, project: str = "", user: str = "", limit: int = 50):
+    """Get all chat messages across all users/projects."""
+    _require_super(request)
+    query = """
+        SELECT s.session_id, s.project_slug, u.username, s.created_at, s.updated_at, s.first_message
+        FROM public.dash_chat_sessions s
+        LEFT JOIN public.dash_users u ON u.id = s.user_id
+        WHERE 1=1
+    """
+    params: dict = {}
+    if project:
+        query += " AND s.project_slug = :proj"
+        params["proj"] = project
+    if user:
+        query += " AND u.username = :user"
+        params["user"] = user
+    query += f" ORDER BY s.updated_at DESC LIMIT {min(limit, 200)}"
+
+    with _engine.connect() as conn:
+        rows = conn.execute(text(query), params).fetchall()
+    return {"logs": [{"session_id": r[0], "project": r[1], "user": r[2], "created_at": str(r[3]) if r[3] else None, "updated_at": str(r[4]) if r[4] else None, "first_message": r[5]} for r in rows]}
+
+
+@router.get("/admin/schemas")
+def admin_schemas(request: Request):
+    """List all project schemas with table details."""
+    _require_super(request)
+    from sqlalchemy import inspect as sa_inspect
+    insp = sa_inspect(_engine)
+    with _engine.connect() as conn:
+        projects = conn.execute(text("SELECT slug, schema_name, user_id FROM public.dash_projects")).fetchall()
+        users = {r[0]: r[1] for r in conn.execute(text("SELECT id, username FROM public.dash_users")).fetchall()}
+
+    schemas = []
+    for p in projects:
+        schema = p[1]
+        tables_info = []
+        total_rows = 0
+        try:
+            for t in insp.get_table_names(schema=schema):
+                cols = insp.get_columns(t, schema=schema)
+                rows = 0
+                try:
+                    with _engine.connect() as c:
+                        rows = c.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{t}"')).scalar() or 0
+                except: pass
+                total_rows += rows
+                tables_info.append({"name": t, "columns": len(cols), "rows": rows, "col_names": [c["name"] for c in cols[:10]]})
+        except: pass
+        schemas.append({"slug": p[0], "schema": schema, "owner": users.get(p[2], "?"), "tables": tables_info, "total_rows": total_rows})
+    return {"schemas": schemas}
+
+
+@router.get("/admin/health")
+def admin_health(request: Request):
+    """System health check with details."""
+    _require_super(request)
+    health = {"status": "ok", "services": []}
+    # DB check
+    try:
+        with _engine.connect() as c:
+            c.execute(text("SELECT 1"))
+        health["services"].append({"name": "PostgreSQL", "status": "online", "detail": "responding"})
+    except:
+        health["services"].append({"name": "PostgreSQL", "status": "offline", "detail": "connection failed"})
+    # Memory
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        health["services"].append({"name": "Memory", "status": "ok", "detail": f"{mem.used // 1048576} MB / {mem.total // 1048576} MB ({mem.percent}%)"})
+    except:
+        health["services"].append({"name": "Memory", "status": "unknown"})
+    # Disk
+    try:
+        import psutil
+        disk = psutil.disk_usage('/')
+        health["services"].append({"name": "Disk", "status": "ok", "detail": f"{disk.used // 1048576} MB / {disk.total // 1048576} MB ({disk.percent}%)"})
+    except:
+        health["services"].append({"name": "Disk", "status": "unknown"})
+    # Workers
+    health["services"].append({"name": "Workers", "status": "running", "detail": f"{os.getenv('WORKERS', '4')} uvicorn workers"})
+    # Uptime
+    try:
+        import psutil
+        boot = psutil.boot_time()
+        uptime = int(time.time() - boot)
+        health["uptime"] = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
+    except:
+        health["uptime"] = "unknown"
+    return health
+
+
+@router.get("/admin/stats")
+def admin_stats(request: Request):
+    """Platform-wide statistics."""
+    _require_super(request)
+    with _engine.connect() as conn:
+        users = conn.execute(text("SELECT COUNT(*) FROM public.dash_users")).scalar() or 0
+        projects = conn.execute(text("SELECT COUNT(*) FROM public.dash_projects")).scalar() or 0
+        sessions = conn.execute(text("SELECT COUNT(*) FROM public.dash_chat_sessions")).scalar() or 0
+        feedback_up = conn.execute(text("SELECT COUNT(*) FROM public.dash_feedback WHERE rating = 'up'")).scalar() or 0
+        feedback_down = conn.execute(text("SELECT COUNT(*) FROM public.dash_feedback WHERE rating = 'down'")).scalar() or 0
+        training_runs = conn.execute(text("SELECT COUNT(*) FROM public.dash_training_runs")).scalar() or 0
+        training_done = conn.execute(text("SELECT COUNT(*) FROM public.dash_training_runs WHERE status = 'done'")).scalar() or 0
+        training_failed = conn.execute(text("SELECT COUNT(*) FROM public.dash_training_runs WHERE status = 'failed'")).scalar() or 0
+        memories = conn.execute(text("SELECT COUNT(*) FROM public.dash_memories")).scalar() or 0
+        evals = conn.execute(text("SELECT COUNT(*) FROM public.dash_evals")).scalar() or 0
+        workflows = conn.execute(text("SELECT COUNT(*) FROM public.dash_workflows_db")).scalar() or 0
+        dashboards = conn.execute(text("SELECT COUNT(*) FROM public.dash_dashboards")).scalar() or 0
+        # DB size
+        db_size = conn.execute(text("SELECT pg_size_pretty(pg_database_size(current_database()))")).scalar() or "0"
+    return {
+        "users": users, "projects": projects, "sessions": sessions,
+        "feedback": {"up": feedback_up, "down": feedback_down},
+        "training": {"total": training_runs, "done": training_done, "failed": training_failed},
+        "content": {"memories": memories, "evals": evals, "workflows": workflows, "dashboards": dashboards},
+        "db_size": db_size,
+    }
+
+
 @router.post("/logout")
 def logout(request: Request):
     """Invalidate current token."""

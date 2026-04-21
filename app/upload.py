@@ -3294,69 +3294,7 @@ def list_tables():
     return {"tables": tables}
 
 
-_WORKFLOWS_FILE = KNOWLEDGE_DIR / "workflows.json"
-
-
-@router.get("/workflows")
-def list_workflows(request: Request, project: str | None = None):
-    """List saved analysis workflows."""
-    workflows = []
-    # Check per-project workflows first
-    if project:
-        proj_wf = KNOWLEDGE_DIR / project / "workflows.json"
-        if proj_wf.exists():
-            try:
-                with open(proj_wf) as f:
-                    workflows = json.load(f)
-            except Exception:
-                pass
-    # Fallback to global
-    if not workflows and _WORKFLOWS_FILE.exists():
-        try:
-            with open(_WORKFLOWS_FILE) as f:
-                workflows = json.load(f)
-        except Exception:
-            pass
-    return {"workflows": workflows}
-
-
-@router.post("/workflows")
-def save_workflow(name: str, description: str, query: str):
-    """Save a reusable analysis workflow."""
-    workflows = []
-    if _WORKFLOWS_FILE.exists():
-        with open(_WORKFLOWS_FILE) as f:
-            workflows = json.load(f)
-
-    workflows.append({
-        "name": name,
-        "description": description,
-        "query": query,
-        "created_at": __import__("datetime").datetime.now().isoformat(),
-    })
-
-    _WORKFLOWS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(_WORKFLOWS_FILE, "w") as f:
-        json.dump(workflows, f, indent=2)
-
-    return {"status": "ok", "count": len(workflows)}
-
-
-@router.delete("/workflows/{name}")
-def delete_workflow(name: str):
-    """Delete a saved workflow."""
-    if not _WORKFLOWS_FILE.exists():
-        raise HTTPException(404, "No workflows found")
-    with open(_WORKFLOWS_FILE) as f:
-        workflows = json.load(f)
-    workflows = [w for w in workflows if w["name"] != name]
-    with open(_WORKFLOWS_FILE, "w") as f:
-        json.dump(workflows, f, indent=2)
-    return {"status": "ok"}
-
-
 _SCHEDULES_FILE = KNOWLEDGE_DIR / "schedules.json"
-_ALERTS_FILE = KNOWLEDGE_DIR / "alerts.json"
 
 
 @router.get("/user-schedules")
@@ -3401,51 +3339,6 @@ def delete_schedule(name: str, request: Request):
     schedules = [s for s in schedules if not (s["name"] == name and s.get("user_id") == user_id)]
     with open(_SCHEDULES_FILE, "w") as f:
         json.dump(schedules, f, indent=2)
-    return {"status": "ok"}
-
-
-@router.get("/user-alerts")
-def list_alerts(request: Request):
-    """List configured alerts for current user."""
-    user_id = _get_user_id(request)
-    if not _ALERTS_FILE.exists():
-        return {"alerts": []}
-    with open(_ALERTS_FILE) as f:
-        all_a = json.load(f)
-    return {"alerts": [a for a in all_a if a.get("user_id") == user_id]}
-
-
-@router.post("/user-alerts")
-def create_alert(request: Request, name: str, condition: str, threshold: str, webhook_url: str = ""):
-    """Save an alert rule."""
-    user_id = _get_user_id(request)
-    alerts = []
-    if _ALERTS_FILE.exists():
-        with open(_ALERTS_FILE) as f:
-            alerts = json.load(f)
-    alerts.append({
-        "name": name, "condition": condition, "threshold": threshold,
-        "webhook_url": webhook_url, "user_id": user_id, "enabled": True,
-        "created_at": __import__("datetime").datetime.now().isoformat(),
-        "last_triggered": None,
-    })
-    _ALERTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(_ALERTS_FILE, "w") as f:
-        json.dump(alerts, f, indent=2)
-    return {"status": "ok"}
-
-
-@router.delete("/user-alerts/{name}")
-def delete_alert(name: str, request: Request):
-    """Delete an alert rule."""
-    user_id = _get_user_id(request)
-    if not _ALERTS_FILE.exists():
-        raise HTTPException(404, "Not found")
-    with open(_ALERTS_FILE) as f:
-        alerts = json.load(f)
-    alerts = [a for a in alerts if not (a["name"] == name and a.get("user_id") == user_id)]
-    with open(_ALERTS_FILE, "w") as f:
-        json.dump(alerts, f, indent=2)
     return {"status": "ok"}
 
 
