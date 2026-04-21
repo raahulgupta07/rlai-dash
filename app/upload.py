@@ -3586,6 +3586,7 @@ def retrain_project(slug: str, request: Request):
                 _log_entries.append({"ts": _time.strftime('%H:%M:%S'), "msg": msg})
 
             try:
+                from dash.settings import training_llm_call
                 eng = create_engine(db_url)
 
                 # Create training run for UI tracking
