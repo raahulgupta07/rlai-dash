@@ -196,7 +196,21 @@
       const data = await res.json();
       const tables = data.tables || [];
       if (tables.length === 0) {
-        dynamicSuggestions = ["What tables do I have?", "Help me understand my data"];
+        // Doc-only project — load training Q&A as suggestions
+        try {
+          const evRes = await fetch(`/api/projects/${projectSlug}/evals`, { headers: _headers() });
+          if (evRes.ok) {
+            const evData = await evRes.json();
+            const evals = evData.evals || [];
+            if (evals.length > 0) {
+              dynamicSuggestions = evals.slice(0, 6).map((e: any) => e.question?.replace(/^\[.*?\]\s*/, '') || '');
+              dynamicSuggestions = dynamicSuggestions.filter((s: string) => s.length > 5);
+            }
+          }
+        } catch {}
+        if (dynamicSuggestions.length === 0) {
+          dynamicSuggestions = ["Tell me about this project", "What are the key findings?", "Summarize the documents"];
+        }
         return;
       }
 
@@ -251,7 +265,7 @@
       }
 
       if (suggestions.length === 0) {
-        suggestions.push("What tables do I have?", "Give me an overview of my data");
+        suggestions.push("Give me an overview of my data", "What are the key metrics?");
       }
 
       dynamicSuggestions = suggestions.slice(0, 6);
