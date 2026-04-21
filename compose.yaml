@@ -3,7 +3,7 @@ services:
     image: pgvector/pgvector:pg18-trixie
     container_name: dash-db
     restart: always
-    command: postgres -c max_connections=200 -c shared_buffers=1GB -c work_mem=16MB -c effective_cache_size=3GB -c maintenance_work_mem=256MB
+    command: postgres -c max_connections=200 -c shared_buffers=1GB -c work_mem=16MB -c effective_cache_size=3GB -c maintenance_work_mem=256MB -c password_encryption=md5
     environment:
       POSTGRES_USER: ${DB_USER:-ai}
       POSTGRES_PASSWORD: ${DB_PASS:-ai}
@@ -63,8 +63,8 @@ services:
       - AGNO_DEBUG=True
       - AGENTOS_URL=http://127.0.0.1:8000
       # Database — goes through PgBouncer
-      - DB_HOST=dash-pgbouncer
-      - DB_PORT=6432
+      - DB_HOST=dash-db
+      - DB_PORT=5432
       - DB_USER=${DB_USER:-ai}
       - DB_PASS=${DB_PASS:-ai}
       - DB_DATABASE=${DB_DATABASE:-ai}
