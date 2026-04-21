@@ -3541,7 +3541,27 @@ def retrain_project(slug: str, request: Request):
 
     tables = insp.get_table_names(schema=schema)
     if not tables:
-        return {"status": "no_tables"}
+        # Doc-only project — still index knowledge base
+        import threading
+        def _bg_docs_only():
+            try:
+                # Index knowledge
+                _reload_project_knowledge(slug, timeout_sec=60)
+                # Create training run record
+                eng = create_engine(db_url)
+                with eng.connect() as conn:
+                    conn.execute(text(
+                        "INSERT INTO public.dash_training_runs (project_slug, status, steps, logs) "
+                        "VALUES (:s, 'done', 'complete', CAST(:logs AS jsonb))"
+                    ), {"s": slug, "logs": json.dumps([
+                        {"ts": __import__('time').strftime('%H:%M:%S'), "msg": "No data tables — indexing docs only"},
+                        {"ts": __import__('time').strftime('%H:%M:%S'), "msg": "✓ knowledge indexed from documents"},
+                    ])})
+                    conn.commit()
+            except Exception:
+                pass
+        threading.Thread(target=_bg_docs_only, daemon=True).start()
+        return {"status": "ok", "tables": 0, "message": "No data tables — indexing documents only"}
 
     import pandas as pd
 
