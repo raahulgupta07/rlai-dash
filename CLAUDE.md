@@ -168,6 +168,14 @@ Q&A Eval Pairs → Generation (LLM generates SQL from question)
 → Training Run Tracking (success/fail/duration)
 ```
 
+**Doc-Only Training (PPTX/PDF/DOCX without data tables):**
+14 steps: knowledge index → memories → persona → workflows → evals →
+feedback → business rules → domain knowledge → proactive insights →
+negative examples → training Q&A → multi-doc synthesis →
+cross-document relationships → complete
+
+All steps tracked in dash_training_runs for UI progress bar.
+
 ## Recent Features (Session Build)
 
 1. **Response Tabs** — Each chat response has 4 tabs: Analysis / Data / Query / Graph. Analysis shows markdown + feedback. Data shows clean spreadsheet table. Query shows SQL in CLI terminal. Graph shows ECharts with chart type selector.
@@ -268,6 +276,10 @@ Q&A Eval Pairs → Generation (LLM generates SQL from question)
 
 49. **Dead Code Cleanup** — Removed 442 lines of unused code across the codebase.
 
+50. **Complete Doc-Only Training** — 14-step training pipeline for document-only projects fills all brain layers: memories, persona, workflows, evals, feedback, rules, domain knowledge, insights, negative examples, Q&A, synthesis, relationships.
+
+51. **Training Progress for Docs** — Doc-only training creates training runs with step tracking so the UI progress bar updates in real-time.
+
 ## Self-Evolution Architecture
 
 ```
@@ -317,6 +329,8 @@ On-Demand Features:
 - **Table extraction from PDF** — uses pdfplumber to extract tabular data
 - **Table extraction from DOCX** — extracts doc.tables into PostgreSQL tables
 - **pdfminer.six dependency** — for PDF text extraction
+- Doc-only projects fully supported — no CSV/data table required for training
+- Training progress UI works for doc-only projects (step tracking in DB)
 
 ## Export System
 

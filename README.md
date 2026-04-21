@@ -159,6 +159,8 @@ When a user uploads data or triggers a retrain, the system runs a 10-step pipeli
 
 Training runs are tracked with success/fail status and duration.
 
+For document-only projects (PPTX/PDF/DOCX without data tables), training runs a 14-step pipeline: knowledge indexing, memories, persona, workflows, evals, feedback, business rules, domain knowledge (glossary/KPIs/metrics), proactive insights, negative examples, training Q&A, multi-document synthesis, cross-document relationships, and completion.
+
 ## Self-Learning
 
 Nine context layers are injected into the analyst prompt on every query:
@@ -197,6 +199,8 @@ Background processes run after every chat: quality scoring, rule suggestion, pro
 - **PPTX, DOCX, PDF** -- text + embedded tables extracted
 - **SQL** -- query patterns
 - **MD, TXT, PY** -- knowledge base
+
+All file formats receive full brain training — no data tables required.
 
 ## Troubleshooting
 
