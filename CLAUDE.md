@@ -19,7 +19,7 @@ app/
 ├── projects.py            # Projects CRUD (create, list, delete, chat, share, export, update)
 ├── upload.py              # Data upload + LLM auto-training + Codex-enriched knowledge + relationship discovery + drift detection
 ├── rules.py               # Business rules CRUD (with access checks)
-├── dashboards.py          # Dashboard CRUD + widgets
+├── dashboards.py          # Dashboard CRUD + widgets + dashboard generation from chat
 ├── suggested_rules.py     # AI-suggested rules (approve/reject)
 ├── scores.py              # Quality scoring API
 ├── export.py              # PDF + PPTX + conversation-to-report
@@ -297,6 +297,36 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 59. **Raw Binary Storage** — PPTX/PDF/DOCX uploads now save original binary to `docs_raw/` alongside extracted text. Enables structure extraction and image processing from original files.
 
+60. **Dashboard Generator (D button)** — Blue D button in chat input. 2-step LLM (think + generate) creates 6-8 widget dashboard from chat conversation. Metrics, charts, tables, insights. Preview mode with SAVE/DISCARD. `POST /{slug}/generate-dashboard-from-chat` in `app/dashboards.py`, "dashboard" task config with 3000 tokens.
+
+61. **Training Per-Table Progress** — Training shows which table is currently being trained: "Table 2/7: mm_conso_data_report_apr_25 · Deep Analysis". Steps field format: `step_name|table_name|index|total`. Single master training run in DB.
+
+62. **Dynamic Agents Tab** — AGENTS tab now API-driven via `GET /{slug}/agents`. Shows 4 agents (Leader, Analyst, Engineer, Researcher) with active/standby status badges. No more hardcoded HTML.
+
+63. **Smart File Routing** — DATASETS upload now routes files to correct endpoint: CSV/Excel/JSON → `/api/upload`, PPTX/PDF/DOCX/SQL/MD/TXT → `/api/upload-doc`. Was sending all files to data endpoint causing silent failures.
+
+64. **Leader Doc-Only Routing** — For doc-only projects, Leader instructions explicitly route ALL content questions to Researcher. Lists uploaded document names. Never says "I need more context."
+
+65. **Role-Based Permissions** — viewer=chat only, editor=upload+train, admin=all. Backend enforces via `check_project_permission(required_role)`. Frontend hides buttons via `canEdit`/`canAdmin` derived states. Shared project cards show CHAT only (no settings/delete).
+
+66. **User Sharing Modal** — Settings → USERS tab: "Add Access" modal with searchable user list, role selector (READ/EDITOR/ADMIN), inline access list with role dropdown and remove button.
+
+67. **Dashboard Save/Discard** — Generated dashboards show PREVIEW badge with SAVE (green) + DISCARD (red) buttons. No auto-save. Closing panel without saving auto-discards.
+
+68. **Command Center 7 Tabs** — USERS (inline expand with deep insights), PROJECTS (all projects with brain health), LOGS (audit trail with filters), SCHEMAS (PostgreSQL schemas with table drill-down), CHAT LOGS (all sessions with filters), HEALTH (system status), STATS (platform metrics). All data loads on tab switch.
+
+69. **Project Delete Cleanup** — Deleting a project now removes `knowledge/{slug}/` directory on disk via `shutil.rmtree`. Previously only cleaned DB.
+
+70. **Column Definition File Visibility** — Files classified as `column_definition` now saved to docs directory so they appear in the DOCUMENTS list.
+
+71. **Upload Auto-Hide** — Upload panel auto-hides 3 seconds after success. Upload button hidden during upload progress.
+
+72. **Queries Tab Shows DB Patterns** — QUERIES tab now shows patterns from `dash_query_patterns` DB table (was showing empty file-based patterns). Training auto-generates query patterns with SQL metadata extraction.
+
+73. **Lineage Counts All Relationships** — LINEAGE tab counts FK + AI-discovered relationships. Shows relationship table with FROM/TO/TYPE/CONFIDENCE/SOURCE badges.
+
+74. **Production Security Hardening** — scram-sha-256 (was md5), AGNO_DEBUG=False, PgBouncer health check, Caddy security headers (HSTS, X-Frame-Options, XSS, nosniff), Caddy 512M memory limit.
+
 ## Self-Evolution Architecture
 
 ```
@@ -347,6 +377,7 @@ On-Demand Features:
 - **Table extraction from PDF** — uses pdfplumber to extract tabular data
 - **Table extraction from DOCX** — extracts doc.tables into PostgreSQL tables
 - **pdfminer.six dependency** — for PDF text extraction
+- **Smart file routing** — PPTX/PDF/DOCX/SQL/MD/TXT → upload-doc, CSV/Excel/JSON → upload
 - Doc-only projects fully supported — no CSV/data table required for training
 - Training progress UI works for doc-only projects (step tracking in DB)
 - **Vision pipeline** — extracts images from PPTX (shape.image.blob) and PDF (fitz extract_image), sends to vision LLM, saves descriptions as searchable text
@@ -398,7 +429,7 @@ On-Demand Features:
 
 ## Settings Tabs (13)
 
-DATASETS · KNOWLEDGE · RULES · TRAINING · DOCS · QUERIES · LINEAGE · AGENTS · WORKFLOWS · SCHEDULES · EVALS · USERS · CONFIG
+DATASETS · KNOWLEDGE · RULES · TRAINING · DOCS · QUERIES · LINEAGE · AGENTS (API-driven, 4 agents with status badges) · WORKFLOWS · SCHEDULES · EVALS · USERS · CONFIG
 
 ## Commands
 
@@ -448,6 +479,11 @@ docker compose up -d --build
 - PgBouncer connection pooling (transaction mode, 100+ users)
 - NullPool for per-project engines (prevents connection leaks)
 - Streaming file upload (1MB chunks, no full file in memory)
+- scram-sha-256 authentication (was md5)
+- AGNO_DEBUG=False in production
+- Caddy security headers (HSTS, X-Frame-Options, XSS protection, nosniff)
+- PgBouncer health check
+- Caddy 512M memory limit
 
 ## Build & Deploy Troubleshooting
 

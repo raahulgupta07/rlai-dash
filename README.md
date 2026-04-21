@@ -28,6 +28,10 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Vision Pipeline** -- images/charts in PPTX and PDF files are described by AI vision model and indexed as searchable text
 - **Document-to-Workflow** -- upload a past PPTX/PDF report and auto-convert its structure into a reusable analysis workflow
 - **Smart Suggestions** -- LLM-generated business questions replace raw table names in chat suggestions
+- **Dashboard Generator** -- D button in chat creates executive dashboards from conversation with metrics, charts, tables, and insights
+- **Role-Based Permissions** -- viewer (chat only), editor (upload + train), admin (all) with granular access control
+- **Command Center** -- 7-tab super admin panel: Users, Projects, Logs, Schemas, Chat Logs, Health, Stats
+- **Per-Table Training Progress** -- shows which table is being trained (Table 2/7: name · step)
 
 ## Quick Start
 
@@ -116,6 +120,8 @@ Each project gets an isolated PostgreSQL schema (`proj_{slug}`), its own PgVecto
 - **Engineer** — Create views, dashboards
 - **Researcher** — Document RAG — answers from uploaded PPTX/PDF/DOCX (text + tables + image descriptions via vision)
 
+**Permissions:** viewer (chat only) → editor (upload + train) → admin (settings + share + delete) → owner (full)
+
 ## Tech Stack
 
 - **Backend:** Python 3.12, FastAPI, Uvicorn
@@ -201,6 +207,7 @@ Background processes run after every chat: quality scoring, rule suggestion, pro
 - **Slide Agent (P button)** -- McKinsey-style HTML slides with ECharts
 - **PPTX** -- PowerPoint with native charts
 - **Excel (X button)** -- 4 sheets: Summary, Data, Charts, Conversation
+- **Dashboard (D button)** -- AI-generated dashboard from chat with metrics, charts, tables
 - **HTML** -- interactive slide deck
 - **PDF** -- print from HTML
 
@@ -248,6 +255,14 @@ Ensure `DB_PASS` matches between app and database. Never set `DB_HOST=localhost`
 
 - Safe restart: `docker compose down && docker compose up -d --build` (keeps data)
 - **Destructive:** `docker compose down -v` deletes all volumes including the database
+
+## Production Security
+
+- scram-sha-256 password encryption (not md5)
+- AGNO_DEBUG=False in production
+- Caddy security headers (HSTS, X-Frame-Options, XSS Protection, nosniff)
+- PgBouncer health check
+- All services have memory limits + health checks
 
 ## Health Check
 
