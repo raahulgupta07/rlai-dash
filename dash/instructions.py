@@ -21,11 +21,16 @@ You lead a team of specialists. Route requests to the right agent:
 | Request Type | Agent | Examples |
 |-------------|-------|---------|
 | Data questions, SQL queries, analysis | **Analyst** | "What's our MRR?", "Which plan has highest churn?" |
-| Create views, summary tables, computed data | **Engineer** | "Create a monthly MRR view", "Build a churn risk score", "Add a customer health table" |
-| Create dashboards, reports, visual summaries | **Engineer** | "Build me a dashboard showing...", "Create a summary dashboard with key metrics" |
+| Document questions, project info, SOPs, reports | **Researcher** | "What does the report say?", "What are the SLA targets?", "Summarize the document" |
+| Create views, summary tables, computed data | **Engineer** | "Create a monthly MRR view", "Build a churn risk score" |
+| Create dashboards, reports, visual summaries | **Engineer** | "Build me a dashboard showing..." |
 | Greetings, thanks, "what can you do?" | Direct response | No delegation needed |
 
-**Default to Analyst** for anything data-related that isn't clearly about creating or modifying views/tables.
+**Routing rules:**
+- If the project has uploaded documents (PPTX/PDF/DOCX) → route to **Researcher** for document questions
+- If the project has data tables (CSV/Excel) → route to **Analyst** for SQL queries
+- If both exist → route to **Researcher** for "what does the report say?" and **Analyst** for "show me the numbers"
+- **Default to Researcher** if no data tables exist
 
 ## Two Schemas
 
@@ -126,35 +131,40 @@ Serious when the board deck is due, casual when someone's just exploring.
 # Analyst
 # ---------------------------------------------------------------------------
 ANALYST_INSTRUCTIONS = """\
-You are the Analyst, Dash's SQL specialist. You write queries, execute them,
-handle data quality issues, and extract insights from results.
+You are the Analyst, Dash's data and document specialist. You analyze data via SQL queries
+AND answer questions from uploaded documents (PPTX, PDF, DOCX).
 
-## Two Schemas
+## ⚠️ CRITICAL: READ YOUR CONTEXT FIRST
+
+**Before doing ANYTHING, scroll down and read ALL sections in your context:**
+- UPLOADED DOCUMENTS — full text from uploaded files
+- AGENT MEMORIES — facts extracted during training
+- TRAINING EXAMPLES — sample Q&A pairs
+- SEMANTIC MODEL — table schemas (if data exists)
+
+**RULES:**
+1. If the answer is in your context → answer directly. Do NOT say "I need more info."
+2. If the user asks "what else?" or "tell me more" → summarize everything in UPLOADED DOCUMENTS and MEMORIES.
+3. NEVER say "I don't have data" without checking ALL your context sections first.
+4. For vague questions → provide a summary of what you know about the project from the documents.
+
+## Two Schemas (for data projects)
 
 You can **read** from both schemas:
-- `public.*` — Company data (customers, subscriptions, invoices, etc.). Never modify.
-- `dash.*` — Agent-managed views and summary tables created by the Engineer.
+- `public.*` — Company data. Never modify.
+- `dash.*` — Agent-managed views created by the Engineer.
 
-Always check `dash.*` first — the Engineer may have already built a view
-that answers the question faster than querying raw tables.
+If no tables exist, answer from documents and memories only.
 
 ## Workflow
 
-1. **ALWAYS search knowledge base first** — check for documents, validated queries, table schemas, business rules, and dash views. This is CRITICAL — uploaded documents (PPTX, PDF, DOCX) are stored here.
-2. **Search learnings** — check for error patterns, type gotchas, column quirks.
+1. **CHECK your context FIRST** — look at the UPLOADED DOCUMENTS, AGENT MEMORIES, and TRAINING EXAMPLES sections below. The answer is likely already there.
+2. **Search knowledge base** — use `search_knowledge_base` tool for additional context from uploaded files.
 3. **If data tables exist** → Write SQL, LIMIT 50 by default, no SELECT *, ORDER BY for rankings.
-4. **If NO data tables exist** → Answer from knowledge base search results and agent memories. Do NOT say "I don't have data" — search the knowledge base first.
+4. **If NO data tables exist** → Answer from context + knowledge search. You have enough information.
 5. **Execute** via SQLTools (only if tables exist).
 6. **On error** → use `introspect_schema` to inspect the actual schema → fix → `save_learning`.
 7. **On success** → provide **insights**, not just data. Offer `save_validated_query` if reusable.
-
-## IMPORTANT: Document-Only Projects
-When there are NO SQL tables but documents have been uploaded (PPTX, PDF, DOCX):
-- ALWAYS use `search_knowledge_base` to find information from uploaded documents
-- Answer questions using the document content found in knowledge search
-- Use agent memories (facts extracted during training) to supplement answers
-- NEVER say "I don't have data" without searching knowledge first
-- You CAN answer questions about project scope, goals, KPIs, rules, and context from documents
 
 ## When to save_learning
 
@@ -541,13 +551,51 @@ def build_analyst_instructions(user_id: str | None = None, project_slug: str | N
         from dash.paths import KNOWLEDGE_DIR
         tables_dir = KNOWLEDGE_DIR / project_slug / "tables"
         business_dir = KNOWLEDGE_DIR / project_slug / "business"
-        semantic_model = format_semantic_model(build_semantic_model(tables_dir if tables_dir.exists() else None))
+        if tables_dir.exists() and list(tables_dir.glob("*.json")):
+            semantic_model = format_semantic_model(build_semantic_model(tables_dir))
+        else:
+            semantic_model = ""  # Doc-only project — no tables, no global defaults
         business_context = build_business_context(business_dir if business_dir.exists() else None)
     else:
         semantic_model = format_semantic_model(build_semantic_model())
         business_context = build_business_context()
 
-    parts = [ANALYST_INSTRUCTIONS]
+    # For doc-only projects: use SHORT instructions + docs first
+    has_project_tables = project_slug and (KNOWLEDGE_DIR / project_slug / "tables").exists() and list((KNOWLEDGE_DIR / project_slug / "tables").glob("*.json"))
+    if project_slug and not has_project_tables:
+        # Shorter instructions for doc-only — skip SQL rules, chart hints, analysis frameworks
+        parts = [
+            "You are the Analyst — an expert on the uploaded documents in this project.\n\n"
+            "## RULES\n"
+            "1. Your PRIMARY data source is the UPLOADED DOCUMENTS section below.\n"
+            "2. Answer ALL questions from the document text. The answer IS in your context.\n"
+            "3. NEVER say 'I don't have data' or 'I need more info' — read the documents.\n"
+            "4. For vague questions → summarize the key points from the documents.\n"
+            "5. Use agent memories to supplement your answers.\n"
+        ]
+    else:
+        parts = [ANALYST_INSTRUCTIONS]
+
+    if project_slug and not has_project_tables:
+        docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
+        if docs_dir.exists():
+            doc_texts = []
+            for f in sorted(docs_dir.iterdir()):
+                if f.is_file():
+                    try:
+                        content = f.read_text(errors='ignore')[:3000]
+                        if content.strip():
+                            doc_texts.append(f"### Document: {f.name}\n{content}")
+                    except Exception:
+                        pass
+            if doc_texts:
+                parts.append(
+                    "## ⚠️ UPLOADED DOCUMENTS — YOUR PRIMARY DATA SOURCE\n\n"
+                    "**This project has NO SQL tables. The documents below ARE your data. "
+                    "Answer EVERY question from this text. Do NOT ask for more info.**\n\n"
+                    + "\n\n---\n\n".join(doc_texts[:5])
+                )
+
     if semantic_model:
         parts.append(f"## SEMANTIC MODEL\n\n{semantic_model}")
     if business_context:
@@ -571,25 +619,6 @@ def build_analyst_instructions(user_id: str | None = None, project_slug: str | N
         sl = _build_self_learning_context(project_slug, actual_user_id=actual_user_id)
         if sl:
             parts.append(sl)
-
-    # For doc-only projects: inject document summaries directly into prompt
-    has_project_tables = project_slug and (KNOWLEDGE_DIR / project_slug / "tables").exists() and list((KNOWLEDGE_DIR / project_slug / "tables").glob("*.json"))
-    if project_slug and not has_project_tables:
-        from dash.paths import KNOWLEDGE_DIR
-        docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
-        if docs_dir.exists():
-            doc_texts = []
-            for f in sorted(docs_dir.iterdir()):
-                if f.is_file():
-                    try:
-                        content = f.read_text(errors='ignore')[:3000]
-                        if content.strip():
-                            doc_texts.append(f"### Document: {f.name}\n{content}")
-                    except Exception:
-                        pass
-            if doc_texts:
-                doc_section = "## UPLOADED DOCUMENTS\n\nThis project has NO data tables — only uploaded documents. Answer ALL questions from this context.\n\n" + "\n\n---\n\n".join(doc_texts[:5])
-                parts.append(doc_section)
 
     final_prompt = "\n\n---\n\n".join(parts)
 

@@ -32,6 +32,7 @@ except ImportError:
 
 from dash.agents.analyst import analyst
 from dash.agents.engineer import engineer
+from dash.agents.researcher import researcher
 from dash.settings import SLACK_SIGNING_SECRET, SLACK_TOKEN, TRAINING_MODEL, dash_knowledge, dash_learnings
 from dash.team import dash
 from db import get_postgres_db, db_url
@@ -107,7 +108,7 @@ agent_os = AgentOS(
     lifespan=lifespan,
     db=get_postgres_db(),
     teams=[dash],
-    agents=[analyst, engineer],
+    agents=[analyst, engineer, researcher],
     knowledge=[dash_knowledge, dash_learnings],
     interfaces=interfaces,
     config=str(Path(__file__).parent / "config.yaml"),

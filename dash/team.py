@@ -17,6 +17,7 @@ from agno.team import Team, TeamMode
 
 from dash.agents.analyst import create_analyst
 from dash.agents.engineer import create_engineer
+from dash.agents.researcher import create_researcher
 from dash.instructions import build_leader_instructions
 from dash.settings import MODEL, SLACK_TOKEN, agent_db, dash_learning
 
@@ -72,7 +73,7 @@ def create_team(
 
 _team_cache: dict[str, tuple] = {}  # slug -> (team, created_at)
 _cache_lock = threading.Lock()
-_TEAM_CACHE_TTL = 300  # 5 minutes
+_TEAM_CACHE_TTL = 60  # 1 minute — faster refresh for instruction changes
 
 
 def create_project_team(
@@ -103,12 +104,31 @@ def create_project_team(
     analyst = create_analyst(project_slug=project_slug, knowledge=knowledge, learning=learning, actual_user_id=user_id)
     engineer = create_engineer(project_slug=project_slug, knowledge=knowledge, learning=learning, dashboard_user_id=user_id)
 
+    # Build doc context for Researcher
+    doc_instructions = ""
+    from dash.paths import KNOWLEDGE_DIR
+    docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
+    if docs_dir.exists():
+        doc_texts = []
+        for f in sorted(docs_dir.iterdir()):
+            if f.is_file():
+                try:
+                    content = f.read_text(errors='ignore')[:3000]
+                    if content.strip():
+                        doc_texts.append(f"### Document: {f.name}\n{content}")
+                except Exception:
+                    pass
+        if doc_texts:
+            doc_instructions = "\n\n## UPLOADED DOCUMENTS\n\n" + "\n\n---\n\n".join(doc_texts[:5])
+
+    researcher = create_researcher(knowledge=knowledge, instructions=doc_instructions, project_slug=project_slug)
+
     team = Team(
         id="dash",
         name=agent_name,
         mode=TeamMode.coordinate,
         model=MODEL,
-        members=[analyst, engineer],
+        members=[analyst, engineer, researcher],
         db=agent_db,
         instructions=build_leader_instructions(user_id=project_slug, project_slug=project_slug),
         tools=[],
