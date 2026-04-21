@@ -14,6 +14,7 @@ from agno.tools.reasoning import ReasoningTools
 from agno.tools.sql import SQLTools
 
 from dash.tools.dashboard import create_dashboard_tool
+from dash.tools.forecast import run_forecast
 from dash.tools.introspect import create_introspect_schema_tool
 from dash.tools.save_query import create_save_validated_query_tool
 from dash.tools.update_knowledge import create_update_knowledge_tool
@@ -39,10 +40,18 @@ def build_analyst_tools(knowledge: Knowledge, user_id: str | None = None, projec
         ro_engine = get_readonly_engine()
         user_schema = None
 
+    # Create forecast tool with injected engine/schema
+    from agno.tools import tool
+
+    @tool(name="run_forecast", description="Run time series forecast using Prophet. Use when user asks to predict, forecast, or project future values. Args: table (str), date_column (str), value_column (str), periods (int, default 3)")
+    def forecast_tool(table: str, date_column: str, value_column: str, periods: int = 3) -> str:
+        return run_forecast(table, date_column, value_column, periods, _engine=ro_engine, _schema=user_schema or "public")
+
     return [
         SQLTools(db_engine=ro_engine),
         create_introspect_schema_tool(db_url, engine=ro_engine, user_schema=user_schema),
         create_save_validated_query_tool(knowledge),
+        forecast_tool,
         ReasoningTools(),
     ]
 
