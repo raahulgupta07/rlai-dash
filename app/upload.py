@@ -3981,8 +3981,6 @@ def retrain_project(slug: str, request: Request):
 
             except Exception:
                 pass
-        from concurrent.futures import ThreadPoolExecutor
-        _bg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="dash-bg")
         _bg_executor.submit(_bg_docs_only)
         return {"status": "ok", "tables": 0, "message": "Doc-only project — indexing documents and filling brain"}
 
