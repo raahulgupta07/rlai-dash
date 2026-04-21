@@ -3725,7 +3725,107 @@ def retrain_project(slug: str, request: Request):
                     except Exception:
                         pass
 
-                    # Step 8: Cross-document relationships
+                    # Step 8: Extract business rules from docs
+                    _dlog("extracting business rules from documents...")
+                    try:
+                        result = training_llm_call(
+                            f"Extract business rules, constraints, and policies from this document.\n\n"
+                            f"DOCUMENT:\n{all_text[:4000]}\n\n"
+                            f'Return JSON array: [{{"name": "Rule Name", "definition": "The rule description", "type": "business_rule"}}]',
+                            "extraction"
+                        )
+                        if result:
+                            rules = json.loads(result)
+                            if isinstance(rules, list):
+                                saved = 0
+                                with eng.connect() as conn:
+                                    for r in rules[:8]:
+                                        if isinstance(r, dict) and r.get("name"):
+                                            rule_id = f"doc_{r['name'].lower().replace(' ', '_')[:25]}"
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_rules_db (project_slug, rule_id, name, type, definition, source) "
+                                                "VALUES (:s, :rid, :name, :type, :defn, 'doc_training') ON CONFLICT DO NOTHING"
+                                            ), {"s": slug, "rid": rule_id, "name": r["name"], "type": r.get("type", "business_rule"), "defn": r.get("definition", "")})
+                                            saved += 1
+                                    conn.commit()
+                                _dlog(f"✓ {saved} business rules extracted")
+                    except Exception as e:
+                        _dlog(f"⚠ rules error: {str(e)[:60]}")
+
+                    # Step 9: Extract domain knowledge (glossary + KPIs)
+                    _dlog("extracting domain knowledge...")
+                    try:
+                        result = training_llm_call(
+                            f"Extract domain knowledge from this document:\n\n"
+                            f"DOCUMENT:\n{all_text[:4000]}\n\n"
+                            f"Return JSON with:\n"
+                            f'{{"glossary": [{{"term": "SLA", "definition": "Service Level Agreement"}}], '
+                            f'"kpis": [{{"name": "Resolution Time", "definition": "Average time to resolve tickets"}}], '
+                            f'"key_metrics": [{{"name": "Ticket Volume", "value": "500/month"}}]}}',
+                            "extraction"
+                        )
+                        if result:
+                            domain = json.loads(result)
+                            if isinstance(domain, dict):
+                                saved = 0
+                                with eng.connect() as conn:
+                                    # Glossary → memories
+                                    for g in (domain.get("glossary") or [])[:10]:
+                                        if isinstance(g, dict) and g.get("term"):
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_memories (project_slug, scope, fact, source) "
+                                                "VALUES (:s, 'project', :f, 'glossary') ON CONFLICT DO NOTHING"
+                                            ), {"s": slug, "f": f"Glossary: {g['term']} = {g.get('definition', '')}"})
+                                            saved += 1
+                                    # KPIs → rules
+                                    for k in (domain.get("kpis") or [])[:8]:
+                                        if isinstance(k, dict) and k.get("name"):
+                                            rule_id = f"kpi_doc_{k['name'].lower().replace(' ', '_')[:25]}"
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_rules_db (project_slug, rule_id, name, type, definition, source) "
+                                                "VALUES (:s, :rid, :name, 'kpi', :defn, 'doc_training') ON CONFLICT DO NOTHING"
+                                            ), {"s": slug, "rid": rule_id, "name": k["name"], "defn": k.get("definition", "")})
+                                            saved += 1
+                                    # Metrics → memories
+                                    for m in (domain.get("key_metrics") or [])[:5]:
+                                        if isinstance(m, dict) and m.get("name"):
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_memories (project_slug, scope, fact, source) "
+                                                "VALUES (:s, 'project', :f, 'auto_training') ON CONFLICT DO NOTHING"
+                                            ), {"s": slug, "f": f"Key metric: {m['name']} = {m.get('value', 'N/A')}"})
+                                            saved += 1
+                                    conn.commit()
+                                _dlog(f"✓ {saved} domain knowledge items extracted")
+                    except Exception as e:
+                        _dlog(f"⚠ domain knowledge error: {str(e)[:60]}")
+
+                    # Step 10: Generate proactive insights from docs
+                    _dlog("generating proactive insights...")
+                    try:
+                        result = training_llm_call(
+                            f"Analyze this document and identify 3 proactive insights — things that need attention, risks, or opportunities.\n\n"
+                            f"DOCUMENT:\n{all_text[:4000]}\n\n"
+                            f'Return JSON array: [{{"insight": "Description of the insight", "severity": "info|warning|critical"}}]',
+                            "extraction"
+                        )
+                        if result:
+                            insights = json.loads(result)
+                            if isinstance(insights, list):
+                                saved = 0
+                                with eng.connect() as conn:
+                                    for ins in insights[:5]:
+                                        if isinstance(ins, dict) and ins.get("insight"):
+                                            conn.execute(text(
+                                                "INSERT INTO public.dash_proactive_insights (project_slug, insight, severity) "
+                                                "VALUES (:s, :i, :sev)"
+                                            ), {"s": slug, "i": ins["insight"], "sev": ins.get("severity", "info")})
+                                            saved += 1
+                                    conn.commit()
+                                _dlog(f"✓ {saved} proactive insights generated")
+                    except Exception as e:
+                        _dlog(f"⚠ insights error: {str(e)[:60]}")
+
+                    # Step 11: Cross-document relationships
                     _dlog("discovering cross-document relationships...")
                     try:
                         doc_summaries = []
