@@ -531,6 +531,75 @@
   let dashboardPanelOpen = $state(false);
   let activeDashboardId = $state<number | null>(null);
 
+  // Slide Agent panel
+  let slidesPanelOpen = $state(false);
+  let slidesData = $state<any[]>([]);
+  let slidesThinking = $state<any>(null);
+  let slidesLoading = $state(false);
+  let slidesProgress = $state('');
+  let currentSlide = $state(0);
+
+  async function generateSlides() {
+    if (messages.length < 2 || slidesLoading) return;
+    slidesLoading = true;
+    slidesProgress = 'Analyzing conversation...';
+    slidesPanelOpen = true;
+    slidesData = [];
+    currentSlide = 0;
+
+    try {
+      const res = await fetch('/api/export/slides-agent', {
+        method: 'POST',
+        headers: { ..._headers(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: messages.map(m => ({ role: m.role, content: m.content })),
+          title: projectInfo?.agent_name + ' Analysis',
+          agent_name: projectInfo?.agent_name || 'Agent'
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        slidesThinking = data.thinking;
+        slidesData = data.slides || [];
+        slidesProgress = 'Done';
+      } else {
+        slidesProgress = 'Failed to generate slides';
+      }
+    } catch (e) {
+      slidesProgress = 'Error generating slides';
+    }
+    slidesLoading = false;
+  }
+
+  $effect(() => {
+    const slide = slidesData[currentSlide];
+    if (slide?.chart) {
+      setTimeout(() => {
+        const el = document.getElementById(`slide-chart-${currentSlide}`);
+        const echarts = (window as any).echarts;
+        if (!el || !echarts) return;
+        const existing = echarts.getInstanceByDom(el);
+        if (existing) existing.dispose();
+        const chart = echarts.init(el);
+        const type = slide.chart.type || 'bar';
+        const option: any = {
+          tooltip: { trigger: 'axis' },
+          title: { text: slide.chart.title || '', left: 'center', textStyle: { fontSize: 13 } },
+          xAxis: { type: 'category', data: slide.chart.labels || [], axisLabel: { fontSize: 10 } },
+          yAxis: { type: 'value' },
+          series: [{ type, data: slide.chart.values || [], itemStyle: { color: '#D24726', borderRadius: type === 'bar' ? [4,4,0,0] : undefined }, smooth: type === 'line' }],
+          grid: { left: '10%', right: '5%', bottom: '15%', top: '15%' }
+        };
+        if (type === 'pie') {
+          delete option.xAxis; delete option.yAxis;
+          option.series = [{ type: 'pie', radius: ['35%','60%'], data: (slide.chart.labels||[]).map((l:string,i:number) => ({name:l, value:(slide.chart.values||[])[i]})) }];
+        }
+        chart.setOption(option);
+      }, 150);
+    }
+  });
+
   // Dashboard pin modal
   let showPinModal = $state(false);
   let pinModalData = $state<{msgIndex: number; tables: any[]; content: string} | null>(null);
@@ -1379,6 +1448,20 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
           </button>
         {/if}
+        <!-- Slide Agent button -->
+        <button onclick={generateSlides} disabled={messages.length < 2 || slidesLoading} title="Create Presentation" style="height: 34px; width: 34px; padding: 0; border: 2px solid {messages.length >= 2 ? '#D24726' : '#ccc'}; background: {messages.length >= 2 ? '#D2472610' : 'none'}; cursor: {messages.length >= 2 ? 'pointer' : 'default'}; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
+          <svg width="18" height="18" viewBox="0 0 24 24">
+            <defs>
+              <linearGradient id="pptGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#D24726"/>
+                <stop offset="50%" stop-color="#E5682A"/>
+                <stop offset="100%" stop-color="#F0A030"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="20" height="20" rx="4" fill="url(#pptGrad)"/>
+            <text x="12" y="16" text-anchor="middle" fill="white" font-size="13" font-weight="900" font-family="Arial">P</text>
+          </svg>
+        </button>
       </div>
     </div>
     <div style="text-align: center; font-size: 9px; color: var(--color-on-surface-dim); padding: 0 20px 8px; text-transform: uppercase; letter-spacing: 0.1em;">
@@ -1390,10 +1473,159 @@
         });
         if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `report-${Date.now()}.pdf`; a.click(); URL.revokeObjectURL(url); }
       }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-on-surface-dim); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline;">GENERATE REPORT</button>
+      <button onclick={async () => {
+        const res = await fetch('/api/export/pptx-from-chat', {
+          method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: projectInfo?.agent_name + ' Analysis' })
+        });
+        if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `${projectInfo?.agent_name || 'analysis'}-${Date.now()}.pptx`; a.click(); URL.revokeObjectURL(url); }
+      }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-on-surface-dim); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline; margin-left: 6px;">CREATE PPTX</button>
+      <button onclick={async () => {
+        const res = await fetch('/api/export/slides-from-chat', {
+          method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: messages.map(m => ({ role: m.role, content: m.content })), title: projectInfo?.agent_name + ' Analysis', agent_name: projectInfo?.agent_name || 'Agent' })
+        });
+        if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); window.open(url, '_blank'); }
+      }} style="background: none; border: none; cursor: pointer; font-size: 9px; color: var(--color-primary); font-family: var(--font-family-display); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: underline; margin-left: 6px; font-weight: 900;">PRESENT</button>
       <span style="margin-left: 8px;">{projectInfo?.agent_name?.toUpperCase() || 'AGENT'} CAN MAKE MISTAKES.</span>
     </div>
   </div>
 </div>
+
+  <!-- Slide Panel -->
+  {#if slidesPanelOpen}
+  <div style="position: fixed; top: 0; right: 0; width: 50%; height: 100vh; background: var(--color-surface); border-left: 3px solid var(--color-on-surface); z-index: 90; display: flex; flex-direction: column; box-shadow: -4px 0 20px rgba(0,0,0,0.2);">
+    <!-- Header -->
+    <div style="padding: 12px 16px; border-bottom: 2px solid var(--color-on-surface); display: flex; align-items: center; justify-content: space-between; background: var(--color-surface-bright);">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <svg width="20" height="20" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="4" fill="#D24726"/><text x="12" y="16" text-anchor="middle" fill="white" font-size="12" font-weight="900" font-family="Arial">P</text></svg>
+        <span style="font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.05em;">PRESENTATION</span>
+        {#if slidesData.length > 0}
+          <span style="font-size: 10px; color: var(--color-on-surface-dim);">{currentSlide + 1} / {slidesData.length}</span>
+        {/if}
+      </div>
+      <div style="display: flex; gap: 6px; align-items: center;">
+        {#if slidesData.length > 0}
+          <button onclick={() => { const w = window.open('', '_blank'); if (w) { w.document.write('<html><head><title>Slides</title><script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"><\/script></head><body>' + document.querySelector('.slide-render-area')?.innerHTML + '</body></html>'); w.document.close(); }}} style="font-size: 9px; font-weight: 900; padding: 4px 8px; border: 1px solid var(--color-on-surface); background: none; cursor: pointer; text-transform: uppercase;">Fullscreen</button>
+        {/if}
+        <button onclick={() => slidesPanelOpen = false} style="background: none; border: none; cursor: pointer; font-size: 18px; font-weight: 900; color: var(--color-on-surface);">&#x2715;</button>
+      </div>
+    </div>
+
+    <!-- Loading state -->
+    {#if slidesLoading}
+      <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;">
+        <svg width="24" height="24" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="4" fill="#D24726"/><text x="12" y="16" text-anchor="middle" fill="white" font-size="12" font-weight="900" font-family="Arial">P</text></svg>
+        <div style="font-size: 12px; font-weight: 900; text-transform: uppercase;">{slidesProgress}</div>
+        <div style="width: 200px; height: 4px; background: var(--color-surface-dim); border: 1px solid var(--color-on-surface-dim);">
+          <div style="height: 100%; background: #D24726; width: {slidesProgress.includes('Analyz') ? '33' : slidesProgress.includes('Structur') ? '66' : slidesProgress.includes('Done') ? '100' : '15'}%; transition: width 0.5s;"></div>
+        </div>
+      </div>
+
+    <!-- Thinking summary + slides -->
+    {:else if slidesThinking && slidesData.length > 0}
+      <div style="flex: 1; overflow-y: auto;" class="slide-render-area">
+        <!-- Thinking bar -->
+        <div style="padding: 8px 16px; background: #FFF8E1; border-bottom: 1px solid #FFE082; font-size: 10px;">
+          <strong>NARRATIVE:</strong> {slidesThinking.narrative || ''}
+          {#if slidesThinking.key_insight} &middot; <strong>KEY INSIGHT:</strong> {slidesThinking.key_insight}{/if}
+        </div>
+
+        <!-- Current slide -->
+        {#if slidesData[currentSlide]}
+          {@const slide = slidesData[currentSlide]}
+          <div style="padding: 30px; min-height: 400px;">
+            <!-- Title -->
+            <h2 style="font-size: 24px; font-weight: 900; margin-bottom: 16px; color: #1a1a1a;">{slide.title || ''}</h2>
+
+            {#if slide.layout === 'title'}
+              <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 300px;">
+                <div style="font-size: 36px; font-weight: 900; text-align: center;">{slide.title}</div>
+                <div style="font-size: 16px; color: #666; margin-top: 12px; text-align: center;">{slide.bullets?.join(' · ') || ''}</div>
+              </div>
+
+            {:else if slide.layout === 'kpi' && slide.kpi}
+              <div style="display: flex; align-items: center; justify-content: center; height: 200px; gap: 40px;">
+                <div style="text-align: center;">
+                  <div style="font-size: 56px; font-weight: 900;">{slide.kpi.value}</div>
+                  <div style="font-size: 14px; color: #666; margin-top: 4px;">{slide.kpi.label}</div>
+                  {#if slide.kpi.change}
+                    <div style="font-size: 20px; font-weight: 700; color: {slide.kpi.change?.startsWith('+') ? '#00c853' : '#ff1744'}; margin-top: 4px;">{slide.kpi.change}</div>
+                  {/if}
+                </div>
+              </div>
+              {#each (slide.bullets || []) as b}
+                <div style="font-size: 13px; color: #555; padding: 6px 12px; border-left: 3px solid #D24726; margin-bottom: 6px; background: #fafaf8;">&middot; {b}</div>
+              {/each}
+
+            {:else if slide.chart}
+              <div style="display: flex; gap: 20px;">
+                <div id="slide-chart-{currentSlide}" style="flex: 1; height: 280px;"></div>
+                <div style="flex: 0 0 200px;">
+                  {#each (slide.bullets || []) as b}
+                    <div style="font-size: 12px; color: #333; padding: 8px; border-left: 3px solid #D24726; margin-bottom: 8px; background: #fafaf8;">{b}</div>
+                  {/each}
+                </div>
+              </div>
+
+            {:else if slide.table}
+              <div style="overflow-x: auto;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 12px;">
+                  <thead>
+                    <tr>
+                      {#each (slide.table.headers || []) as h}
+                        <th style="padding: 8px 12px; text-align: left; border-bottom: 2px solid #1a1a1a; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #666;">{h}</th>
+                      {/each}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {#each (slide.table.rows || []).slice(0, 10) as row, ri}
+                      <tr style="background: {ri % 2 === 0 ? '#fafaf8' : '#fff'};">
+                        {#each row as cell}
+                          <td style="padding: 6px 12px; border-bottom: 1px solid #eee;">{cell}</td>
+                        {/each}
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+              {#each (slide.bullets || []) as b}
+                <div style="font-size: 12px; color: #555; margin-top: 8px;">&middot; {b}</div>
+              {/each}
+
+            {:else}
+              <!-- bullets/summary layout -->
+              {#each (slide.bullets || []) as b}
+                <div style="font-size: 14px; color: #333; padding: 10px 14px; border-left: 4px solid #D24726; margin-bottom: 8px; background: #fafaf8;">{b}</div>
+              {/each}
+            {/if}
+
+            <!-- So what -->
+            {#if slide.so_what}
+              <div style="margin-top: 20px; padding: 10px 14px; background: #E3F2FD; border-left: 4px solid #1976D2; font-size: 12px; font-weight: 700; color: #1565C0;">
+                SO WHAT: {slide.so_what}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+
+      <!-- Navigation -->
+      <div style="padding: 10px 16px; border-top: 2px solid var(--color-on-surface); display: flex; align-items: center; justify-content: space-between; background: var(--color-surface-bright);">
+        <button onclick={() => currentSlide = Math.max(0, currentSlide - 1)} disabled={currentSlide === 0} style="font-size: 10px; font-weight: 900; padding: 4px 12px; border: 1px solid var(--color-on-surface); background: none; cursor: pointer;">&#x2190; PREV</button>
+        <div style="display: flex; gap: 4px;">
+          {#each slidesData as _, si}
+            <button onclick={() => currentSlide = si} style="width: 8px; height: 8px; border-radius: 50%; border: 1px solid #999; background: {si === currentSlide ? '#D24726' : 'none'}; cursor: pointer; padding: 0;"></button>
+          {/each}
+        </div>
+        <button onclick={() => currentSlide = Math.min(slidesData.length - 1, currentSlide + 1)} disabled={currentSlide >= slidesData.length - 1} style="font-size: 10px; font-weight: 900; padding: 4px 12px; border: 1px solid var(--color-on-surface); background: none; cursor: pointer;">NEXT &#x2192;</button>
+      </div>
+
+    {:else}
+      <div style="flex: 1; display: flex; align-items: center; justify-content: center; color: var(--color-on-surface-dim); font-size: 12px;">No slides generated</div>
+    {/if}
+  </div>
+  {/if}
 
   <!-- Dashboard Side Panel -->
   {#if dashboardPanelOpen}

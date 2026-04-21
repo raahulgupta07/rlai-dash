@@ -81,6 +81,39 @@ docker compose -f compose.yaml up -d --build
                     └─────────────┘
 ```
 
+## If ports 80/443 are already taken (Nginx/Apache)
+
+Comment out Caddy in `compose.yaml`:
+```yaml
+  # caddy:
+  #   ... (comment out entire caddy section)
+```
+
+Add Nginx proxy:
+```bash
+sudo nano /etc/nginx/sites-available/dash
+```
+```nginx
+server {
+    listen 80;
+    server_name dash.yourdomain.com;
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 300s;
+    }
+}
+```
+```bash
+sudo ln -s /etc/nginx/sites-available/dash /etc/nginx/sites-enabled/
+sudo certbot --nginx -d dash.yourdomain.com
+sudo nginx -t && sudo systemctl reload nginx
+docker compose up -d --build
+```
+
 ## Health Check
 
 ```bash
