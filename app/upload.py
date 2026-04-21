@@ -1569,6 +1569,42 @@ Return ONLY valid JSON (no markdown):
     else:
         _log("⊘ skipping relationship discovery — only 1 table")
 
+    # Also discover cross-document relationships if docs exist
+    docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
+    if docs_dir.exists():
+        doc_files = [f for f in docs_dir.iterdir() if f.is_file()]
+        if len(doc_files) >= 2:
+            _log("discovering cross-document relationships...")
+            try:
+                doc_sums = []
+                for f in doc_files[:10]:
+                    try:
+                        doc_sums.append(f"{f.name}: {f.read_text(errors='ignore')[:500]}")
+                    except Exception:
+                        pass
+                result = training_llm_call(
+                    f"Find relationships between these documents.\n\n"
+                    f"DOCUMENTS:\n" + "\n---\n".join(doc_sums) + "\n\n"
+                    f'Return JSON: [{{"from_doc": "a.txt", "to_doc": "b.txt", "relationship": "shared topic", "shared_topics": ["topic1"], "strength": 0.8}}]',
+                    "extraction"
+                )
+                if result:
+                    rels = json.loads(result)
+                    if isinstance(rels, list):
+                        with train_engine.connect() as conn:
+                            for r in rels[:10]:
+                                if isinstance(r, dict) and r.get("from_doc"):
+                                    conn.execute(text(
+                                        "INSERT INTO public.dash_relationships (project_slug, from_table, from_column, to_table, to_column, rel_type, confidence, source) "
+                                        "VALUES (:s, :ft, :fc, :tt, :tc, 'topic', :conf, 'ai') ON CONFLICT DO NOTHING"
+                                    ), {"s": project_slug, "ft": r["from_doc"], "fc": ", ".join(r.get("shared_topics", [])[:5]),
+                                        "tt": r.get("to_doc", ""), "tc": r.get("relationship", ""),
+                                        "conf": r.get("strength", 0.5)})
+                            conn.commit()
+                        _log(f"✓ {len(rels)} cross-document relationships found")
+            except Exception:
+                pass
+
     _log("✓ relationships discovered")
 
     # Step 9: Re-index knowledge (with timeout — training completes even if this fails)
@@ -3688,6 +3724,47 @@ def retrain_project(slug: str, request: Request):
                         _dlog("✓ 1 seed feedback saved")
                     except Exception:
                         pass
+
+                    # Step 8: Cross-document relationships
+                    _dlog("discovering cross-document relationships...")
+                    try:
+                        doc_summaries = []
+                        for f in docs_dir.iterdir():
+                            if f.is_file():
+                                try:
+                                    content = f.read_text(errors='ignore')[:2000]
+                                    doc_summaries.append(f"{f.name}: {content[:500]}")
+                                except Exception:
+                                    pass
+                        if len(doc_summaries) >= 2:
+                            result = training_llm_call(
+                                f"Analyze these documents and find relationships, shared topics, cross-references between them.\n\n"
+                                f"DOCUMENTS:\n" + "\n---\n".join(doc_summaries[:10]) + "\n\n"
+                                f"Return ONLY valid JSON array:\n"
+                                f'[{{"from_doc": "doc1.txt", "to_doc": "doc2.txt", "relationship": "both discuss revenue targets", "shared_topics": ["revenue", "KPIs"], "strength": 0.8}}]',
+                                "extraction"
+                            )
+                            if result:
+                                rels = json.loads(result)
+                                if isinstance(rels, list):
+                                    saved = 0
+                                    with eng.connect() as conn:
+                                        for r in rels[:10]:
+                                            if isinstance(r, dict) and r.get("from_doc"):
+                                                conn.execute(text(
+                                                    "INSERT INTO public.dash_relationships (project_slug, from_table, from_column, to_table, to_column, rel_type, confidence, source) "
+                                                    "VALUES (:s, :ft, :fc, :tt, :tc, 'topic', :conf, 'ai') "
+                                                    "ON CONFLICT DO NOTHING"
+                                                ), {"s": slug, "ft": r["from_doc"], "fc": ", ".join(r.get("shared_topics", [])[:5]),
+                                                    "tt": r.get("to_doc", ""), "tc": r.get("relationship", ""),
+                                                    "conf": r.get("strength", 0.5)})
+                                                saved += 1
+                                        conn.commit()
+                                    _dlog(f"✓ {saved} cross-document relationships found")
+                        else:
+                            _dlog("· only 1 document — no cross-references to find")
+                    except Exception as e:
+                        _dlog(f"⚠ relationships error: {str(e)[:60]}")
 
                 _dlog("✓ doc-only training complete")
 
