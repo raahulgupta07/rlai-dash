@@ -34,11 +34,11 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Command Center** -- 7-tab super admin panel: Users, Projects, Logs, Schemas, Chat Logs, Health, Stats
 - **Per-Table Training Progress** -- shows which table is being trained (Table 2/7: name · step)
 
-## Quick Start
+## Fresh Install
 
 ```bash
 # 1. Clone and enter
-git clone <repo-url>
+git clone https://github.com/raahulgupta07/rlai-dash.git
 cd dash
 
 # 2. Create env file
@@ -57,6 +57,72 @@ docker compose up -d --build
 open http://localhost:8001
 
 # 6. Login with default admin credentials (see Default Login below)
+```
+
+## Upgrade (existing installation)
+
+```bash
+# 1. BACKUP first (always)
+docker exec dash-db pg_dump -U ai -d ai > backup_$(date +%Y%m%d).sql
+
+# 2. Pull latest code
+cd dash
+git pull origin main
+
+# 3. Build only the API (database untouched, no data loss)
+docker compose build dash-api
+
+# 4. Restart only the API
+docker compose up -d dash-api
+
+# 5. Verify
+curl http://localhost:8001/health
+# Should return: {"status":"ok"}
+```
+
+> **Important:** Never use `docker compose down -v` — the `-v` flag deletes all volumes including your database and trained knowledge. Use `docker compose down` (without `-v`) to stop safely.
+
+## Full Restart (data preserved)
+
+```bash
+# Stop and restart everything (data safe, volumes preserved)
+docker compose down
+docker compose up -d --build
+```
+
+## Backup & Restore
+
+```bash
+# Backup database
+docker exec dash-db pg_dump -U ai -d ai > backup_$(date +%Y%m%d).sql
+
+# Backup knowledge/training files
+docker run --rm -v dash_knowledge_data:/data -v $(pwd):/backup \
+  alpine tar czf /backup/knowledge_$(date +%Y%m%d).tar.gz /data
+
+# Restore database (if needed)
+cat backup_YYYYMMDD.sql | docker exec -i dash-db psql -U ai -d ai
+
+# Restore knowledge (if needed)
+docker run --rm -v dash_knowledge_data:/data -v $(pwd):/backup \
+  alpine tar xzf /backup/knowledge_YYYYMMDD.tar.gz -C /
+```
+
+## Rollback (if upgrade breaks something)
+
+```bash
+# See recent versions
+git log --oneline -10
+
+# Rollback to a specific version
+git checkout <commit-hash>
+docker compose build dash-api
+docker compose up -d dash-api
+
+# Rollback to pre-upload-agent version
+git checkout backup/pre-upload-agent
+docker compose build dash-api
+docker compose up -d dash-api
 ```
 
 ## Configuration
