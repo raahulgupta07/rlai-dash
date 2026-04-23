@@ -6,7 +6,8 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 
 - **Self-Learning** -- every chat improves the agent via feedback loops, memory accumulation, pattern mining, and auto-evolving instructions
 - **11 Analysis Types** -- response tabs (Analysis / Data / Query / Graph), dashboards, PDF/PPTX/CSV export, conversation-to-report, knowledge graph, eval pipeline, proactive insights
-- **Auto-Training** -- 10-step pipeline on upload: column analysis, Codex-enriched knowledge, Q&A generation, persona creation, relationship discovery, workflow generation, and more
+- **Upload Agent Team** -- 5 AI agents (Conductor, Parser, Scanner, Vision, Inspector) process any file: smart Excel parsing, Tesseract OCR, auto-merge same-structure tables, quality validation
+- **Auto-Training** -- 10-step pipeline with verified Q&A (SQL executed against real data), real brain memories (SQL aggregates), training quality score, chat feedback loop
 - **Self-Correction** -- closed-loop reasoning validates every query result; retries up to 3 times with schema introspection and join diagnosis
 - **Multi-Tenant** -- per-project schema isolation, granular sharing (viewer/editor/admin), user management, optional Keycloak SSO
 - **9 Context Layers** -- proven patterns, approved responses, anti-patterns, memories, annotations, JOIN strategies, user preferences, meta-learning, evolved instructions
@@ -111,7 +112,8 @@ Internet → Caddy (auto-SSL, security headers)
               ↓
            PostgreSQL 18 + PgVector (300 max_connections)
 
-Agent Team: Leader → Analyst (SQL) + Engineer (views) + Researcher (docs)
+Chat Team:   Leader → Analyst (SQL) + Engineer (views) + Researcher (docs)
+Upload Team: Conductor → Parser (data) + Scanner (docs) + Vision (images) + Inspector (quality)
 ```
 
 Each project gets an isolated PostgreSQL schema (`proj_{slug}`), its own PgVector knowledge store, an agent team (Leader, Analyst, Engineer, Researcher), a generated persona, and a self-learning pipeline. 35+ database tables across system, content, learning, and evolution domains.
@@ -130,7 +132,9 @@ All DB connections route through PgBouncer. App engines use NullPool (PgBouncer 
 - **Backend:** Python 3.12, FastAPI, Uvicorn
 - **Frontend:** SvelteKit 2, Svelte 5, Tailwind CSS v4, ECharts
 - **Database:** PostgreSQL 18 (pgvector/pgvector:pg18-trixie), PgVector
-- **LLM Router:** OpenRouter (gpt-5.4-mini for chat, gemini-3.1-flash-lite for training + vision)
+- **LLM Router:** OpenRouter (gpt-5.4-mini for chat + Excel analysis, gemini-3.1-flash-lite for training + vision)
+- **OCR:** Tesseract (local, free) for scanned PDFs + images
+- **Agents:** 9 total — 4 chat (Leader, Analyst, Engineer, Researcher) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector)
 - **Reverse Proxy:** Caddy 2 (auto-SSL)
 - **Containerization:** Docker Compose
 
@@ -149,7 +153,7 @@ app/                    # FastAPI application
 dash/                   # Agent core
   team.py               # Agent team factory
   instructions.py       # Dynamic prompt assembly (9 context layers)
-  agents/               # Analyst + Engineer agents
+  agents/               # 9 agents: Analyst, Engineer, Researcher (chat) + Conductor, Parser, Scanner, Vision, Inspector (upload)
   context/              # Semantic model, business rules
   tools/                # 11 agent tools (introspect, dashboard, insights, etc.)
 
@@ -225,7 +229,7 @@ Background processes run after every chat: quality scoring, rule suggestion, pro
 - **SQL** -- query patterns
 - **MD, TXT, PY** -- knowledge base
 
-All file formats receive full brain training — no data tables required. Upload Intelligence Agent (`_conduct_upload`) routes each file to specialized handler.
+All file formats receive full brain training — no data tables required. Upload Agent Team (Conductor → Parser/Scanner/Vision → Inspector → Engineer) processes files intelligently: smart parsing, auto-merge same-structure tables, quality validation, zero duplicates.
 
 ## Troubleshooting
 

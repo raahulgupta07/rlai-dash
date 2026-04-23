@@ -381,49 +381,85 @@ On-Demand Features:
 
 ## Upload System
 
-### Upload Intelligence Agent (Conductor + Handlers)
+### Upload Agent Team (9 Agents)
 
-All uploads route through `_conduct_upload()` which dispatches to specialized handlers:
+Two teams of agents work together. Chat Team handles user queries, Upload Team handles file processing:
 
 ```
-_conduct_upload(file, ext, project)
-  ├── _handle_excel()   ← AI multi-sheet analyzer (training_llm_call)
-  ├── _handle_pdf()     ← scanned page detection → vision OCR
-  ├── _handle_pptx()    ← text + tables + images (cap 30)
-  ├── _handle_docx()    ← text + tables + images (NEW)
-  ├── _handle_image()   ← JPG/PNG → vision → knowledge
-  ├── _handle_csv()     ← delimiter auto-detection
-  ├── _handle_json()    ← records/object orientation
-  └── _handle_text()    ← TXT/MD/SQL/PY → knowledge
-  ↓
-  All images → _describe_images_with_vision(UNIVERSAL_PROMPT) → text
-  ↓
-  tables → PostgreSQL | text → PgVector | metadata → JSON
+CHAT TEAM (user-facing):
+  Leader → Analyst (SQL) + Engineer (schema) + Researcher (docs)
+
+UPLOAD TEAM (file processing):
+  Conductor → Parser (data) + Scanner (docs) + Vision (images) + Inspector (quality)
+  → Engineer (post-upload merge + views)
 ```
 
-Every handler returns: `{"tables": [...], "text": str, "images": [...], "metadata": dict, "errors": [...], "warnings": [...]}`
+**Upload Agents** (`dash/agents/`):
+- **Conductor** (`conductor.py`) — Upload Orchestrator. Sees all files, creates plan, assigns agents, handles retries
+- **Parser** (`parser.py`) — Data Extraction Specialist. Excel/CSV/JSON: header detection, unpivot months, split multi-table sheets, merge related sheets
+- **Scanner** (`scanner.py`) — Document Intelligence Specialist. PDF/PPTX/DOCX/TXT: text extraction, table extraction, Tesseract OCR, Vision for charts
+- **Vision** (`vision_agent.py`) — Visual Recognition Specialist. JPG/PNG: OCR first (Tesseract, free), Vision LLM fallback for charts/diagrams
+- **Inspector** (`inspector.py`) — Data Quality Inspector. Validates every table: profiles columns, checks duplicates, scores health, triggers retry if bad
+
+**Upload Tools** (`dash/tools/upload_tools.py`): 20 tools across 4 categories — parser tools (6), scanner tools (5), vision tools (3), inspector tools (5)
+
+### Upload Flow: Smart Parse → Merge → Validate → Clean
+
+```
+File uploaded
+  ↓
+PHASE 1: SMART UPLOAD (per file)
+  Conductor → Parser/Scanner/Vision
+  Each file → individual tables (AI parsing: headers, unpivot, split)
+  ↓
+PHASE 2: ENGINEER MERGE (after all files)
+  Compare ALL tables → find >80% column overlap groups
+  MERGE same-structure tables → one table + _source_table column
+  ↓
+PHASE 3: INSPECTOR VALIDATION
+  Validate merged table: row count matches? health > 50%?
+  PASS → DELETE originals (no duplicates)
+  FAIL → keep originals (safe, no data loss)
+  ↓
+PHASE 4: ENGINEER RELATIONSHIPS
+  Discover JOINs, fix column types, report
+```
+
+### Endpoints
+
+- `POST /api/upload` — Standard data file upload (CSV/Excel/JSON)
+- `POST /api/upload-doc` — Document upload (PDF/PPTX/DOCX/TXT/MD/SQL)
+- `POST /api/upload-agent` — Agent-powered upload (full team: Conductor → Parser → Inspector → Engineer)
 
 ### Key Features
 
 - **13 File formats:** CSV, Excel (.xlsx/.xls), JSON, SQL, PPTX, DOCX, PDF, JPG, JPEG, PNG, MD, TXT, PY
-- **Excel AI multi-sheet** — `_handle_excel()` enumerates all sheets, sends previews to LLM (`training_llm_call("excel_analysis")`), gets JSON extraction plan per sheet (header_row, skip_rows, forward_fill, split tables). Fallback: `pd.read_excel(sheet_name=None)` reads all sheets with rule-based header detection
-- **Multi-table per sheet** — AI detects blank row gaps between tables within a single sheet, extracts each as separate PostgreSQL table
-- **Forward-fill merged cells** — AI identifies columns where values appear once then blank (grouped cells), applies `df.ffill()`
-- **Scanned PDF OCR** — `_handle_pdf()` detects scanned pages (text < 50 chars), renders at 200 DPI via `page.get_pixmap()`, sends to vision LLM for text extraction. No Tesseract needed
-- **DOCX image extraction** — `_extract_images_docx()` extracts images from `doc.part.rels` relationships, sends to vision for description
-- **JPG/PNG direct upload** — `_handle_image()` base64 encodes image, vision LLM describes content (certificates, photos, diagrams)
-- **Universal vision prompt** — `_UNIVERSAL_VISION_PROMPT` handles all image types: scanned text, charts, diagrams, photos, tables. One prompt, auto-detects content type
-- **Image cap: 30** per document (was 10), min size 3KB (was 5KB)
-- **Corrupt PDF detection** — 0 pages = error returned to user
-- **Smart classification:** data, column_definition, sql_patterns, business_rules, documentation
-- **CSV delimiter auto-detection:** comma, semicolon, tab, pipe
-- **PostgreSQL reserved word protection** — auto-escapes column names
-- **Smart upsert with PK detection** — detects primary keys, upserts on conflict
+- **Excel AI multi-sheet** — GPT-5.4-mini analyzes structure, detects headers, unpivots months→rows, splits multi-table sheets, merges related sheets. Fallback: reads all sheets with rule-based header detection
+- **Excel unpivot** — Wide format (months as columns) → long format (months as rows). AI-powered 2-stage: structure analysis + conversion plan. Date parsing via LLM (Jul'21 → 2021-07-01)
+- **Clean/messy master decision** — `_is_clean_sheet()` checks in <1s: clean → direct load (0 AI calls), messy → AI analysis
+- **Multi-table per sheet** — AI detects blank row gaps, reads with header=None, slices manually (no pd.read_excel header crash)
+- **Forward-fill merged cells** — openpyxl detects merged ranges, AI identifies columns needing ffill
+- **Scanned PDF OCR** — Tesseract first (local, free), Vision LLM fallback. Max 5 scanned pages per PDF
+- **DOCX image extraction** — from doc.part.rels relationships → Vision description
+- **JPG/PNG direct upload** — Tesseract OCR + Vision description → knowledge base
+- **Auto-merge same-structure tables** — Engineer finds >80% column overlap → CREATE TABLE AS UNION ALL → Inspector validates → DROP originals
+- **Data profiling** — `_profile_table()` on every table: null%, types, distributions, duplicates, real health %
+- **Per-file upload progress bar** — numbered list with ✓/●/○/✗ status per file
+- **Source tracking** — SOURCE column in DATASETS tab: file name, sheet/page/slide number, AI description
+- **Image cap: 30** per document, min size 3KB
+- **Universal vision prompt** — one prompt handles all image types (text, charts, diagrams, photos)
 - **Stream upload** — 1MB chunks, never holds full file in memory
-- **Smart file routing** — PPTX/PDF/DOCX/SQL/MD/TXT/JPG/PNG → upload-doc, CSV/Excel/JSON → upload
-- Doc-only projects fully supported — no CSV/data table required for training
-- **Document-to-workflow** — extracts slide/section structure, LLM converts to reusable workflow steps
-- **Raw binary preservation** — original files saved to docs_raw/ for re-processing
+- **Models:** GPT-5.4-mini for Excel structure analysis, Gemini Flash Lite for training/vision. Per-task model override in TRAINING_CONFIGS
+
+### Training Verification
+
+Training pipeline now verifies with real data (was 28% real, now 100%):
+- **Q&A SQL verification** — generated SQL executed against real DB, answers saved as verified
+- **Relationship verification** — SELECT DISTINCT from both tables, compute actual value overlap
+- **Real brain memories** — from SQL aggregates (COUNT, SUM, AVG, GROUP BY), not metadata copies
+- **Distribution summary** — full data stats (value counts, ranges, percentiles) sent to LLM alongside 8 sample rows
+- **Training quality score** — computed after training: Q&A verified %, relationships verified %, memories count, health %
+- **Chat feedback loop** — proven patterns (👍) + anti-patterns (👎) fed into next training's Q&A prompt
 
 ## Export System
 
