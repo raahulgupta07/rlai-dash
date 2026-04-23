@@ -2909,6 +2909,25 @@ Return ONLY valid JSON:
                         if k not in df_final.columns:
                             df_final[k] = v
 
+                    # Ask AI to create date mapping for the period column
+                    if variable_name in df_final.columns:
+                        unique_periods = df_final[variable_name].dropna().unique().tolist()[:20]
+                        if unique_periods:
+                            try:
+                                date_prompt = f"""Convert these time period labels to ISO dates (YYYY-MM-DD, use 1st of month).
+
+Periods: {unique_periods}
+
+Return ONLY a JSON object mapping each period to its date:
+{{"Jul'21": "2021-07-01", "Aug'21": "2021-08-01", "Q1 2022": "2022-01-01"}}"""
+                                date_raw = training_llm_call(date_prompt, "extraction")
+                                if date_raw:
+                                    date_map = json.loads(date_raw)
+                                    df_final["date"] = df_final[variable_name].map(date_map)
+                                    df_final["date"] = pd.to_datetime(df_final["date"], errors="coerce")
+                            except Exception:
+                                pass
+
                     if value_name in df_final.columns:
                         df_final = df_final.dropna(subset=[value_name])
                     df_final = df_final.dropna(how='all')
