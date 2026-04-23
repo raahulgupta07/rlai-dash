@@ -1290,12 +1290,15 @@
           <div class="ink-border" style="overflow: hidden;">
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div style="width: 100%; text-align: left; background: var(--color-on-surface); color: var(--color-surface); padding: 10px 16px; cursor: pointer; font-family: var(--font-family-display); display: flex; align-items: center; justify-content: space-between;" onclick={() => toggleTableExpand(t.name)}>
-              <div class="flex items-center gap-3">
+              <div class="flex items-center gap-3" style="flex-wrap: wrap;">
                 <span style="font-size: 14px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.05em;">{t.name}</span>
                 {#if isTrained}
                   <span style="font-size: 8px; padding: 2px 6px; background: var(--color-primary); color: white; font-weight: 900; letter-spacing: 0.08em;">TRAINED</span>
                 {:else}
                   <span style="font-size: 8px; padding: 2px 6px; background: var(--color-warning); color: var(--color-on-surface); font-weight: 900; letter-spacing: 0.08em;">UNTRAINED</span>
+                {/if}
+                {#if t.source_file}
+                  <span style="font-size: 8px; padding: 2px 6px; background: #444; color: #ccc; font-weight: 700; letter-spacing: 0.05em;">{t.source_file.split('.').pop()?.toUpperCase()} {t.source_detail || ''}</span>
                 {/if}
               </div>
               <div class="flex items-center gap-3" style="font-size: 11px;">
@@ -1309,6 +1312,16 @@
             <!-- Expanded Content -->
             {#if isExpanded}
               <div style="padding: 16px;">
+
+                <!-- Source Info -->
+                {#if t.source_file}
+                  <div style="margin-bottom: 10px; font-size: 11px; color: var(--color-on-surface-dim); display: flex; gap: 8px; align-items: center;">
+                    <span style="font-weight: 700;">Source:</span>
+                    <span>{t.source_file}</span>
+                    {#if t.source_detail}<span style="color: var(--color-primary);">{t.source_detail}</span>{/if}
+                    {#if t.description}<span style="color: var(--color-on-surface-dim);">— {t.description}</span>{/if}
+                  </div>
+                {/if}
 
                 <!-- Metadata Section -->
                 {#if meta}
