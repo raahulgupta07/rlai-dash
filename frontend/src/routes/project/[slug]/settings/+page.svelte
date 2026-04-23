@@ -935,7 +935,7 @@
               {@const isTrained = knowledgeFiles.some((f) => f.type === 'tables' && f.name === t.name + '.json')}
               {@const qaCount = (training?.training_qa || []).filter((q) => q.source_table === t.name).length}
               {@const ruleCount = rules.filter((r) => r.name?.toLowerCase().includes(t.name?.toLowerCase())).length}
-              {@const health = isTrained ? (qaCount > 0 ? 100 : 60) : 0}
+              {@const health = t.health || (isTrained ? (qaCount > 0 ? 100 : 60) : 0)}
               <tr>
                 <td style="font-weight: 900;">{t.name}</td>
                 <td style="font-size: 10px; color: var(--color-on-surface-dim); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="{t.source_file || ''}{t.source_detail ? ' → ' + t.source_detail : ''}{t.description ? ' — ' + t.description : ''}">
@@ -1246,7 +1246,7 @@
               {#each detail.tables as t}
                 {@const isTrained = knowledgeFiles.some((f: any) => f.type === 'tables' && f.name === t.name + '.json')}
                 {@const qaCount = (training?.training_qa || []).filter((q: any) => q.source_table === t.name).length}
-                {@const health = isTrained ? (qaCount > 0 ? 100 : 60) : 0}
+                {@const health = t.health || (isTrained ? (qaCount > 0 ? 100 : 60) : 0)}
                 <tr style="cursor: pointer;" onclick={() => toggleTableExpand(t.name)}>
                   <td style="font-weight: 900;">{t.name}</td>
                   <td style="text-align: center;">{(t.rows || 0).toLocaleString()}</td>

@@ -699,6 +699,86 @@ def _detect_relationships(columns: list[str]) -> list[str]:
     return rels
 
 
+def _profile_table(df: pd.DataFrame, project_slug: str, table_name: str) -> dict:
+    """Profile table using pure pandas — real health %, column stats, alerts. No external deps."""
+    profile_data = {"health": 60, "alerts": [], "columns": {}, "row_count": len(df), "col_count": len(df.columns)}
+    try:
+        alerts = []
+        col_profiles = {}
+        total_cols = len(df.columns)
+
+        for col in df.columns:
+            series = df[col]
+            null_pct = round(float(series.isna().mean()) * 100, 1)
+            unique = int(series.nunique())
+            ctype = "numeric" if pd.api.types.is_numeric_dtype(series) else ("datetime" if pd.api.types.is_datetime64_any_dtype(series) else "text")
+
+            cp = {"type": ctype, "missing_pct": null_pct, "unique": unique}
+            if ctype == "numeric":
+                clean = series.dropna()
+                if len(clean) > 0:
+                    cp["min"] = float(clean.min())
+                    cp["max"] = float(clean.max())
+                    cp["mean"] = round(float(clean.mean()), 2)
+                    cp["zeros_pct"] = round(float((clean == 0).mean()) * 100, 1)
+            elif ctype == "text":
+                clean = series.dropna().astype(str)
+                if len(clean) > 0:
+                    cp["top_values"] = clean.value_counts().head(5).index.tolist()
+                    if unique <= 20:
+                        cp["is_categorical"] = True
+
+            col_profiles[col] = cp
+
+            # Generate alerts
+            if null_pct > 50:
+                alerts.append(f"Column '{col}' is {null_pct}% missing")
+            if null_pct > 0 and null_pct <= 50:
+                alerts.append(f"Column '{col}' has {null_pct}% missing values")
+            if ctype == "numeric" and cp.get("zeros_pct", 0) > 30:
+                alerts.append(f"Column '{col}' has {cp['zeros_pct']}% zero values")
+
+        # Duplicate detection
+        dup_rows = int(df.duplicated().sum())
+        if dup_rows > 0:
+            alerts.append(f"{dup_rows} duplicate rows detected")
+
+        # Compute REAL health %
+        health = 100
+        missing_cols = sum(1 for c in col_profiles.values() if c.get("missing_pct", 0) > 50)
+        if total_cols > 0:
+            health -= int((missing_cols / total_cols) * 30)
+        if dup_rows > 0:
+            health -= 15
+        if len(alerts) > 8:
+            health -= 10
+        if len(df) < 5:
+            health -= 20
+        # Bonus for completeness
+        complete_cols = sum(1 for c in col_profiles.values() if c.get("missing_pct", 0) == 0)
+        if total_cols > 0 and complete_cols == total_cols:
+            health = min(100, health + 10)
+        health = max(10, min(100, health))
+
+        profile_data = {
+            "health": health,
+            "row_count": len(df),
+            "col_count": total_cols,
+            "duplicate_rows": dup_rows,
+            "alerts": alerts[:20],
+            "columns": col_profiles,
+        }
+
+        # Save profile JSON
+        profile_dir = KNOWLEDGE_DIR / project_slug / "table_sources"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        _safe_write_json(profile_dir / f"{table_name}_profile.json", profile_data)
+
+    except Exception:
+        pass
+    return profile_data
+
+
 def _generate_metadata(table_name: str, df: pd.DataFrame, col_analyses: list[dict]) -> dict:
     """Generate table metadata JSON (same format as knowledge/tables/*.json)."""
     # Infer use cases from column types
@@ -1085,17 +1165,32 @@ Return empty array [] if no relationships found."""
         rels = json.loads(content.strip().strip("`").strip())
 
         if isinstance(rels, list) and rels:
+            # VERIFY relationships: check actual value overlap in PostgreSQL
+            schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
             engine = create_engine(db_url)
             with engine.connect() as conn:
                 for r in rels[:10]:
+                    ft, fc = r.get("from_table", ""), r.get("from_column", "")
+                    tt, tc = r.get("to_table", ""), r.get("to_column", "")
+                    verified_conf = r.get("confidence", 0.5)
+                    try:
+                        # Check actual value overlap between the two columns
+                        vals1 = conn.execute(text(f'SELECT DISTINCT "{fc}" FROM "{schema}"."{ft}" WHERE "{fc}" IS NOT NULL LIMIT 100')).fetchall()
+                        vals2 = conn.execute(text(f'SELECT DISTINCT "{tc}" FROM "{schema}"."{tt}" WHERE "{tc}" IS NOT NULL LIMIT 100')).fetchall()
+                        set1 = {str(v[0]) for v in vals1}
+                        set2 = {str(v[0]) for v in vals2}
+                        if set1 and set2:
+                            overlap = len(set1 & set2) / max(len(set1 | set2), 1)
+                            verified_conf = round(overlap, 2)
+                    except Exception:
+                        pass  # Keep LLM confidence if verification fails
                     try:
                         conn.execute(text("""
                             INSERT INTO public.dash_relationships (project_slug, from_table, from_column, to_table, to_column, rel_type, confidence, source)
-                            VALUES (:s, :ft, :fc, :tt, :tc, :type, :conf, 'ai')
-                            ON CONFLICT (project_slug, from_table, from_column, to_table, to_column) DO UPDATE SET confidence = :conf
-                        """), {"s": project_slug, "ft": r.get("from_table", ""), "fc": r.get("from_column", ""),
-                               "tt": r.get("to_table", ""), "tc": r.get("to_column", ""),
-                               "type": r.get("type", "fk"), "conf": r.get("confidence", 0.5)})
+                            VALUES (:s, :ft, :fc, :tt, :tc, :type, :conf, 'ai_verified')
+                            ON CONFLICT (project_slug, from_table, from_column, to_table, to_column) DO UPDATE SET confidence = :conf, source = 'ai_verified'
+                        """), {"s": project_slug, "ft": ft, "fc": fc, "tt": tt, "tc": tc,
+                               "type": r.get("type", "fk"), "conf": verified_conf})
                     except Exception:
                         pass
                 conn.commit()
@@ -1436,6 +1531,40 @@ def _run_auto_training(project_slug: str, table_name: str, col_analyses: list[di
     _log(f"generating training Q&A for {table_name}...")
     training = _llm_generate_training(table_name, metadata)
     if training and isinstance(training, list):
+        # VERIFY Q&A: Run each generated SQL against real data
+        schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+        verified_count = 0
+        discarded_count = 0
+        try:
+            verify_engine = create_engine(db_url)
+            for qa in training:
+                sql = qa.get("sql", "")
+                if not sql:
+                    continue
+                try:
+                    with verify_engine.connect() as vconn:
+                        vconn.execute(text(f"SET LOCAL search_path TO {schema}, public"))
+                        result = vconn.execute(text(sql))
+                        rows = result.fetchall()
+                        if rows:
+                            # Save real answer
+                            qa["verified"] = True
+                            qa["verified_answer"] = str(rows[0][0]) if len(rows[0]) == 1 else str(rows[:3])
+                            qa["verified_row_count"] = len(rows)
+                            verified_count += 1
+                        else:
+                            qa["verified"] = True
+                            qa["verified_answer"] = "0 rows"
+                            qa["verified_row_count"] = 0
+                            verified_count += 1
+                except Exception:
+                    qa["verified"] = False
+                    qa["verified_answer"] = None
+                    discarded_count += 1
+        except Exception:
+            pass
+        _log(f"  ✓ {verified_count} Q&A verified with real data, {discarded_count} had SQL errors")
+
         training_dir = KNOWLEDGE_DIR / project_slug / "training"
         training_dir.mkdir(parents=True, exist_ok=True)
         with open(training_dir / f"{table_name}_qa.json", "w") as f:
@@ -1746,22 +1875,64 @@ Return ONLY valid JSON (no markdown):
 
     engine = create_engine(db_url)
 
-    # 1. Auto-Memories
+    # 1. Auto-Memories — from REAL data, not just metadata
     try:
-        _log("  generating auto-memories...")
+        _log("  generating auto-memories from real data...")
         mem_facts = []
+        schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+
+        # Get REAL stats from actual table
+        try:
+            mem_engine = create_engine(db_url)
+            with mem_engine.connect() as mconn:
+                mconn.execute(text(f"SET LOCAL search_path TO {schema}, public"))
+                # Row count
+                row_count = mconn.execute(text(f'SELECT COUNT(*) FROM "{table_name}"')).scalar() or 0
+                mem_facts.append(f"Table '{table_name}' has {row_count:,} rows")
+
+                # Column count
+                col_count = len(col_analyses) if col_analyses else 0
+                mem_facts.append(f"Table '{table_name}' has {col_count} columns")
+
+                # Date range (if date column exists)
+                for ca in (col_analyses or []):
+                    if ca.get("type") == "datetime" or "date" in ca.get("name", "").lower():
+                        try:
+                            dr = mconn.execute(text(f'SELECT MIN("{ca["name"]}"), MAX("{ca["name"]}") FROM "{table_name}"')).fetchone()
+                            if dr and dr[0]:
+                                mem_facts.append(f"Table '{table_name}' date range: {dr[0]} to {dr[1]}")
+                        except Exception:
+                            pass
+                        break
+
+                # Top categories (for categorical columns)
+                for ca in (col_analyses or []):
+                    if ca.get("is_categorical") and ca.get("unique_count", 0) <= 15:
+                        try:
+                            cats = mconn.execute(text(f'SELECT "{ca["name"]}", COUNT(*) as cnt FROM "{table_name}" WHERE "{ca["name"]}" IS NOT NULL GROUP BY "{ca["name"]}" ORDER BY cnt DESC LIMIT 5')).fetchall()
+                            if cats:
+                                cat_str = ", ".join(f"{c[0]} ({c[1]})" for c in cats)
+                                mem_facts.append(f"Table '{table_name}' column '{ca['name']}' top values: {cat_str}")
+                        except Exception:
+                            pass
+
+                # Numeric ranges (for key numeric columns)
+                for ca in (col_analyses or []):
+                    if ca.get("type") == "numeric" and ca.get("mean"):
+                        try:
+                            stats = mconn.execute(text(f'SELECT SUM("{ca["name"]}"), AVG("{ca["name"]}"), MIN("{ca["name"]}"), MAX("{ca["name"]}") FROM "{table_name}"')).fetchone()
+                            if stats and stats[0] is not None:
+                                mem_facts.append(f"Table '{table_name}' column '{ca['name']}': total={stats[0]:,.0f}, avg={stats[1]:,.0f}, range={stats[2]:,.0f} to {stats[3]:,.0f}")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # Add metadata-based facts as fallback
         if metadata.get("table_description"):
             mem_facts.append(f"Table '{table_name}': {metadata['table_description'][:200]}")
         if metadata.get("grain"):
             mem_facts.append(f"Table '{table_name}' grain: {metadata['grain']}")
-        if metadata.get("primary_keys"):
-            pks = metadata["primary_keys"] if isinstance(metadata["primary_keys"], str) else ", ".join(metadata["primary_keys"])
-            mem_facts.append(f"Table '{table_name}' primary key(s): {pks}")
-        if metadata.get("freshness"):
-            mem_facts.append(f"Table '{table_name}' freshness: {metadata['freshness']}")
-        for col in (metadata.get("table_columns") or [])[:5]:
-            if col.get("description") and len(col["description"]) > 20:
-                mem_facts.append(f"Column '{table_name}.{col['name']}': {col['description'][:150]}")
 
         with engine.connect() as conn:
             saved = 0
@@ -3649,6 +3820,13 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                                 "description": tbl_info.get("description", ""),
                             })
 
+                        # Profile table for real health %
+                        if project:
+                            try:
+                                _profile_table(df, project, tbl_name)
+                            except Exception:
+                                pass
+
                         # Generate metadata + queries for each table
                         if project:
                             col_analyses = [_analyze_column(df[col]) for col in df.columns]
@@ -3919,6 +4097,12 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                 "source_detail": ext.replace(".", "").upper(),
                 "description": metadata.get("description", "") if isinstance(metadata, dict) else "",
             })
+
+        # Run YData Profiling for real health %
+        try:
+            _profile_table(df, project or proj_schema, tbl)
+        except Exception:
+            pass
 
         queries_file = queries_dir / f"{tbl}_queries.sql"
         with open(queries_file, "w") as f:

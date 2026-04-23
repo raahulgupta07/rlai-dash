@@ -642,11 +642,22 @@ def project_detail(slug: str, request: Request):
                     count = conn.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{t}"')).scalar() or 0
                 cols = insp.get_columns(t, schema=schema)
                 src = _source_meta.get(t, {})
+                # Load profile for real health %
+                _profile = {}
+                try:
+                    _pf = _source_dir.parent / "table_sources" / f"{t}_profile.json"
+                    if _pf.exists():
+                        _profile = _json.loads(_pf.read_text())
+                except Exception:
+                    pass
                 tables_list.append({
                     "name": t, "rows": count, "columns": len(cols),
                     "source_file": src.get("source_file", ""),
                     "source_detail": src.get("source_detail", ""),
                     "description": src.get("description", ""),
+                    "health": _profile.get("health", 0),
+                    "alerts": _profile.get("alerts", [])[:5],
+                    "duplicate_rows": _profile.get("duplicate_rows", 0),
                 })
             except Exception:
                 tables_list.append({"name": t, "rows": 0, "columns": 0, "source_file": "", "source_detail": "", "description": ""})
