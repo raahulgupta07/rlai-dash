@@ -3514,6 +3514,28 @@ def _handle_pdf(file_path: str, filename: str) -> dict:
                     pass
             else:
                 texts.append(page_text)
+                # Diagram detection: if page has text but it's mostly short labels
+                # (flowcharts, process diagrams, org charts) → also render for Vision
+                lines = [l.strip() for l in page_text.split("\n") if l.strip()]
+                avg_line_len = sum(len(l) for l in lines) / max(len(lines), 1)
+                is_diagram = (
+                    len(page_text.strip()) < 2000  # Not a full text page
+                    and len(lines) > 5              # Has multiple labels
+                    and avg_line_len < 30            # Short labels, not paragraphs
+                )
+                if is_diagram and len(result["images"]) < 30:
+                    try:
+                        pixmap = page.get_pixmap(dpi=200)
+                        png_bytes = pixmap.tobytes("png")
+                        if len(png_bytes) < 5_000_000:
+                            result["images"].append({
+                                "b64": base64.b64encode(png_bytes).decode(),
+                                "mime": "image/png",
+                                "source": f"page_{pi + 1}_diagram",
+                            })
+                            result["warnings"].append(f"Page {pi + 1}: diagram detected — sent to Vision for flow description")
+                    except Exception:
+                        pass
         doc.close()
         result["text"] = "\n".join(texts)
 
