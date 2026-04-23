@@ -920,13 +920,41 @@ def _llm_deep_analysis(table_name: str, col_analyses: list[dict], sample_rows: l
 
     col_summary = json.dumps([{k: v for k, v in c.items() if k in ("name", "type", "null_pct", "unique_count", "min", "max", "mean", "sample_values", "is_categorical")} for c in col_analyses], indent=2, default=str)
 
+    # Build distribution summary (gives LLM full picture without sending all rows)
+    dist_lines = []
+    total_rows = col_analyses[0].get("total_count", 0) if col_analyses else 0
+    dist_lines.append(f"TOTAL ROWS: {total_rows:,}")
+    for ca in col_analyses:
+        name = ca.get("name", "?")
+        ctype = ca.get("type", "?")
+        null_pct = ca.get("null_pct", 0)
+        unique = ca.get("unique_count", 0)
+        line = f"  {name} ({ctype}): {unique} unique, {null_pct}% null"
+        if ctype == "numeric" and ca.get("mean") is not None:
+            line += f", min={ca.get('min')}, max={ca.get('max')}, mean={ca.get('mean')}"
+            zeros = ca.get("zeros_pct", 0)
+            if zeros:
+                line += f", {zeros}% zeros"
+        elif ca.get("sample_values"):
+            vals = ca["sample_values"][:5]
+            line += f", top values: {vals}"
+        if ca.get("is_categorical"):
+            line += " [CATEGORICAL]"
+        if ca.get("min_date"):
+            line += f", range: {ca['min_date']} to {ca.get('max_date', '?')}"
+        dist_lines.append(line)
+    distribution_summary = "\n".join(dist_lines)
+
     prompt = f"""You are analyzing a dataset to train a data agent. Analyze deeply.
 
 TABLE: {table_name}
 COLUMNS:
 {col_summary}
 
-SAMPLE DATA:
+DATA DISTRIBUTION (full table stats):
+{distribution_summary}
+
+SAMPLE DATA (first 8 rows):
 {sample_md}
 
 Generate a comprehensive analysis like a Codex-enriched knowledge pipeline. Return ONLY valid JSON (no markdown):
@@ -969,7 +997,44 @@ Generate a comprehensive analysis like a Codex-enriched knowledge pipeline. Retu
         return None
 
 
-def _llm_generate_training(table_name: str, metadata: dict) -> list[dict] | None:
+def _get_chat_feedback_for_training(table_name: str) -> str:
+    """Load proven SQL patterns + user feedback to improve Q&A generation."""
+    feedback_context = ""
+    try:
+        engine = create_engine(db_url)
+        with engine.connect() as conn:
+            # Proven queries (thumbs-up)
+            good = conn.execute(text(
+                "SELECT question, answer FROM public.dash_feedback WHERE rating = 'up' AND answer LIKE :t ORDER BY created_at DESC LIMIT 5"
+            ), {"t": f"%{table_name}%"}).fetchall()
+            if good:
+                feedback_context += "\nUSERS LIKED THESE QUERIES (generate similar):\n"
+                for g in good:
+                    feedback_context += f"  Q: {str(g[0])[:80]}\n"
+
+            # Anti-patterns (thumbs-down)
+            bad = conn.execute(text(
+                "SELECT question, answer FROM public.dash_feedback WHERE rating = 'down' AND answer LIKE :t ORDER BY created_at DESC LIMIT 3"
+            ), {"t": f"%{table_name}%"}).fetchall()
+            if bad:
+                feedback_context += "\nUSERS DISLIKED THESE (avoid similar):\n"
+                for b in bad:
+                    feedback_context += f"  Q: {str(b[0])[:80]}\n"
+
+            # Proven SQL patterns
+            patterns = conn.execute(text(
+                "SELECT question, sql_text FROM public.dash_query_patterns WHERE table_name = :t AND usage_count > 1 ORDER BY usage_count DESC LIMIT 3"
+            ), {"t": table_name}).fetchall()
+            if patterns:
+                feedback_context += "\nPROVEN SQL PATTERNS (high usage, include similar):\n"
+                for p in patterns:
+                    feedback_context += f"  Q: {str(p[0])[:60]} → {str(p[1])[:100]}\n"
+    except Exception:
+        pass
+    return feedback_context
+
+
+def _llm_generate_training(table_name: str, metadata: dict, col_analyses: list[dict] = None) -> list[dict] | None:
     """Use LLM to generate training Q&A pairs for the agent."""
     from os import getenv
     import httpx
@@ -980,6 +1045,21 @@ def _llm_generate_training(table_name: str, metadata: dict) -> list[dict] | None
 
     cols_desc = "\n".join(f"- {c['name']} ({c.get('type', 'TEXT')}): {c.get('description', '')}" for c in metadata.get("table_columns", []))
 
+    # Build distribution so LLM knows REAL data shape (not just column names)
+    dist_info = ""
+    if col_analyses:
+        total = col_analyses[0].get("total_count", 0) if col_analyses else 0
+        dist_lines = [f"ROWS: {total:,}"]
+        for ca in col_analyses:
+            name = ca.get("name", "?")
+            line = f"  {name}: {ca.get('unique_count', '?')} unique, {ca.get('null_pct', 0)}% null"
+            if ca.get("type") == "numeric" and ca.get("mean") is not None:
+                line += f", range {ca.get('min')} to {ca.get('max')}, avg {ca.get('mean')}"
+            elif ca.get("sample_values"):
+                line += f", values: {ca['sample_values'][:5]}"
+            dist_lines.append(line)
+        dist_info = "\nDATA DISTRIBUTION:\n" + "\n".join(dist_lines) + "\n"
+
     prompt = f"""Generate 11 training Q&A pairs for this data table, one for each analysis type.
 Each pair should have: question, sql, analysis_type.
 
@@ -987,6 +1067,7 @@ TABLE: {table_name}
 DESCRIPTION: {metadata.get('table_description', '')}
 COLUMNS:
 {cols_desc}
+{dist_info}
 
 Generate exactly 11 pairs, one per analysis type. Use real column names from the table above:
 1. DESCRIPTIVE: "What is the total X?" with simple aggregation SQL (SUM, COUNT, AVG)
@@ -1005,7 +1086,9 @@ Return ONLY valid JSON array (no markdown):
 [
   {{"question": "What is the total revenue?", "sql": "SELECT SUM(revenue) FROM {table_name}", "analysis_type": "descriptive"}},
   ...
-]"""
+]
+
+{_get_chat_feedback_for_training(table_name)}"""
 
     try:
         resp = httpx.post(
@@ -1529,7 +1612,7 @@ def _run_auto_training(project_slug: str, table_name: str, col_analyses: list[di
         _update_run("failed", "cancelled"); _log("⊘ training cancelled by user"); return
     _update_run("running", "qa_generation")
     _log(f"generating training Q&A for {table_name}...")
-    training = _llm_generate_training(table_name, metadata)
+    training = _llm_generate_training(table_name, metadata, col_analyses=col_analyses)
     if training and isinstance(training, list):
         # VERIFY Q&A: Run each generated SQL against real data
         schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
@@ -2523,6 +2606,71 @@ Return ONLY valid JSON (no markdown):
 
     # Save fingerprint for delta detection on next retrain
     save_fingerprint(project_slug, table_name, num_rows, [c.get("name", "") for c in (metadata.get("table_columns") or [])])
+
+    # Training Quality Score — measure how good this training was
+    try:
+        schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+        qa_file = KNOWLEDGE_DIR / project_slug / "training" / f"{table_name}_qa.json"
+        quality_score = 0
+        quality_details = {}
+
+        if qa_file.exists():
+            with open(qa_file) as f:
+                qa_pairs = json.load(f)
+            total_qa = len(qa_pairs)
+            verified_qa = sum(1 for q in qa_pairs if q.get("verified"))
+            quality_details["qa_total"] = total_qa
+            quality_details["qa_verified"] = verified_qa
+            quality_details["qa_pct"] = round((verified_qa / max(total_qa, 1)) * 100)
+            quality_score += quality_details["qa_pct"] * 0.4  # 40% weight
+
+        # Check relationships verified
+        try:
+            rel_engine = create_engine(db_url)
+            with rel_engine.connect() as rconn:
+                rels = rconn.execute(text("SELECT confidence, source FROM public.dash_relationships WHERE project_slug = :s"), {"s": project_slug}).fetchall()
+                if rels:
+                    verified_rels = sum(1 for r in rels if r[1] == 'ai_verified')
+                    quality_details["relationships_total"] = len(rels)
+                    quality_details["relationships_verified"] = verified_rels
+                    quality_score += min(100, (verified_rels / max(len(rels), 1)) * 100) * 0.2  # 20% weight
+                else:
+                    quality_score += 50 * 0.2  # No rels = partial credit
+        except Exception:
+            quality_score += 50 * 0.2
+
+        # Check memories from real data
+        try:
+            with rel_engine.connect() as rconn:
+                mem_count = rconn.execute(text("SELECT COUNT(*) FROM public.dash_memories WHERE project_slug = :s AND source = 'auto'"), {"s": project_slug}).scalar() or 0
+                quality_details["memories"] = mem_count
+                quality_score += min(100, (mem_count / 8) * 100) * 0.2  # 20% weight
+        except Exception:
+            pass
+
+        # Check profile exists (data quality)
+        profile_file = KNOWLEDGE_DIR / project_slug / "table_sources" / f"{table_name}_profile.json"
+        if profile_file.exists():
+            try:
+                with open(profile_file) as f:
+                    profile = json.load(f)
+                quality_details["health"] = profile.get("health", 0)
+                quality_score += profile.get("health", 50) * 0.2  # 20% weight
+            except Exception:
+                quality_score += 50 * 0.2
+        else:
+            quality_score += 50 * 0.2
+
+        quality_score = round(min(100, max(0, quality_score)))
+        quality_details["overall_score"] = quality_score
+        _log(f"✓ training quality score: {quality_score}% (Q&A: {quality_details.get('qa_pct', '?')}% verified, {quality_details.get('memories', '?')} memories, health: {quality_details.get('health', '?')}%)")
+
+        # Save quality score
+        quality_dir = KNOWLEDGE_DIR / project_slug / "table_sources"
+        quality_dir.mkdir(parents=True, exist_ok=True)
+        _safe_write_json(quality_dir / f"{table_name}_training_quality.json", quality_details)
+    except Exception as e:
+        _log(f"⚠ quality score error: {str(e)[:80]}")
 
     _log(f"✓ training complete for {table_name}")
     _update_run("done", "complete")
