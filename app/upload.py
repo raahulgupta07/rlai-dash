@@ -2664,8 +2664,34 @@ def _handle_image(file_path: str, filename: str) -> dict:
     return result
 
 
+def _is_clean_sheet(df_preview: pd.DataFrame, merged_cells: list = []) -> bool:
+    """Quick check: is this sheet clean data (proper headers, no mess) or messy (needs AI)?"""
+    if len(df_preview) < 2:
+        return False
+    # Messy signals
+    if merged_cells:
+        return False  # Merged cells = messy
+    headers = list(df_preview.columns)
+    unnamed_count = sum(1 for h in headers if "unnamed" in str(h).lower())
+    if unnamed_count > len(headers) * 0.3:
+        return False  # Too many unnamed columns = wrong header row
+    # Check if first row looks like data (not metadata/units)
+    first_row = df_preview.iloc[0]
+    text_vals = [str(v).strip().lower() for v in first_row.dropna()]
+    unit_words = {"sachets", "kg", "units", "pcs", "nos", "mtrs", "ltrs"}
+    if text_vals and all(v in unit_words for v in text_vals if v):
+        return False  # First data row is units = messy
+    # Check if columns have month/date patterns (needs unpivot)
+    month_re = re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", re.IGNORECASE)
+    month_cols = sum(1 for h in headers if month_re.match(str(h).strip()))
+    if month_cols >= 3:
+        return False  # Months as columns = needs unpivot
+    # Clean: proper headers, no merges, no months as columns
+    return True
+
+
 def _handle_excel(file_path: str, filename: str) -> dict:
-    """Handle Excel upload — AI multi-sheet analysis with fallback."""
+    """Handle Excel upload — master decision: clean data → fast load, messy data → AI analysis."""
     result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
     ext = Path(file_path).suffix.lower()
 
@@ -2724,14 +2750,73 @@ def _handle_excel(file_path: str, filename: str) -> dict:
         result["warnings"].append("No sheets found in Excel file")
         return result
 
-    # Step 2: AI analysis — send previews, get extraction plan
+    # Step 2: MASTER DECISION — is this clean or messy data?
+    file_slug = _sanitize_table_name(Path(filename).stem)
+    clean_sheets = {}
+    messy_sheets = {}
+
+    for sname in sheet_names:
+        info = sheet_previews.get(sname, {})
+        merged = info.get("merged_cells", [])
+        # Quick read with header=0 to check if it's clean
+        try:
+            df_peek = pd.read_excel(file_path, sheet_name=sname, header=0, nrows=10)
+            if _is_clean_sheet(df_peek, merged):
+                clean_sheets[sname] = True
+            else:
+                messy_sheets[sname] = True
+        except Exception:
+            messy_sheets[sname] = True
+
+    # FAST PATH: All sheets are clean → direct load, no AI needed
+    if not messy_sheets and clean_sheets:
+        result["warnings"].append(f"Clean data detected — direct load ({len(clean_sheets)} sheets, no AI needed)")
+        for sname in sheet_names:
+            try:
+                df = pd.read_excel(file_path, sheet_name=sname, header=0)
+                df = _clean_dataframe(df)
+                if len(df) == 0:
+                    continue
+                tname = f"{file_slug}_{_sanitize_table_name(str(sname))}" if len(sheet_names) > 1 else file_slug
+                tname = _sanitize_table_name(tname)
+                sheet_idx = sheet_names.index(sname) + 1
+                result["tables"].append({"name": tname, "df": df, "source": sname, "sheet_number": sheet_idx, "description": f"Clean data from sheet '{sname}'"})
+            except Exception as e:
+                result["warnings"].append(f"Sheet '{sname}' failed: {e}")
+        return result
+
+    # MIXED: Some clean, some messy — load clean ones directly, AI for messy
+    if clean_sheets:
+        for sname in list(clean_sheets.keys()):
+            try:
+                df = pd.read_excel(file_path, sheet_name=sname, header=0)
+                df = _clean_dataframe(df)
+                if len(df) == 0:
+                    continue
+                tname = f"{file_slug}_{_sanitize_table_name(str(sname))}"
+                tname = _sanitize_table_name(tname)
+                sheet_idx = sheet_names.index(sname) + 1
+                result["tables"].append({"name": tname, "df": df, "source": f"{sname} [direct]", "sheet_number": sheet_idx, "description": f"Clean data from '{sname}'"})
+                result["warnings"].append(f"Sheet '{sname}': clean data — loaded directly (no AI)")
+            except Exception:
+                messy_sheets[sname] = True  # Failed direct load, try AI
+
+    # AI PATH: Only for messy sheets
+    # Filter sheet_names to only messy ones for AI analysis
+    ai_sheet_names = [s for s in sheet_names if s in messy_sheets]
+    if not ai_sheet_names:
+        return result
+
+    result["warnings"].append(f"{len(ai_sheet_names)} messy sheet(s) → AI analysis")
+
+    # Step 3: AI analysis — send previews, get extraction plan (only messy sheets)
     ai_plan = None
     try:
         from dash.settings import training_llm_call
         preview_text = ""
         # Limit preview rows per sheet based on sheet count to stay within LLM context
-        max_preview_rows = 25 if len(sheet_names) <= 5 else (15 if len(sheet_names) <= 10 else 10)
-        for sname in sheet_names:
+        max_preview_rows = 25 if len(ai_sheet_names) <= 5 else (15 if len(ai_sheet_names) <= 10 else 10)
+        for sname in ai_sheet_names:
             info = sheet_previews[sname]
             merged = info.get("merged_cells", [])
             merged_note = f" | Merged cells: {', '.join(merged[:10])}" if merged else ""
@@ -2739,7 +2824,7 @@ def _handle_excel(file_path: str, filename: str) -> dict:
             for ri, row in enumerate(info["rows"][:max_preview_rows]):
                 preview_text += f"  Row {ri}: {row}\n"
 
-        prompt = f"""Analyze this Excel file with {len(sheet_names)} sheets. For each sheet I show the first rows as raw cell values. Empty cells are ''.
+        prompt = f"""Analyze {len(ai_sheet_names)} messy Excel sheets that need intelligent processing. For each sheet I show the first rows as raw cell values. Empty cells are ''.
 
 {preview_text}
 
@@ -2779,9 +2864,12 @@ DETECT THESE PATTERNS:
 - Summary/total rows (Utilisation, Total) → skip_rows
 - Merged cells → forward_fill_columns
 - Empty sheets → "skip"
-- ALWAYS provide column_names mapping with clean descriptive names (not sachets_1, column_2)
-
-IMPORTANT: column_names should use the ACTUAL header text cleaned up. e.g. "Jul'21" → "jul_21", "Annual Capacity" → "annual_capacity", "Products" → "product\""""
+- NEVER invent column names. Use the EXACT text from the header row, just cleaned for PostgreSQL:
+  "No of FFS machines" → "no_of_ffs_machines"
+  "Annual Capacity" → "annual_capacity"
+  "Products" → "products"
+  "Jul'21" → keep as "Jul'21" (readable for unpivot values)
+- column_names mapping: key=column index, value=cleaned REAL header text"""
 
         raw = training_llm_call(prompt, "excel_analysis")
         if raw:
