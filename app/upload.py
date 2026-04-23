@@ -3353,15 +3353,34 @@ Return ONLY a JSON object mapping each period to its date:
                 continue
 
             if action == "split":
-                # Multiple tables in one sheet
+                # Multiple tables in one sheet — read with header=None, slice manually
+                try:
+                    df_raw = pd.read_excel(file_path, sheet_name=sname, header=None)
+                except Exception as e:
+                    result["warnings"].append(f"Cannot read sheet '{sname}': {e}")
+                    continue
                 for sub in sheet_plan.get("tables", []):
                     try:
                         hrow = sub.get("header_row", 0)
                         dstart = sub.get("data_start_row", hrow + 1)
                         dend = sub.get("data_end_row")
-                        nrows = (dend - dstart + 1) if dend is not None else None
-                        skip = [r for r in range(0, hrow)] + sub.get("skip_rows", [])
-                        df = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=skip, nrows=nrows)
+                        if dend is None:
+                            dend = len(df_raw) - 1
+                        # Extract header row as column names
+                        if hrow < len(df_raw):
+                            headers = [str(v).strip() if pd.notna(v) and str(v).strip() else f"col_{i}" for i, v in enumerate(df_raw.iloc[hrow])]
+                        else:
+                            continue
+                        # Extract data rows
+                        skip_rows = set(sub.get("skip_rows", []))
+                        skip_rows.add(hrow)  # Don't include header as data
+                        data_rows = []
+                        for ri in range(dstart, min(dend + 1, len(df_raw))):
+                            if ri not in skip_rows:
+                                data_rows.append(df_raw.iloc[ri].values)
+                        if not data_rows:
+                            continue
+                        df = pd.DataFrame(data_rows, columns=headers[:len(df_raw.columns)])
                         df = _clean_dataframe(df)
                         if len(df) == 0:
                             continue

@@ -681,7 +681,11 @@
       try {
         const ext = currentFile.name.split('.').pop()?.toLowerCase() || '';
         const isDoc = ['pptx', 'docx', 'pdf', 'md', 'txt', 'sql', 'py', 'jpg', 'jpeg', 'png'].includes(ext);
-        const uploadUrl = isDoc
+        // Use agent upload for data files (Excel/CSV/JSON), standard for docs
+        const isData = ['xlsx', 'xls', 'csv', 'json'].includes(ext);
+        const uploadUrl = isData
+          ? `/api/upload-agent?project=${slug}`
+          : isDoc
           ? `/api/upload-doc?project=${slug}`
           : `/api/upload?project=${slug}&action=${uploadAction}`;
         const res = await fetch(uploadUrl, { method: 'POST', body: fd, headers: _h() });
@@ -700,13 +704,21 @@
           continue;
         }
         const result = await res.json();
-        const detail = result?.multi_sheet ? `${result.tables_created} tables, ${result.total_rows} rows` :
+        const detail = result?.agent ? `${result.tables_created || 0} tables (agent)` :
+                       result?.multi_sheet ? `${result.tables_created} tables, ${result.total_rows} rows` :
                        result?.rows ? `${result.rows} rows` :
                        result?.size ? `${result.size} chars indexed` :
                        result?.tables_saved ? `${result.tables_saved} tables` : 'ok';
         uploadResults = [...uploadResults, { file: currentFile.name, detail, ...result }];
         uploadResult = result;
         uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'done' } : p);
+
+        // Log agent report to CLI
+        if (result?.agent && result?.agent_report) {
+          cLog(`${ts()} │  🤖 Agent processed: ${result.tables_created || 0} tables`);
+          const lines = result.agent_report.split('\n').filter((l: string) => l.trim()).slice(0, 8);
+          for (const line of lines) cLog(`${ts()} │  ${line.trim().substring(0, 80)}`);
+        }
 
         // Log to CLI
         const smart = result?.smart;
