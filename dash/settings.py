@@ -40,7 +40,7 @@ TRAINING_CONFIGS = {
     "meta_learning":    {"temp": 0.0, "tokens": 300,  "thinking": "none"},
     "vision":           {"temp": 0.1, "tokens": 1000, "thinking": "none"},
     "dashboard":        {"temp": 0.2, "tokens": 3000, "thinking": "minimal"},
-    "excel_analysis":   {"temp": 0.1, "tokens": 4000, "thinking": "medium"},
+    "excel_analysis":   {"temp": 0.1, "tokens": 4000, "thinking": "medium", "model": "openai/gpt-5.4-mini", "timeout": 60},
 }
 
 
@@ -95,19 +95,20 @@ def training_llm_call(prompt: str, task: str = "extraction") -> str | None:
     if not OPENROUTER_API_KEY:
         return None
     try:
+        model = cfg.get("model", TRAINING_MODEL)
         body: dict = {
-            "model": TRAINING_MODEL,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": cfg["tokens"],
             "temperature": cfg["temp"],
         }
-        if cfg["thinking"] != "none":
+        if cfg["thinking"] != "none" and "gemini" in model.lower():
             body["reasoning"] = {"effort": cfg["thinking"]}
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
             json=body,
-            timeout=30,
+            timeout=cfg.get("timeout", 30),
         )
         result = resp.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
