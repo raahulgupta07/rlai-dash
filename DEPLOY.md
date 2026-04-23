@@ -114,6 +114,81 @@ sudo nginx -t && sudo systemctl reload nginx
 docker compose up -d --build
 ```
 
+## Safe Update (code changes, data preserved)
+
+```bash
+# 1. ALWAYS backup first
+docker exec dash-db pg_dump -U ai -d ai > backup_$(date +%Y%m%d).sql
+
+# 2. Pull latest code
+git pull origin main
+
+# 3. Build ONLY the API container (DB untouched)
+docker compose build dash-api
+
+# 4. Restart ONLY the API
+docker compose up -d dash-api
+
+# 5. Verify
+curl http://localhost:8001/health
+```
+
+## Backup & Restore
+
+```bash
+# Backup database
+docker exec dash-db pg_dump -U ai -d ai > backup_$(date +%Y%m%d).sql
+
+# Backup knowledge files
+docker run --rm -v dash_knowledge_data:/data -v $(pwd):/backup \
+  alpine tar czf /backup/knowledge_$(date +%Y%m%d).tar.gz /data
+
+# Restore database
+cat backup_YYYYMMDD.sql | docker exec -i dash-db psql -U ai -d ai
+
+# Restore knowledge
+docker run --rm -v dash_knowledge_data:/data -v $(pwd):/backup \
+  alpine tar xzf /backup/knowledge_YYYYMMDD.tar.gz -C /
+```
+
+## Rollback
+
+```bash
+# Rollback to any previous commit
+git log --oneline -10             # find commit hash
+git checkout <commit-hash>
+docker compose build dash-api
+docker compose up -d dash-api
+
+# Rollback to pre-upload-agent backup
+git checkout backup/pre-upload-agent
+docker compose build dash-api
+docker compose up -d dash-api
+```
+
+## What Survives Rebuild
+
+| Data | Location | `down && up` | `down -v` |
+|------|----------|:---:|:---:|
+| Users, projects, chat | `pgdata` volume | ✅ | ❌ DELETED |
+| Uploaded tables | `pgdata` volume | ✅ | ❌ DELETED |
+| Training, memories | `pgdata` volume | ✅ | ❌ DELETED |
+| Knowledge files | `knowledge_data` volume | ✅ | ❌ DELETED |
+| SSL certificates | `caddy_data` volume | ✅ | ❌ DELETED |
+| .env config | Host filesystem | ✅ | ✅ |
+| Application code | Docker image | 🔄 Rebuilt | 🔄 Rebuilt |
+
+## Pre-Deploy Checklist
+
+- [ ] Backup database: `pg_dump`
+- [ ] Backup knowledge: `tar czf`
+- [ ] Check health: `curl /health`
+- [ ] Pull code: `git pull`
+- [ ] Build API only: `docker compose build dash-api`
+- [ ] Restart API only: `docker compose up -d dash-api`
+- [ ] Verify health: `curl /health`
+- [ ] Login and check data intact
+
 ## Health Check
 
 ```bash
