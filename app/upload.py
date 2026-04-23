@@ -68,8 +68,8 @@ _engine = create_engine(db_url)
 # Tables that ship with the demo — protected from deletion
 PROTECTED_TABLES = {"customers", "subscriptions", "plan_changes", "invoices", "usage_metrics", "support_tickets", "dash_users", "dash_tokens", "dash_projects", "shared_results"}
 
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
-ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".json", ".sql", ".py", ".txt", ".md", ".pptx", ".docx", ".pdf", ".jpg", ".jpeg", ".png"}
+MAX_FILE_SIZE = 200 * 1024 * 1024  # 200 MB
+ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".json", ".sql", ".py", ".txt", ".md", ".pptx", ".docx", ".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
 
 # Universal vision prompt — handles charts, scanned docs, photos, diagrams in one call
 _UNIVERSAL_VISION_PROMPT = (
@@ -530,7 +530,14 @@ def _find_header_row(file_path: str, ext: str) -> int:
 
 
 def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Smart cleanup: drop empty rows/columns, rename unnamed, clean column names."""
+    """Smart cleanup: normalize nulls, drop empty rows/columns, rename unnamed, clean column names."""
+    # 0. Normalize null representations → NaN
+    _null_strings = {"N/A", "n/a", "#N/A", "NA", "na", "NULL", "null", "None", "none", "NONE",
+                     "N/a", "#NA", "NaN", "nan", "-", "?", ".", "—", "–", ""}
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].map(lambda x: pd.NA if isinstance(x, str) and x.strip() in _null_strings else x)
+
     # 1. Drop rows where ALL values are NaN
     df = df.dropna(how='all')
 
@@ -2952,36 +2959,59 @@ def _describe_images_with_vision(images: list[dict], filename: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _handle_image(file_path: str, filename: str) -> dict:
-    """Handle JPG/PNG image upload — Tesseract OCR first, vision fallback for charts/diagrams."""
+    """Handle image upload — any format. Tesseract OCR first, vision fallback. Saves original."""
     import base64
     result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
     try:
-        with open(file_path, "rb") as f:
-            blob = f.read()
         ext = Path(file_path).suffix.lower()
-        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                    ".tiff": "image/tiff", ".tif": "image/tiff", ".bmp": "image/bmp",
+                    ".gif": "image/gif", ".webp": "image/webp"}
 
-        # Try Tesseract first (local, fast, free)
+        # Convert to PNG if needed (Tesseract/Vision work best with PNG/JPG)
         try:
-            import pytesseract
             from PIL import Image as PILImage
             img = PILImage.open(file_path)
-            ocr_text = pytesseract.image_to_string(img)
-            if len(ocr_text.strip()) > 30:
-                result["text"] = f"[OCR from {filename}]\n{ocr_text.strip()}"
-                result["warnings"].append("Text extracted via Tesseract OCR (local)")
-                # Still send to vision for richer description (charts, diagrams)
-        except ImportError:
-            pass
-        except Exception:
-            pass
 
-        # Always add to images for vision (may be a chart/diagram that needs AI understanding)
-        result["images"] = [{
-            "b64": base64.b64encode(blob).decode(),
-            "mime": mime_map.get(ext, "image/png"),
-            "source": filename,
-        }]
+            # Auto-rotate based on EXIF orientation
+            try:
+                from PIL import ImageOps
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+
+            # Convert to RGB if needed (CMYK, palette, etc.)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+
+            # Tesseract OCR (local, free)
+            try:
+                import pytesseract
+                ocr_text = pytesseract.image_to_string(img)
+                if len(ocr_text.strip()) > 30:
+                    result["text"] = f"[OCR from {filename}]\n{ocr_text.strip()}"
+                    result["warnings"].append("Text extracted via Tesseract OCR")
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
+            # Save as PNG for Vision
+            import io
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            blob = buf.getvalue()
+            result["images"] = [{"b64": base64.b64encode(blob).decode(), "mime": "image/png", "source": filename}]
+            result["metadata"]["width"] = img.width
+            result["metadata"]["height"] = img.height
+            result["metadata"]["format"] = ext
+
+        except Exception:
+            # Fallback: read raw bytes
+            with open(file_path, "rb") as f:
+                blob = f.read()
+            result["images"] = [{"b64": base64.b64encode(blob).decode(), "mime": mime_map.get(ext, "image/png"), "source": filename}]
+
     except Exception as e:
         result["errors"].append(f"Failed to read image: {e}")
     return result
@@ -3567,15 +3597,28 @@ def _handle_pptx(file_path: str, filename: str) -> dict:
         from pptx import Presentation
         prs = Presentation(file_path)
         texts = []
-        for slide in prs.slides:
+        notes = []
+        for si, slide in enumerate(prs.slides):
             for shape in slide.shapes:
                 if shape.has_text_frame:
                     for para in shape.text_frame.paragraphs:
                         t = para.text.strip()
                         if t:
                             texts.append(t)
-        result["text"] = "\n".join(texts)
+            # Extract speaker notes
+            try:
+                if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                    note_text = slide.notes_slide.notes_text_frame.text.strip()
+                    if note_text:
+                        notes.append(f"[Slide {si + 1} notes]: {note_text}")
+            except Exception:
+                pass
+        all_text = "\n".join(texts)
+        if notes:
+            all_text += "\n\n--- SPEAKER NOTES ---\n" + "\n".join(notes)
+        result["text"] = all_text
         result["metadata"]["slides"] = len(prs.slides)
+        result["metadata"]["notes_count"] = len(notes)
     except Exception as e:
         result["errors"].append(f"PPTX text extraction failed: {e}")
 
@@ -3591,7 +3634,25 @@ def _handle_docx(file_path: str, filename: str) -> dict:
     try:
         from docx import Document
         doc = Document(file_path)
-        result["text"] = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        # Main body text
+        body_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        # Headers and footers
+        extras = []
+        try:
+            for section in doc.sections:
+                if section.header and section.header.paragraphs:
+                    h = " ".join(p.text.strip() for p in section.header.paragraphs if p.text.strip())
+                    if h:
+                        extras.append(f"[Header]: {h}")
+                if section.footer and section.footer.paragraphs:
+                    f_text = " ".join(p.text.strip() for p in section.footer.paragraphs if p.text.strip())
+                    if f_text:
+                        extras.append(f"[Footer]: {f_text}")
+        except Exception:
+            pass
+        result["text"] = body_text
+        if extras:
+            result["text"] += "\n\n--- HEADERS/FOOTERS ---\n" + "\n".join(set(extras))  # deduplicate
     except Exception as e:
         result["errors"].append(f"DOCX text extraction failed: {e}")
 
@@ -3602,12 +3663,33 @@ def _handle_docx(file_path: str, filename: str) -> dict:
 
 
 def _handle_csv(file_path: str, filename: str) -> dict:
-    """Handle CSV upload — existing read logic wrapped in standard result."""
+    """Handle CSV upload — auto-detect encoding + delimiter + header."""
     result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
     try:
+        # Auto-detect encoding
+        encoding = "utf-8"
+        try:
+            import chardet
+            with open(file_path, "rb") as f:
+                raw = f.read(100000)  # Read first 100KB for detection
+            detected = chardet.detect(raw)
+            if detected and detected.get("encoding") and detected.get("confidence", 0) > 0.5:
+                encoding = detected["encoding"]
+                if encoding.lower() != "utf-8" and encoding.lower() != "ascii":
+                    result["warnings"].append(f"Encoding detected: {encoding} (confidence: {detected.get('confidence', 0):.0%})")
+        except ImportError:
+            pass
+
         header_row = _find_header_row(file_path, ".csv")
         sep = _detect_delimiter(file_path)
-        df = pd.read_csv(file_path, header=header_row, sep=sep)
+        df = pd.read_csv(file_path, header=header_row, sep=sep, encoding=encoding, encoding_errors="replace")
+
+        # Normalize null values: N/A, NULL, None, -, ? → NaN
+        null_values = {"N/A", "n/a", "#N/A", "NA", "na", "NULL", "null", "None", "none", "NONE", "-", "?", ".", " "}
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].replace(null_values, pd.NA)
+
         df = _clean_dataframe(df)
         tname = _sanitize_table_name(Path(filename).stem)
         result["tables"].append({"name": tname, "df": df, "source": "csv"})
@@ -3657,7 +3739,7 @@ def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_c
         result = _handle_pptx(file_path, filename)
     elif ext == ".docx":
         result = _handle_docx(file_path, filename)
-    elif ext in (".jpg", ".jpeg", ".png"):
+    elif ext in (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".webp"):
         result = _handle_image(file_path, filename)
     elif ext == ".csv":
         result = _handle_csv(file_path, filename)
