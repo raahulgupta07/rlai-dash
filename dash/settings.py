@@ -40,7 +40,7 @@ TRAINING_CONFIGS = {
     "meta_learning":    {"temp": 0.0, "tokens": 300,  "thinking": "none"},
     "vision":           {"temp": 0.1, "tokens": 1000, "thinking": "none"},
     "dashboard":        {"temp": 0.2, "tokens": 3000, "thinking": "minimal"},
-    "excel_analysis":   {"temp": 0.1, "tokens": 3000, "thinking": "medium"},
+    "excel_analysis":   {"temp": 0.1, "tokens": 4000, "thinking": "medium"},
 }
 
 

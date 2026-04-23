@@ -2739,36 +2739,61 @@ def _handle_excel(file_path: str, filename: str) -> dict:
             for ri, row in enumerate(info["rows"][:max_preview_rows]):
                 preview_text += f"  Row {ri}: {row}\n"
 
-        prompt = f"""Analyze this Excel file with {len(sheet_names)} sheets. For each sheet I show the first 25 rows as raw cell values. Empty cells are ''.
+        prompt = f"""Analyze this Excel file with {len(sheet_names)} sheets. For each sheet I show the first rows as raw cell values. Empty cells are ''.
 
 {preview_text}
 
 Return ONLY a valid JSON array. For each sheet return an object with:
 - "sheet": sheet name (exact match)
-- "action": "load" (single table), "split" (multiple tables in one sheet separated by blank rows), or "skip" (empty/irrelevant)
+- "action": "load" | "split" | "skip" | "unpivot"
 - "table_name": clean lowercase PostgreSQL table name (a-z, 0-9, underscore only, max 50 chars)
 - "header_row": 0-indexed row number with column headers
 - "data_start_row": 0-indexed row where data begins
-- "skip_rows": array of 0-indexed row numbers to skip (blank/separator rows between header and data)
-- "forward_fill_columns": array of 0-indexed column positions that use merged cells and need forward-fill (e.g. plant name appears once then blank for related rows)
+- "skip_rows": array of 0-indexed row numbers to skip (blank/separator/unit/summary rows)
+- "forward_fill_columns": array of 0-indexed column positions that need forward-fill (merged cells)
+- "column_names": object mapping column index to clean name e.g. {{"0":"plant","1":"product","3":"jul_21"}}
 - "description": brief description of table content
 
-For "split" action, instead of single header_row/data_start_row, return:
-- "tables": array of objects each with "table_name", "header_row", "data_start_row", "data_end_row" (inclusive, null=end of sheet), "description"
+ACTIONS:
+1. "load" — single table, store as-is
+2. "split" — multiple tables in one sheet separated by blank rows. Return "tables" array.
+3. "skip" — empty or irrelevant sheet
+4. "unpivot" — columns are time periods (months, quarters, dates). MELT them into rows. Return:
+   - "id_columns": array of column indexes that are identifiers (plant, product, category...)
+   - "value_columns": array of column indexes that are time-based values to unpivot
+   - "value_name": what the values represent ("output", "amount", "quantity")
+   - "variable_name": what the columns represent ("month", "quarter", "period")
+   - "extra_columns": object of extra columns to add e.g. {{"fiscal_year":"FY2022","unit":"Sachets"}}
+   - "blocks": if multiple data blocks exist (e.g. IB Plant rows 4-9, Tea Plant row 13), list them:
+     [{{"data_start":4,"data_end":9,"extra":{{"plant":"IB Plant","unit":"Sachets"}}}},
+      {{"data_start":13,"data_end":13,"extra":{{"plant":"Tea Plant","unit":"kg"}}}}]
+     All blocks get merged into ONE table with extra columns distinguishing them.
 
-IMPORTANT:
-- Metadata rows at top (Company, Period, Date, Rate) are NOT headers — find the real column header row
-- Blank rows between data sections signal multiple tables
-- Sub-header rows (units like "Sachets", "kg") should be in skip_rows
-- Empty sheets (all blank or only metadata) should be "skip"
-- Table names should be descriptive: use file context + sheet content
-- Merged cells are shown. If a column has a value in one row then blank in next rows (merged), add that column INDEX (0-based) to forward_fill_columns so values propagate down
-- Write a clear "description" for each table explaining what data it contains"""
+For "split" action, return "tables" array with "table_name", "header_row", "data_start_row", "data_end_row", "description".
+
+DETECT THESE PATTERNS:
+- Columns with month/date names (Jul'21, Aug'21, Q1 2022, 2021-01...) → use "unpivot"
+- Multiple data blocks with same columns but different categories → merge via "blocks"
+- Metadata rows at top (Company, Period, Rate) → NOT headers, skip them
+- Sub-header rows (units: Sachets, kg, %) → skip_rows, capture unit in extra_columns
+- Summary/total rows (Utilisation, Total) → skip_rows
+- Merged cells → forward_fill_columns
+- Empty sheets → "skip"
+- ALWAYS provide column_names mapping with clean descriptive names (not sachets_1, column_2)
+
+IMPORTANT: column_names should use the ACTUAL header text cleaned up. e.g. "Jul'21" → "jul_21", "Annual Capacity" → "annual_capacity", "Products" → "product\""""
 
         raw = training_llm_call(prompt, "excel_analysis")
         if raw:
             ai_plan = json.loads(raw)
-    except Exception:
+            result["metadata"]["ai_analysis"] = "success"
+        else:
+            result["warnings"].append("AI returned empty response — using fallback")
+    except json.JSONDecodeError as e:
+        result["warnings"].append(f"AI returned invalid JSON: {str(e)[:100]}")
+        ai_plan = None
+    except Exception as e:
+        result["warnings"].append(f"AI analysis error: {str(e)[:100]}")
         ai_plan = None
 
     # Step 3: Extract tables per AI plan or fallback
@@ -2784,6 +2809,108 @@ IMPORTANT:
 
             if sname not in sheet_names:
                 result["warnings"].append(f"Sheet '{sname}' not found in file")
+                continue
+
+            if action == "unpivot":
+                # Time-based columns → melt into rows, merge blocks
+                try:
+                    hrow = sheet_plan.get("header_row", 0)
+                    skip = sheet_plan.get("skip_rows", [])
+                    df_raw = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=skip)
+
+                    # Apply AI column names
+                    col_names = sheet_plan.get("column_names", {})
+                    if col_names:
+                        new_cols = []
+                        for i, c in enumerate(df_raw.columns):
+                            new_cols.append(col_names.get(str(i), str(c).lower().replace(" ", "_").replace("'", "_")[:50]))
+                        df_raw.columns = new_cols
+
+                    id_cols_idx = sheet_plan.get("id_columns", [])
+                    val_cols_idx = sheet_plan.get("value_columns", [])
+                    id_cols = [df_raw.columns[i] for i in id_cols_idx if i < len(df_raw.columns)]
+                    val_cols = [df_raw.columns[i] for i in val_cols_idx if i < len(df_raw.columns)]
+                    value_name = sheet_plan.get("value_name", "value")
+                    variable_name = sheet_plan.get("variable_name", "period")
+
+                    blocks = sheet_plan.get("blocks", [])
+                    tname = sheet_plan.get("table_name") or f"{file_slug}_{_sanitize_table_name(sname)}"
+                    tname = _sanitize_table_name(tname)
+
+                    if blocks:
+                        # Multiple blocks (e.g. IB Plant + Tea Plant + Cereal Plant)
+                        all_melted = []
+                        for block in blocks:
+                            bstart = block.get("data_start", 0) - hrow - 1
+                            bend = block.get("data_end", bstart) - hrow - 1
+                            # Adjust for skipped rows
+                            bstart = max(0, bstart - len([s for s in skip if s < block.get("data_start", 0)]))
+                            bend = max(bstart, bend - len([s for s in skip if s < block.get("data_end", 0)]))
+                            if bstart < len(df_raw) and bend < len(df_raw):
+                                df_block = df_raw.iloc[bstart:bend + 1].copy()
+                            elif bstart < len(df_raw):
+                                df_block = df_raw.iloc[bstart:bstart + 1].copy()
+                            else:
+                                continue
+
+                            # Forward-fill within block
+                            for col_idx in sheet_plan.get("forward_fill_columns", []):
+                                if isinstance(col_idx, int) and col_idx < len(df_block.columns):
+                                    df_block.iloc[:, col_idx] = df_block.iloc[:, col_idx].ffill()
+
+                            if val_cols:
+                                melted = df_block.melt(id_vars=id_cols, value_vars=val_cols,
+                                                       var_name=variable_name, value_name=value_name)
+                            else:
+                                melted = df_block
+
+                            # Add block-specific extra columns
+                            for k, v in block.get("extra", {}).items():
+                                melted[k] = v
+                            all_melted.append(melted)
+
+                        if all_melted:
+                            df_final = pd.concat(all_melted, ignore_index=True)
+                        else:
+                            df_final = pd.DataFrame()
+                    else:
+                        # Single block unpivot
+                        for col_idx in sheet_plan.get("forward_fill_columns", []):
+                            if isinstance(col_idx, int) and col_idx < len(df_raw.columns):
+                                df_raw.iloc[:, col_idx] = df_raw.iloc[:, col_idx].ffill()
+
+                        if val_cols:
+                            df_final = df_raw.melt(id_vars=id_cols, value_vars=val_cols,
+                                                    var_name=variable_name, value_name=value_name)
+                        else:
+                            df_final = df_raw
+
+                    # Add sheet-level extra columns
+                    for k, v in sheet_plan.get("extra_columns", {}).items():
+                        df_final[k] = v
+
+                    # Try to parse period/month to date
+                    if variable_name in df_final.columns:
+                        try:
+                            df_final["date"] = pd.to_datetime(df_final[variable_name], format="mixed", dayfirst=False)
+                        except Exception:
+                            pass
+
+                    # Drop NaN values and clean
+                    df_final = df_final.dropna(subset=[value_name], how='all') if value_name in df_final.columns else df_final
+                    df_final = df_final.dropna(how='all')
+
+                    if len(df_final) > 0:
+                        sheet_idx = sheet_names.index(sname) + 1 if sname in sheet_names else 0
+                        # Check if this table should merge with an existing one (same table_name from another sheet)
+                        existing = [t for t in result["tables"] if t["name"] == tname]
+                        if existing:
+                            existing[0]["df"] = pd.concat([existing[0]["df"], df_final], ignore_index=True)
+                            existing[0]["source"] += f" + {sname}"
+                        else:
+                            result["tables"].append({"name": tname, "df": df_final, "source": f"{sname} [unpivot]", "sheet_number": sheet_names.index(sname) + 1, "description": sheet_plan.get("description", "")})
+                except Exception as e:
+                    result["warnings"].append(f"Unpivot from '{sname}' failed: {e}")
                 continue
 
             if action == "split":
@@ -2815,6 +2942,13 @@ IMPORTANT:
                     hrow = sheet_plan.get("header_row", 0)
                     skip = sheet_plan.get("skip_rows", [])
                     df = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=skip)
+                    # Apply AI column names
+                    col_names = sheet_plan.get("column_names", {})
+                    if col_names:
+                        new_cols = []
+                        for i, c in enumerate(df.columns):
+                            new_cols.append(col_names.get(str(i), str(c)))
+                        df.columns = new_cols
                     df = _clean_dataframe(df)
                     if len(df) == 0:
                         result["warnings"].append(f"Sheet '{sname}' produced empty table after cleanup")
@@ -2825,6 +2959,9 @@ IMPORTANT:
                     for col_idx in sheet_plan.get("forward_fill_columns", []):
                         if isinstance(col_idx, int) and col_idx < len(df.columns):
                             df.iloc[:, col_idx] = df.iloc[:, col_idx].ffill()
+                    # Add extra columns if specified
+                    for k, v in sheet_plan.get("extra_columns", {}).items():
+                        df[k] = v
                     sheet_idx = sheet_names.index(sname) + 1 if sname in sheet_names else 0
                     result["tables"].append({"name": tname, "df": df, "source": sname, "sheet_number": sheet_idx, "description": sheet_plan.get("description", "")})
                 except Exception as e:
