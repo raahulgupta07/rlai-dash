@@ -433,7 +433,7 @@ PHASE 4: ENGINEER RELATIONSHIPS
 
 ### Key Features
 
-- **13 File formats:** CSV, Excel (.xlsx/.xls), JSON, SQL, PPTX, DOCX, PDF, JPG, JPEG, PNG, MD, TXT, PY
+- **18 File formats:** CSV, Excel (.xlsx/.xls), JSON, SQL, PPTX, DOCX, PDF, JPG, JPEG, PNG, TIFF, BMP, GIF, WEBP, MD, TXT, PY + auto encoding detection (chardet)
 - **Excel AI multi-sheet** — GPT-5.4-mini analyzes structure, detects headers, unpivots months→rows, splits multi-table sheets, merges related sheets. Fallback: reads all sheets with rule-based header detection
 - **Excel unpivot** — Wide format (months as columns) → long format (months as rows). AI-powered 2-stage: structure analysis + conversion plan. Date parsing via LLM (Jul'21 → 2021-07-01)
 - **Clean/messy master decision** — `_is_clean_sheet()` checks in <1s: clean → direct load (0 AI calls), messy → AI analysis
@@ -447,9 +447,27 @@ PHASE 4: ENGINEER RELATIONSHIPS
 - **Per-file upload progress bar** — numbered list with ✓/●/○/✗ status per file
 - **Source tracking** — SOURCE column in DATASETS tab: file name, sheet/page/slide number, AI description
 - **Image cap: 30** per document, min size 3KB
+- **Diagram auto-detection** — PDF pages with short text labels (< 2000 chars, avg line < 30) rendered as full-page image for Vision to describe flowcharts, process diagrams, org charts
+- **Null normalization** — N/A, NULL, None, -, ?, ., —, – all converted to NaN in `_clean_dataframe()` for ALL file types
+- **CSV encoding detection** — chardet auto-detects Latin-1, Shift-JIS, Windows-1252 etc. Falls back to UTF-8
+- **PPTX speaker notes** — extracted from `slide.notes_slide` and appended to text
+- **DOCX headers/footers** — extracted from `doc.sections`, deduplicated
+- **EXIF auto-rotation** — phone photos auto-rotated via `ImageOps.exif_transpose()`
+- **Image format conversion** — TIFF, BMP, GIF, WEBP converted to PNG via Pillow before OCR/Vision
 - **Universal vision prompt** — one prompt handles all image types (text, charts, diagrams, photos)
-- **Stream upload** — 1MB chunks, never holds full file in memory
+- **Stream upload** — 1MB chunks, max 200MB file size
 - **Models:** GPT-5.4-mini for Excel structure analysis, Gemini Flash Lite for training/vision. Per-task model override in TRAINING_CONFIGS
+
+### SQL Experiments (Training)
+
+During TRAIN ALL, after standard 11 Q&A pairs, runs 25+ SQL experiments against real data:
+- Aggregation: SUM, AVG, MAX, MIN, COUNT per numeric column
+- Grouping: GROUP BY categorical columns, top 5, percentages
+- Time analysis: monthly trends, date ranges (if date column)
+- Correlation: CORR between numeric column pairs
+- Cross-category: multi-dimension GROUP BY
+- All answers verified by executing SQL against PostgreSQL ($0 cost)
+- Appended to existing Q&A (doesn't replace). Toggle: `PANDASAI_EXPERIMENTS=true`
 
 ### Training Verification
 

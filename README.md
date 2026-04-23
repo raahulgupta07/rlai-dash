@@ -20,7 +20,7 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **HTML Slide Deck Download** -- interactive HTML slide decks for offline viewing
 - **Presentations Tab** -- save, version, and recall slide decks within projects
 - **Document Table Extraction** -- tables embedded in PPTX, PDF, and DOCX files are extracted and loaded into PostgreSQL
-- **13 File Format Support** -- CSV, Excel (multi-sheet AI), JSON, SQL, PPTX, DOCX, PDF (scanned OCR), JPG, PNG, MD, TXT, PY
+- **18 File Format Support** -- CSV, Excel (multi-sheet AI), JSON, SQL, PPTX (speaker notes), DOCX (headers/footers), PDF (scanned OCR + diagram detection), JPG, PNG, TIFF, BMP, GIF, WEBP, MD, TXT, PY + auto encoding detection
 - **Proactive Insights** -- collapsible insight cards with anomaly detection after each chat
 - **INSIGHT Tab** -- badge parsing with MODE, ANALYSIS, UP/DOWN/FLAT trends, and RISK indicators
 - **Icon Picker** -- SVG Lucide icons selectable on project cards
@@ -289,9 +289,11 @@ Background processes run after every chat: quality scoring, rule suggestion, pro
 
 ## Supported File Formats
 
-- **CSV, Excel, JSON** -- data tables (Excel: AI multi-sheet with header detection, multi-table split, merged cell forward-fill)
-- **PPTX, DOCX, PDF** -- text + embedded tables + images (vision-described). Scanned PDFs get OCR via vision LLM
-- **JPG, JPEG, PNG** -- images described by vision LLM and indexed as searchable knowledge
+- **CSV, Excel, JSON** -- data tables (Excel: AI multi-sheet, unpivot months, merged cells, auto-merge same-structure. CSV: auto encoding detection via chardet)
+- **PPTX** -- text + tables + images + speaker notes (vision-described)
+- **DOCX** -- text + tables + images + headers/footers (vision-described)
+- **PDF** -- text + tables + images. Scanned pages: Tesseract OCR. Diagrams/flowcharts: auto-detected + Vision describes full flow
+- **JPG, JPEG, PNG, TIFF, BMP, GIF, WEBP** -- Tesseract OCR + Vision description, EXIF auto-rotation, all formats converted to PNG
 - **SQL** -- query patterns
 - **MD, TXT, PY** -- knowledge base
 
