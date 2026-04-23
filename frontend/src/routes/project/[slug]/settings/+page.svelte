@@ -922,11 +922,11 @@
           <thead>
             <tr>
               <th style="text-align: left;">TABLE</th>
+              <th style="text-align: left;">SOURCE</th>
               <th>ROWS</th>
               <th>COLS</th>
               <th>TRAINED</th>
               <th>Q&A</th>
-              <th>RULES</th>
               <th>HEALTH</th>
             </tr>
           </thead>
@@ -938,6 +938,14 @@
               {@const health = isTrained ? (qaCount > 0 ? 100 : 60) : 0}
               <tr>
                 <td style="font-weight: 900;">{t.name}</td>
+                <td style="font-size: 10px; color: var(--color-on-surface-dim); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="{t.source_file || ''}{t.source_detail ? ' → ' + t.source_detail : ''}{t.description ? ' — ' + t.description : ''}">
+                  {#if t.source_file}
+                    <span style="font-weight: 700; color: var(--color-on-surface);">{t.source_file.split('.').pop()?.toUpperCase()}</span>
+                    {#if t.source_detail}<span> {t.source_detail}</span>{/if}
+                  {:else}
+                    <span style="color: var(--color-on-surface-dim);">—</span>
+                  {/if}
+                </td>
                 <td style="text-align: center;">{(t.rows || 0).toLocaleString()}</td>
                 <td style="text-align: center;">{t.columns || '—'}</td>
                 <td style="text-align: center;">
@@ -948,7 +956,6 @@
                   {/if}
                 </td>
                 <td style="text-align: center;">{qaCount}</td>
-                <td style="text-align: center;">{ruleCount}</td>
                 <td style="text-align: center;">
                   <div style="display: inline-block; width: 50px; height: 6px; background: var(--color-surface-dim);">
                     <div style="height: 100%; width: {health}%; background: {health >= 70 ? 'var(--color-primary)' : health >= 40 ? 'var(--color-warning)' : 'var(--color-error)'};"></div>

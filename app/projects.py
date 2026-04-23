@@ -620,6 +620,19 @@ def project_detail(slug: str, request: Request):
     schema = proj["schema_name"]
 
     insp = inspect(_engine)
+    # Load source metadata for tables (saved during upload)
+    from dash.paths import KNOWLEDGE_DIR as _KD
+    _source_meta = {}
+    _source_dir = _KD / slug / "table_sources"
+    if _source_dir.exists():
+        for sf in _source_dir.iterdir():
+            if sf.suffix == ".json":
+                try:
+                    import json as _json
+                    _source_meta[sf.stem] = _json.loads(sf.read_text())
+                except Exception:
+                    pass
+
     # Tables
     tables_list = []
     try:
@@ -628,9 +641,15 @@ def project_detail(slug: str, request: Request):
                 with _engine.connect() as conn:
                     count = conn.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{t}"')).scalar() or 0
                 cols = insp.get_columns(t, schema=schema)
-                tables_list.append({"name": t, "rows": count, "columns": len(cols)})
+                src = _source_meta.get(t, {})
+                tables_list.append({
+                    "name": t, "rows": count, "columns": len(cols),
+                    "source_file": src.get("source_file", ""),
+                    "source_detail": src.get("source_detail", ""),
+                    "description": src.get("description", ""),
+                })
             except Exception:
-                tables_list.append({"name": t, "rows": 0, "columns": 0})
+                tables_list.append({"name": t, "rows": 0, "columns": 0, "source_file": "", "source_detail": "", "description": ""})
     except Exception:
         pass
 

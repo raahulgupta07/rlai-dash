@@ -3382,6 +3382,16 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                         tables_created.append({"table": tbl_name, "rows": len(df), "cols": len(df.columns), "source": tbl_info.get("source", ""), "sheet_number": tbl_info.get("sheet_number", 0), "description": tbl_info.get("description", "")})
                         total_rows += len(df)
 
+                        # Save source metadata for DATASETS tab display
+                        if project:
+                            src_dir = KNOWLEDGE_DIR / project / "table_sources"
+                            src_dir.mkdir(parents=True, exist_ok=True)
+                            _safe_write_json(src_dir / f"{tbl_name}.json", {
+                                "source_file": file.filename,
+                                "source_detail": f"Sheet {tbl_info.get('sheet_number', '?')}: {tbl_info.get('source', '')}",
+                                "description": tbl_info.get("description", ""),
+                            })
+
                         # Generate metadata + queries for each table
                         if project:
                             col_analyses = [_analyze_column(df[col]) for col in df.columns]
@@ -3643,6 +3653,16 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
         with open(tables_dir / f"{tbl}.json", "w") as f:
             json.dump(metadata, f, indent=2, default=str)
 
+        # Save source metadata for DATASETS tab
+        if proj_schema:
+            src_dir = KNOWLEDGE_DIR / (project or proj_schema) / "table_sources"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            _safe_write_json(src_dir / f"{tbl}.json", {
+                "source_file": file.filename if hasattr(file, 'filename') else "",
+                "source_detail": ext.replace(".", "").upper(),
+                "description": metadata.get("description", "") if isinstance(metadata, dict) else "",
+            })
+
         queries_file = queries_dir / f"{tbl}_queries.sql"
         with open(queries_file, "w") as f:
             f.write(f"-- Auto-generated queries for {tbl}\n\n{sample_queries}\n")
@@ -3885,6 +3905,21 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
                 try:
                     df.to_sql(tbl_name, engine, schema=schema, if_exists='replace', index=False)
                     tables_saved += 1
+                    # Save source metadata
+                    src_dir = KNOWLEDGE_DIR / project / "table_sources"
+                    src_dir.mkdir(parents=True, exist_ok=True)
+                    source_detail = tbl_info.get("source", "")
+                    if "slide" in source_detail:
+                        source_detail = f"Slide {source_detail.replace('slide_', '')}"
+                    elif "page" in source_detail:
+                        source_detail = f"Page {source_detail.replace('page_', '').replace('_table_', ' Table ')}"
+                    elif "table" in source_detail:
+                        source_detail = f"Table {source_detail.replace('table_', '')}"
+                    _safe_write_json(src_dir / f"{tbl_name}.json", {
+                        "source_file": file.filename,
+                        "source_detail": source_detail,
+                        "description": "",
+                    })
                 except Exception:
                     pass
         except Exception:
