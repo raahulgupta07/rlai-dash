@@ -3037,6 +3037,73 @@ def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_c
     return result
 
 
+def _post_upload_engineer(project_slug: str, tables_created: list[dict], user_id: int = 1):
+    """After upload, call Engineer agent to inspect tables, create views, discover relationships.
+    Runs in background thread — does not block upload response."""
+    if not project_slug or not tables_created:
+        return
+    try:
+        from dash.agents.engineer import create_engineer
+        from db.session import create_project_knowledge, create_project_learnings
+        from agno.learn import LearnedKnowledgeConfig, LearningMachine, LearningMode
+
+        knowledge = create_project_knowledge(project_slug)
+        learnings = create_project_learnings(project_slug)
+        learning = LearningMachine(
+            knowledge=learnings,
+            learned_knowledge=LearnedKnowledgeConfig(mode=LearningMode.AGENTIC),
+        )
+        engineer = create_engineer(
+            project_slug=project_slug,
+            knowledge=knowledge,
+            learning=learning,
+            dashboard_user_id=user_id,
+        )
+
+        # Build table summary for Engineer
+        table_summary = "\n".join(
+            f"  - {t['table']} ({t['rows']} rows, {t.get('cols', '?')} cols) from {t.get('source', '?')}"
+            for t in tables_created
+        )
+
+        prompt = f"""You just received {len(tables_created)} new tables uploaded to this project.
+
+TABLES CREATED:
+{table_summary}
+
+Your job:
+1. INSPECT all tables — run introspect_schema to see columns and types
+2. DISCOVER RELATIONSHIPS — find tables that can be JOINed (shared columns like date, id, location, plant, asset category)
+3. CREATE USEFUL VIEWS — if related tables exist, create SQL VIEWs that combine them for easier analysis. For example:
+   - If there are multiple location tables (factory, HQ, MDY) with same structure → CREATE VIEW combining all with a location column
+   - If there are summary + detail tables → no view needed, just note the relationship
+4. FIX COLUMN TYPES — if you see dates stored as text, ALTER the column type
+5. REPORT what you did — list views created and relationships found
+
+Use your SQL tools. Be concise. Only create views that add real value for cross-table analysis."""
+
+        # Run Engineer (synchronous in background thread)
+        response = engineer.run(prompt)
+        content = response.content if response else ""
+
+        # Save Engineer's findings to knowledge
+        if content:
+            from agno.knowledge.reader.text_reader import TextReader
+            try:
+                knowledge.insert(
+                    name=f"engineer-upload-analysis",
+                    text_content=f"Engineer Post-Upload Analysis:\n\n{content[:5000]}",
+                    reader=TextReader(),
+                    skip_if_exists=False,
+                )
+            except Exception:
+                pass
+
+    except Exception as e:
+        import logging
+        logging.getLogger("dash").warning(f"Post-upload engineer failed: {e}")
+
+
 def _extract_document_structure(file_path: str, ext: str) -> list[dict]:
     """Extract document structure (titles + content summaries) for workflow conversion.
 
@@ -3337,6 +3404,10 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                     except Exception:
                         pass
 
+                # Trigger Engineer agent in background to inspect tables, create views, discover relationships
+                if project and tables_created:
+                    _bg_executor.submit(_post_upload_engineer, project, tables_created, user_id or 1)
+
                 Path(tmp_path).unlink(missing_ok=True)
                 return {
                     "status": "ok",
@@ -3345,6 +3416,7 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                     "total_rows": total_rows,
                     "tables": tables_created,
                     "warnings": excel_result.get("warnings", []),
+                    "engineer": "running in background — inspecting tables, creating views",
                     "smart": {"file_type": "excel_multi_sheet", "tables_created": len(tables_created)},
                 }
 
@@ -3798,6 +3870,13 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
                     pass
         except Exception:
             pass
+
+    # Trigger Engineer in background if tables were extracted from document
+    if tables_saved > 0 and project:
+        doc_tables_info = [{"table": t.get("name", ""), "rows": len(t.get("df", [])), "cols": len(t.get("df", {}).columns) if hasattr(t.get("df"), "columns") else 0, "source": t.get("source", "")} for t in doc_tables if t.get("df") is not None and len(t.get("df", [])) >= 2]
+        if doc_tables_info:
+            user_id_val = getattr(getattr(getattr(request, 'state', None), 'user', None), 'id', 1)
+            _bg_executor.submit(_post_upload_engineer, project, doc_tables_info, user_id_val)
 
     return {"status": "ok", "filename": file.filename, "type": ext, "size": len(text_content), "indexed": True, "tables_saved": tables_saved}
 
