@@ -4524,6 +4524,163 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
     return {"status": "ok", "filename": file.filename, "type": ext, "size": len(text_content), "indexed": True, "tables_saved": tables_saved}
 
 
+@router.post("/upload-agent")
+async def upload_with_agent(request: Request, file: UploadFile, project: str | None = None):
+    """Upload a file using the Upload Agent Team (Conductor → Parser/Scanner/Vision → Inspector → Engineer).
+
+    This uses AI agents for intelligent processing: structure detection,
+    unpivot, merge, quality validation, and post-upload optimization.
+    Falls back to standard upload if agent fails.
+    """
+    from app.auth import check_project_permission
+    user = getattr(getattr(request, 'state', None), 'user', None)
+    if project and user:
+        perm = check_project_permission(user, project, required_role="editor")
+        if not perm:
+            raise HTTPException(403, "Editor access required to upload")
+
+    if not file.filename:
+        raise HTTPException(400, "No filename provided")
+    if not project:
+        raise HTTPException(400, "Project required for agent upload")
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported: {ext}")
+
+    # Stream to temp file
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        size = 0
+        while chunk := await file.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_FILE_SIZE:
+                raise HTTPException(400, "File too large")
+            tmp.write(chunk)
+        tmp_path = tmp.name
+
+    user_id = _get_user_id(request) or 1
+
+    try:
+        # Create the Upload Agent Team
+        from dash.agents.conductor import create_upload_team
+        uid = 1
+        try:
+            uid = int(user_id) if user_id and str(user_id).isdigit() else 1
+        except Exception:
+            pass
+        upload_team = create_upload_team(project, user_id=uid)
+
+        # Build the prompt for the Conductor
+        file_info = f"File: {file.filename} ({ext}, {size:,} bytes)"
+        if ext in (".xlsx", ".xls"):
+            file_info += "\nThis is an Excel file — use Parser to analyze sheets, detect structure, unpivot if needed."
+        elif ext in (".pdf",):
+            file_info += "\nThis is a PDF — use Scanner to extract text, tables, OCR scanned pages."
+        elif ext in (".pptx",):
+            file_info += "\nThis is a PowerPoint — use Scanner to extract slides, tables, images."
+        elif ext in (".docx",):
+            file_info += "\nThis is a Word document — use Scanner to extract text, tables, images."
+        elif ext in (".jpg", ".jpeg", ".png"):
+            file_info += "\nThis is an image — use Vision to OCR text or describe content."
+        elif ext in (".csv",):
+            file_info += "\nThis is a CSV — use Parser for fast direct load."
+        elif ext in (".json",):
+            file_info += "\nThis is a JSON file — use Parser to load."
+        else:
+            file_info += "\nThis is a text file — use Scanner to index to knowledge base."
+
+        prompt = f"""Process this uploaded file for project '{project}'.
+
+{file_info}
+File saved at: {tmp_path}
+
+STEPS:
+1. Use the right agent to parse/extract this file
+2. After tables are created, use Inspector to validate quality
+3. Use Engineer to create views and discover relationships
+4. Report: tables created, health scores, views, relationships"""
+
+        # Run the Conductor
+        response = upload_team.run(prompt)
+        agent_output = response.content if response else "Agent returned no response"
+
+        # Also run the standard conductor as backup (ensures tables are actually created)
+        if ext in ('.md', '.txt', '.sql', '.py'):
+            with open(tmp_path, 'rb') as f:
+                content = f.read()
+        else:
+            content = b''
+
+        conductor_result = _conduct_upload(tmp_path, ext, project, file.filename, raw_content=content)
+
+        # Store tables from conductor result
+        tables_stored = []
+        if conductor_result.get("tables"):
+            proj_schema = re.sub(r"[^a-z0-9_]", "_", project.lower())[:63]
+            try:
+                from db import get_project_engine
+                from db.session import create_project_schema
+                schema = create_project_schema(project)
+                eng = get_project_engine(project)
+                for tbl_info in conductor_result["tables"]:
+                    df = tbl_info.get("df")
+                    if df is None or len(df) == 0:
+                        continue
+                    tbl_name = _sanitize_table_name(tbl_info.get("name", "table"))
+                    try:
+                        df.to_sql(tbl_name, eng, schema=schema, if_exists='replace', index=False)
+                        tables_stored.append({"table": tbl_name, "rows": len(df), "cols": len(df.columns), "source": tbl_info.get("source", "")})
+                        # Profile + source metadata
+                        try:
+                            _profile_table(df, project, tbl_name)
+                        except Exception:
+                            pass
+                        src_dir = KNOWLEDGE_DIR / project / "table_sources"
+                        src_dir.mkdir(parents=True, exist_ok=True)
+                        _safe_write_json(src_dir / f"{tbl_name}.json", {
+                            "source_file": file.filename,
+                            "source_detail": tbl_info.get("source", ext.upper()),
+                            "description": tbl_info.get("description", ""),
+                        })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Index text to knowledge
+        text_content = conductor_result.get("text", "")
+        if text_content and text_content.strip():
+            try:
+                from agno.knowledge.reader.text_reader import TextReader
+                from db.session import create_project_knowledge
+                knowledge = create_project_knowledge(project)
+                knowledge.insert(name=f"doc-{Path(file.filename).stem}", text_content=f"Document: {file.filename}\n\n{text_content[:10000]}", reader=TextReader(), skip_if_exists=False)
+            except Exception:
+                pass
+
+        # Trigger Engineer in background
+        if tables_stored:
+            _bg_executor.submit(_post_upload_engineer, project, tables_stored, user_id or 1)
+
+        Path(tmp_path).unlink(missing_ok=True)
+
+        return {
+            "status": "ok",
+            "agent": True,
+            "agent_report": agent_output[:2000] if agent_output else "",
+            "tables_created": len(tables_stored),
+            "tables": tables_stored,
+            "text_indexed": len(text_content),
+            "warnings": conductor_result.get("warnings", []),
+            "errors": conductor_result.get("errors", []),
+        }
+
+    except Exception as e:
+        # Fallback to standard upload if agent fails
+        Path(tmp_path).unlink(missing_ok=True)
+        return {"status": "error", "agent": True, "error": str(e)[:500], "fallback": "Use /api/upload or /api/upload-doc instead"}
+
+
 @router.get("/docs")
 def list_docs(request: Request, project: str | None = None):
     """List uploaded documents (project-scoped or global)."""
