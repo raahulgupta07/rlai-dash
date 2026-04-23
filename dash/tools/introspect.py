@@ -7,7 +7,8 @@ Shows both schemas:
 
 from agno.tools import tool
 from agno.utils.log import logger
-from sqlalchemy import Engine, create_engine, inspect, text
+from sqlalchemy import Engine, create_engine as _sa_create_engine, inspect, text
+from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import DatabaseError, OperationalError
 
 from db.session import DASH_SCHEMA
@@ -17,7 +18,7 @@ MAX_SAMPLE_ROWS = 20
 
 def create_introspect_schema_tool(db_url: str, engine: Engine | None = None, user_schema: str | None = None):
     """Create introspect_schema tool with database connection."""
-    _engine = engine or create_engine(db_url)
+    _engine = engine or _sa_create_engine(db_url, poolclass=NullPool)
     # Project mode = only project schema, no public
     SCHEMAS = [user_schema] if user_schema else ["public", DASH_SCHEMA]
 

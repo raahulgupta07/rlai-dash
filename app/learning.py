@@ -11,13 +11,14 @@ import re
 import time
 
 from fastapi import APIRouter, HTTPException, Request
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.pool import NullPool
 
 from db import db_url
 from dash.settings import TRAINING_MODEL
 
 router = APIRouter(prefix="/api/projects", tags=["Learning"])
-_engine = create_engine(db_url)
+_engine = _sa_create_engine(db_url, poolclass=NullPool)
 
 
 def _get_user(request: Request) -> dict:

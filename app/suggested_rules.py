@@ -9,13 +9,14 @@ import json
 import time
 
 from fastapi import APIRouter, HTTPException, Request
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.pool import NullPool
 
 from dash.paths import KNOWLEDGE_DIR
 from db import db_url
 
 router = APIRouter(prefix="/api/projects", tags=["Suggested Rules"])
-_engine = create_engine(db_url)
+_engine = _sa_create_engine(db_url, poolclass=NullPool)
 
 
 def _get_user(request: Request) -> dict:

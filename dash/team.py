@@ -85,10 +85,15 @@ def create_project_team(
 ) -> Team:
     """Create a team scoped to a specific project."""
     cache_key = f"{project_slug}_{user_id}"
+    now = time.time()
     with _cache_lock:
+        # Evict expired entries to prevent memory leak
+        expired = [k for k, (_, ts) in _team_cache.items() if now - ts > _TEAM_CACHE_TTL * 5]
+        for k in expired:
+            del _team_cache[k]
         if cache_key in _team_cache:
             cached_team, cached_at = _team_cache[cache_key]
-            if time.time() - cached_at < _TEAM_CACHE_TTL:
+            if now - cached_at < _TEAM_CACHE_TTL:
                 return cached_team
 
     from db.session import create_project_knowledge, create_project_learnings

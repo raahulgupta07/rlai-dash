@@ -11,7 +11,8 @@ import json
 from os import getenv
 
 import httpx
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.pool import NullPool
 
 from db import db_url
 
@@ -58,7 +59,7 @@ Respond with ONLY valid JSON (no markdown):
         score = max(1, min(5, int(parsed.get("score", 3))))
         reasoning = parsed.get("reasoning", "")
 
-        engine = create_engine(db_url)
+        engine = _sa_create_engine(db_url, poolclass=NullPool)
         with engine.connect() as conn:
             conn.execute(text(
                 "INSERT INTO public.dash_quality_scores (project_slug, session_id, score, reasoning) "

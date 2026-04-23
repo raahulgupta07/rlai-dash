@@ -131,7 +131,8 @@ def _get_shared_engine(url: str):
     global _shared_engine
     if _shared_engine is None:
         from sqlalchemy import create_engine
-        _shared_engine = create_engine(url, pool_size=2, max_overflow=3, pool_recycle=3600)
+        from sqlalchemy.pool import NullPool
+        _shared_engine = create_engine(url, poolclass=NullPool)
     return _shared_engine
 
 

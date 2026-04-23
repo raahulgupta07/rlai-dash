@@ -77,7 +77,8 @@ open http://localhost:8001
 | `SUPER_ADMIN_PASS` | Admin password (created on first boot) | same as username |
 | `DB_USER` | PostgreSQL user | `ai` |
 | `DB_DATABASE` | PostgreSQL database name | `ai` |
-| `WORKERS` | Uvicorn worker count (5-10 users: 2, 10-30: 4, 30-100: 8) | `4` |
+| `WORKERS` | Uvicorn worker count (5-10 users: 2, 10-30: 4, 30-100: 8, 100+: 8-16) | `8` |
+| `RATE_LIMIT` | Rate limit per IP (SlowAPI format) | `500/minute` |
 
 ### Optional
 
@@ -102,18 +103,20 @@ Set both in `.env` before first deploy. Change password from UI after login.
 ## Architecture
 
 ```
-Internet --> Caddy (auto-SSL)
-               |
-            Dash API (FastAPI, N workers)
-               |
-            PgBouncer (transaction pooling)
-               |
-            PostgreSQL 18 + PgVector
+Internet → Caddy (auto-SSL, security headers)
+              ↓
+           Dash API (FastAPI, 8 workers, NullPool)
+              ↓
+           PgBouncer (transaction mode, 200 server conns)
+              ↓
+           PostgreSQL 18 + PgVector (300 max_connections)
 
 Agent Team: Leader → Analyst (SQL) + Engineer (views) + Researcher (docs)
 ```
 
 Each project gets an isolated PostgreSQL schema (`proj_{slug}`), its own PgVector knowledge store, an agent team (Leader, Analyst, Engineer, Researcher), a generated persona, and a self-learning pipeline. 35+ database tables across system, content, learning, and evolution domains.
+
+All DB connections route through PgBouncer. App engines use NullPool (PgBouncer owns pooling). Schema isolation via `SET LOCAL search_path` in SQLAlchemy `begin` events (PgBouncer transaction-safe).
 
 **Agent Team:** Leader (persona + routing + result review) dispatches to:
 - **Analyst** — SQL queries on data tables, 11 analysis types, Prophet forecasting
@@ -196,11 +199,14 @@ Background processes run after every chat: quality scoring, rule suggestion, pro
 
 ## Scaling
 
-| Users | VPS | Workers | RAM |
-|-------|-----|---------|-----|
-| 5-10  | 4GB/2CPU | 2 | $6/mo |
-| 10-30 | 8GB/4CPU | 4 | $12/mo |
-| 30-100 | 16GB/6CPU | 8 | $24/mo |
+| Users | VPS | Workers | PgBouncer Pool | RAM |
+|-------|-----|---------|----------------|-----|
+| 5-10  | 4GB/2CPU | 2 | 30 | $6/mo |
+| 10-30 | 8GB/4CPU | 4 | 50 | $12/mo |
+| 30-100 | 16GB/6CPU | 8 | 80 | $24/mo |
+| 100-200 | 32GB/8CPU | 8-16 | 200 | $48/mo |
+
+**Tested:** 200 concurrent users × 5 endpoints = 1000 simultaneous requests → 100% pass rate, 81 DB connections.
 
 ## Export Options
 
@@ -234,9 +240,22 @@ Common causes: missing `OPENROUTER_API_KEY`, wrong `DB_PASS`, ports 80/443 alrea
 
 ```bash
 docker compose logs dash-db | tail -20
+docker compose logs dash-pgbouncer | tail -20
 ```
 
-Ensure `DB_PASS` matches between app and database. Never set `DB_HOST=localhost` in `.env` -- it must remain `dash-db` (set automatically by compose).
+Ensure `DB_PASS` matches between app and database. Never set `DB_HOST` in `.env` — compose sets it to `dash-pgbouncer` automatically. All traffic must route through PgBouncer.
+
+### "Too many clients" error
+
+This was fixed by routing all connections through PgBouncer with NullPool. If it recurs:
+
+```bash
+# Check connection count
+docker exec dash-db psql -U ai -d ai -c "SELECT count(*), state FROM pg_stat_activity WHERE datname='ai' GROUP BY state;"
+
+# Should show ~80 idle, not 200+. If maxed out:
+docker compose restart dash-pgbouncer dash-api
+```
 
 ### Training fails
 
@@ -256,13 +275,19 @@ Ensure `DB_PASS` matches between app and database. Never set `DB_HOST=localhost`
 - Safe restart: `docker compose down && docker compose up -d --build` (keeps data)
 - **Destructive:** `docker compose down -v` deletes all volumes including the database
 
-## Production Security
+## Production Security & Hardening
 
-- scram-sha-256 password encryption (not md5)
+- scram-sha-256 password encryption (PostgreSQL + PgBouncer)
 - AGNO_DEBUG=False in production
 - Caddy security headers (HSTS, X-Frame-Options, XSS Protection, nosniff)
-- PgBouncer health check
+- PgBouncer health check + client/query timeouts
 - All services have memory limits + health checks
+- NullPool on all SQLAlchemy engines (PgBouncer owns connection pooling)
+- Thread-safe token cache with Lock (no race conditions under concurrent auth)
+- Engine cache with TTL eviction (max 200 engines, prevents memory leaks)
+- Atomic JSON writes (prevents file corruption under concurrent uploads)
+- Configurable rate limiting via `RATE_LIMIT` env var
+- PostgreSQL idle transaction timeout (60s) + statement timeout (120s)
 
 ## Health Check
 

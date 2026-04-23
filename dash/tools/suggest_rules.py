@@ -11,7 +11,8 @@ import json
 from os import getenv
 
 import httpx
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.pool import NullPool
 
 from db import db_url
 
@@ -60,7 +61,7 @@ Respond with ONLY valid JSON (no markdown):
             return
 
         # Insert into suggested_rules table
-        engine = create_engine(db_url)
+        engine = _sa_create_engine(db_url, poolclass=NullPool)
         with engine.connect() as conn:
             for rule in rules[:3]:
                 name = rule.get("name", "")

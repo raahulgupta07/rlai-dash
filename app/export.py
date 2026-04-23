@@ -296,9 +296,10 @@ Return ONLY a valid JSON array of 6-8 slide objects."""
 @router.get("/presentations")
 def list_presentations(request: Request, project: str):
     _get_user(request)
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine as _ce, text
+    from sqlalchemy.pool import NullPool
     from db import db_url
-    engine = create_engine(db_url)
+    engine = _ce(db_url, poolclass=NullPool)
     with engine.connect() as conn:
         rows = conn.execute(text(
             "SELECT id, title, version, thinking, created_at "
@@ -314,9 +315,10 @@ def list_presentations(request: Request, project: str):
 @router.get("/presentations/{pres_id}")
 def get_presentation(pres_id: int, request: Request):
     _get_user(request)
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine as _ce, text
+    from sqlalchemy.pool import NullPool
     from db import db_url
-    engine = create_engine(db_url)
+    engine = _ce(db_url, poolclass=NullPool)
     with engine.connect() as conn:
         row = conn.execute(text(
             "SELECT id, project_slug, title, version, thinking, slides, created_at "
@@ -339,9 +341,10 @@ async def save_presentation(request: Request):
     messages = body.get("source_messages", [])
 
     import json
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine as _ce, text
+    from sqlalchemy.pool import NullPool
     from db import db_url
-    engine = create_engine(db_url)
+    engine = _ce(db_url, poolclass=NullPool)
     with engine.connect() as conn:
         # Check if same title exists — increment version
         existing = conn.execute(text(
@@ -361,9 +364,10 @@ async def save_presentation(request: Request):
 @router.delete("/presentations/{pres_id}")
 def delete_presentation(pres_id: int, request: Request):
     _get_user(request)
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine as _ce, text
+    from sqlalchemy.pool import NullPool
     from db import db_url
-    engine = create_engine(db_url)
+    engine = _ce(db_url, poolclass=NullPool)
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM public.dash_presentations WHERE id = :id"), {"id": pres_id})
         conn.commit()
@@ -373,9 +377,10 @@ def delete_presentation(pres_id: int, request: Request):
 @router.post("/presentations/{pres_id}/pptx")
 def export_saved_pptx(pres_id: int, request: Request):
     _get_user(request)
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine as _ce, text
+    from sqlalchemy.pool import NullPool
     from db import db_url
-    engine = create_engine(db_url)
+    engine = _ce(db_url, poolclass=NullPool)
     with engine.connect() as conn:
         row = conn.execute(text(
             "SELECT title, slides FROM public.dash_presentations WHERE id = :id"

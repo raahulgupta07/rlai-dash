@@ -3,7 +3,16 @@ services:
     image: pgvector/pgvector:pg18-trixie
     container_name: dash-db
     restart: always
-    command: postgres -c max_connections=200 -c shared_buffers=1GB -c work_mem=16MB -c effective_cache_size=3GB -c maintenance_work_mem=256MB -c password_encryption=scram-sha-256
+    command: >
+      postgres
+        -c max_connections=300
+        -c shared_buffers=1GB
+        -c work_mem=32MB
+        -c effective_cache_size=3GB
+        -c maintenance_work_mem=256MB
+        -c password_encryption=scram-sha-256
+        -c idle_in_transaction_session_timeout=60000
+        -c statement_timeout=120000
     environment:
       POSTGRES_USER: ${DB_USER:-ai}
       POSTGRES_PASSWORD: ${DB_PASS:-ai}
@@ -33,13 +42,17 @@ services:
       retries: 3
     environment:
       DATABASE_URL: postgres://${DB_USER:-ai}:${DB_PASS:-ai}@dash-db:5432/${DB_DATABASE:-ai}
+      AUTH_TYPE: scram-sha-256
       POOL_MODE: transaction
-      MAX_CLIENT_CONN: 2000
-      DEFAULT_POOL_SIZE: 50
-      MIN_POOL_SIZE: 10
-      RESERVE_POOL_SIZE: 10
-      MAX_DB_CONNECTIONS: 150
+      MAX_CLIENT_CONN: 3000
+      DEFAULT_POOL_SIZE: 80
+      MIN_POOL_SIZE: 20
+      RESERVE_POOL_SIZE: 20
+      MAX_DB_CONNECTIONS: 200
       SERVER_RESET_QUERY: DISCARD ALL
+      SERVER_IDLE_TIMEOUT: 300
+      CLIENT_IDLE_TIMEOUT: 600
+      QUERY_WAIT_TIMEOUT: 30
       IGNORE_STARTUP_PARAMETERS: extra_float_digits,options
     depends_on:
       dash-db:
@@ -49,7 +62,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 512M
 
   dash-api:
     build:
@@ -57,7 +70,7 @@ services:
       dockerfile: Dockerfile
     image: ${IMAGE_NAME:-dash}:${IMAGE_TAG:-latest}
     container_name: dash-api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-4}
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-8}
     restart: always
     ports:
       - "8001:8000"
@@ -68,11 +81,13 @@ services:
       - AGNO_DEBUG=False
       - AGENTOS_URL=http://127.0.0.1:8000
       # Database — goes through PgBouncer
-      - DB_HOST=dash-db
+      - DB_HOST=dash-pgbouncer
       - DB_PORT=5432
       - DB_USER=${DB_USER:-ai}
       - DB_PASS=${DB_PASS:-ai}
       - DB_DATABASE=${DB_DATABASE:-ai}
+      # Scaling
+      - RATE_LIMIT=${RATE_LIMIT:-500/minute}
       # Required
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - SUPER_ADMIN=${SUPER_ADMIN:-admin}
@@ -97,6 +112,8 @@ services:
       start_period: 30s
     depends_on:
       dash-db:
+        condition: service_healthy
+      dash-pgbouncer:
         condition: service_healthy
     networks:
       - dash

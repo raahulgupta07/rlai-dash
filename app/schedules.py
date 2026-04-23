@@ -8,12 +8,13 @@ CRUD for scheduled recurring queries per project.
 import json
 
 from fastapi import APIRouter, HTTPException, Request
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.pool import NullPool
 
 from db import db_url
 
 router = APIRouter(prefix="/api/projects", tags=["Schedules"])
-_engine = create_engine(db_url)
+_engine = _sa_create_engine(db_url, poolclass=NullPool)
 
 CRON_PRESETS = {
     "daily": "0 8 * * *",

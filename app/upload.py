@@ -11,8 +11,10 @@ Usage:
 """
 
 import json
+import os
 import re
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -21,14 +23,47 @@ _bg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="dash-bg")
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Request, UploadFile
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine as _sa_create_engine, inspect, text
+from sqlalchemy.pool import NullPool
+
+
+def create_engine(url, **kw):
+    """Wrapper that forces NullPool for ad-hoc engines (PgBouncer handles pooling)."""
+    kw.setdefault("poolclass", NullPool)
+    return _sa_create_engine(url, **kw)
 
 from dash.paths import BUSINESS_DIR, KNOWLEDGE_DIR, QUERIES_DIR, TABLES_DIR
 from db import db_url
 from dash.settings import TRAINING_MODEL
 
+
+def _safe_write_json(path: Path, data) -> None:
+    """Atomic JSON write — prevents corruption from concurrent writes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".json")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp_path, str(path))  # Atomic rename
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _safe_read_json(path: Path, default=None):
+    """Safe JSON read — handles concurrent writes and corruption."""
+    try:
+        if path.exists():
+            return json.loads(path.read_text(errors="ignore"))
+    except (json.JSONDecodeError, OSError):
+        pass
+    return default if default is not None else {}
+
 router = APIRouter(prefix="/api", tags=["Upload"])
-_engine = create_engine(db_url, pool_size=10, max_overflow=20, pool_recycle=3600)
+_engine = create_engine(db_url)
 
 # Tables that ship with the demo — protected from deletion
 PROTECTED_TABLES = {"customers", "subscriptions", "plan_changes", "invoices", "usage_metrics", "support_tickets", "dash_users", "dash_tokens", "dash_projects", "shared_results"}

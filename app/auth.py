@@ -19,21 +19,23 @@ except ImportError:
     _HAS_BCRYPT = False
 import os
 import secrets
-from os import getenv
-import secrets
+import threading
 import time
+from os import getenv
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.pool import NullPool
 
 from db import db_url
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-_engine = create_engine(db_url)
+_engine = _sa_create_engine(db_url, poolclass=NullPool)
 _token_cache: dict[str, dict] = {}
+_token_cache_lock = threading.Lock()
 _TOKEN_CACHE_MAX = 5000  # Cap to prevent unbounded growth
 
 TOKEN_EXPIRY = 86400 * 7  # 7 days
@@ -599,13 +601,14 @@ def init_auth():
 
 def validate_token(token: str) -> Optional[dict]:
     """Validate a token. Returns {user_id, username} or None."""
-    # Check cache
-    if token in _token_cache:
-        info = _token_cache[token]
-        if info["expiry"] > time.time():
-            return info
-        else:
-            del _token_cache[token]
+    # Check cache (thread-safe read)
+    with _token_cache_lock:
+        if token in _token_cache:
+            info = _token_cache[token]
+            if info["expiry"] > time.time():
+                return info
+            else:
+                del _token_cache[token]
 
     # Check DB
     try:
@@ -615,17 +618,18 @@ def validate_token(token: str) -> Optional[dict]:
             ), {"t": token}).fetchone()
             if row and row[2] > time.time():
                 info = {"user_id": row[0], "username": row[1], "expiry": row[2], "is_super": row[1] == SUPER_ADMIN}
-                # Enforce size limit BEFORE inserting
-                now = time.time()
-                expired = [k for k, v in _token_cache.items() if v.get("expiry", 0) < now]
-                for k in expired:
-                    del _token_cache[k]
-                if len(_token_cache) >= _TOKEN_CACHE_MAX:
-                    # Evict oldest half
-                    oldest = sorted(_token_cache, key=lambda k: _token_cache[k].get("expiry", 0))[: len(_token_cache) // 2]
-                    for k in oldest:
+                with _token_cache_lock:
+                    # Enforce size limit BEFORE inserting
+                    now = time.time()
+                    expired = [k for k, v in _token_cache.items() if v.get("expiry", 0) < now]
+                    for k in expired:
                         del _token_cache[k]
-                _token_cache[token] = info
+                    if len(_token_cache) >= _TOKEN_CACHE_MAX:
+                        # Evict oldest half
+                        oldest = sorted(_token_cache, key=lambda k: _token_cache[k].get("expiry", 0))[: len(_token_cache) // 2]
+                        for k in oldest:
+                            del _token_cache[k]
+                    _token_cache[token] = info
                 return info
             # Clean expired
             if row:

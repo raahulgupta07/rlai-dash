@@ -6,12 +6,13 @@ Retrieve quality scores and stats for a project.
 """
 
 from fastapi import APIRouter, HTTPException, Request
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine as _sa_create_engine, text
+from sqlalchemy.pool import NullPool
 
 from db import db_url
 
 router = APIRouter(prefix="/api/projects", tags=["Scores"])
-_engine = create_engine(db_url)
+_engine = _sa_create_engine(db_url, poolclass=NullPool)
 
 
 def _get_user(request: Request) -> dict:

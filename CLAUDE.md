@@ -7,8 +7,25 @@ Dash is a **production-ready, multi-tenant, self-learning data notebook** — li
 **Architecture**: Each project = isolated PostgreSQL schema + own knowledge vectors + own agent team + own persona + self-learning pipeline. 35+ DB tables. All data persisted in PostgreSQL.
 
 ```
-App (4 workers) → PgBouncer (transaction pooling) → PostgreSQL
+App (8 workers) → PgBouncer (transaction pooling, NullPool) → PostgreSQL 18
 ```
+
+## Connection Architecture (Production-Hardened)
+
+All database connections route through PgBouncer in transaction mode. Application engines use `NullPool` (SQLAlchemy) — PgBouncer owns pooling. Session variables (`search_path`, `read_only`) are set via `SET LOCAL` in SQLAlchemy `begin` events, which is PgBouncer transaction-safe.
+
+**Key design decisions:**
+- `DB_HOST=dash-pgbouncer` (never direct to `dash-db`)
+- All `create_engine()` calls use `poolclass=NullPool` — prevents double-pooling
+- `IGNORE_STARTUP_PARAMETERS: extra_float_digits,options` in PgBouncer — `options` param is silently dropped, so search_path is set via `SET LOCAL` inside transactions
+- `AUTH_TYPE: scram-sha-256` in PgBouncer — matches PostgreSQL's `password_encryption=scram-sha-256`
+- `SERVER_RESET_QUERY: DISCARD ALL` — cleans server connections between assignments
+- Bootstrap engines (schema creation) use `NullPool` and are `.dispose()`d immediately
+- Per-project engines cached with TTL eviction (1hr, max 200) to prevent memory leaks
+- Token cache is thread-safe with `threading.Lock()`
+- Team cache has TTL eviction (expired entries cleaned on access)
+
+**Scaling tested:** 200 concurrent users × 5 endpoints = 1000 simultaneous requests, 100% pass rate, 81 DB connections stable.
 
 ## Structure
 
@@ -476,14 +493,23 @@ docker compose up -d --build
 - Error details hidden from clients
 - Team cache thread-safe (Lock)
 - Prompt injection sanitization
-- PgBouncer connection pooling (transaction mode, 100+ users)
-- NullPool for per-project engines (prevents connection leaks)
+- PgBouncer connection pooling (transaction mode, 200+ users)
+- NullPool on ALL engines (13 files patched) — prevents connection hoarding
+- PgBouncer-safe search_path via SET LOCAL in begin events (not connection options)
+- PgBouncer AUTH_TYPE=scram-sha-256 (matches PostgreSQL)
+- Thread-safe token cache with threading.Lock (prevents race conditions under concurrent auth)
+- Engine cache with TTL eviction (max 200 engines, 1hr TTL, auto-dispose)
+- Team cache with expired entry cleanup (prevents memory leak)
+- Atomic JSON writes via tempfile + os.replace (prevents file corruption under concurrent uploads)
+- Safe JSON reads with corruption handling
+- Rate limiter configurable via RATE_LIMIT env var (default 500/min)
 - Streaming file upload (1MB chunks, no full file in memory)
 - scram-sha-256 authentication (was md5)
 - AGNO_DEBUG=False in production
 - Caddy security headers (HSTS, X-Frame-Options, XSS protection, nosniff)
-- PgBouncer health check
+- PgBouncer health check with CLIENT_IDLE_TIMEOUT and QUERY_WAIT_TIMEOUT
 - Caddy 512M memory limit
+- PostgreSQL idle_in_transaction_session_timeout=60s and statement_timeout=120s
 
 ## Build & Deploy Troubleshooting
 

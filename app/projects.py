@@ -14,14 +14,15 @@ from typing import Any
 _bg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="dash-bg")
 
 from fastapi import APIRouter, HTTPException, Request
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine as _sa_create_engine, inspect, text
+from sqlalchemy.pool import NullPool
 
 from db import db_url
 from db.session import create_project_schema
 
 router = APIRouter(prefix="/api/projects", tags=["Projects"])
 
-_engine = create_engine(db_url)
+_engine = _sa_create_engine(db_url, poolclass=NullPool)
 
 
 def _get_user(request: Request) -> dict:

@@ -7,9 +7,16 @@ PostgreSQL database connection for AgentOS.
 Two schemas:
 - ``public``: Company data (loaded externally). Read-only for agents.
 - ``dash``: Agent-managed data (views, summary tables). Owned by Engineer.
+
+All engines route through PgBouncer (transaction mode).  PgBouncer ignores
+the ``options`` startup parameter and runs DISCARD ALL between server
+assignments, so we set ``search_path`` and ``default_transaction_read_only``
+via ``SET LOCAL`` after each BEGIN using SQLAlchemy's ``after_begin`` event.
 """
 
 import re
+import threading
+import time as _time
 
 from agno.db.postgres import PostgresDb
 from agno.knowledge import Knowledge
@@ -17,6 +24,7 @@ from agno.knowledge.embedder.openai import OpenAIEmbedder
 from os import getenv as _getenv
 from agno.vectordb.pgvector import PgVector, SearchType
 from sqlalchemy import Engine, create_engine, event, text
+from sqlalchemy.pool import NullPool
 
 from db.url import db_url
 
@@ -30,12 +38,29 @@ DASH_SCHEMA = "dash"
 _dash_engine: Engine | None = None
 _readonly_engine: Engine | None = None
 
+
+# ---------------------------------------------------------------------------
+# Helpers — set session variables via SET LOCAL (PgBouncer transaction-safe)
+# ---------------------------------------------------------------------------
+
+def _make_search_path_listener(search_path: str):
+    """Return a 'begin' event listener that sets search_path via SET LOCAL."""
+    def set_search_path(conn):
+        conn.execute(text(f"SET LOCAL search_path TO {search_path}"))
+    return set_search_path
+
+
+def _make_readonly_listener():
+    """Return a 'begin' event listener that sets read-only + timeout."""
+    def set_readonly(conn):
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        conn.execute(text("SET LOCAL statement_timeout = 30000"))
+    return set_readonly
+
+
 # ---------------------------------------------------------------------------
 # Public-schema write guard (Engineer connection)
 # ---------------------------------------------------------------------------
-# Matches DDL/DML that explicitly targets the public schema.
-# Allows reads (SELECT FROM public.*) but blocks writes (CREATE TABLE public.x,
-# DROP VIEW public.y, INSERT INTO public.z, etc.).
 _PUBLIC_WRITE_RE = re.compile(
     r"""(?ix)
     # DDL targeting public schema
@@ -77,19 +102,19 @@ def get_sql_engine() -> Engine:
     global _dash_engine
     if _dash_engine is not None:
         return _dash_engine
-    bootstrap = create_engine(db_url)
+    bootstrap = create_engine(db_url, poolclass=NullPool)
     with bootstrap.connect() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {DASH_SCHEMA}"))
         conn.commit()
     bootstrap.dispose()
     _dash_engine = create_engine(
         db_url,
-        connect_args={"options": f"-c search_path={DASH_SCHEMA},public"},
-        pool_size=5,
-        max_overflow=10,
+        pool_size=2,
+        max_overflow=3,
         pool_recycle=1800,
         pool_pre_ping=True,
     )
+    event.listen(_dash_engine, "begin", _make_search_path_listener(f"{DASH_SCHEMA},public"))
     event.listen(_dash_engine, "before_cursor_execute", _guard_public_schema)
     return _dash_engine
 
@@ -105,24 +130,17 @@ def get_readonly_engine() -> Engine:
         return _readonly_engine
     _readonly_engine = create_engine(
         db_url,
-        connect_args={"options": "-c default_transaction_read_only=on -c statement_timeout=30000"},
-        pool_size=5,
-        max_overflow=10,
+        pool_size=2,
+        max_overflow=3,
         pool_recycle=1800,
         pool_pre_ping=True,
     )
+    event.listen(_readonly_engine, "begin", _make_readonly_listener())
     return _readonly_engine
 
 
 def get_postgres_db(contents_table: str | None = None) -> PostgresDb:
-    """Create a PostgresDb instance.
-
-    Args:
-        contents_table: Optional table name for storing knowledge contents.
-
-    Returns:
-        Configured PostgresDb instance.
-    """
+    """Create a PostgresDb instance."""
     if contents_table is not None:
         return PostgresDb(id=DB_ID, db_url=db_url, knowledge_table=contents_table)
     return PostgresDb(id=DB_ID, db_url=db_url)
@@ -133,6 +151,25 @@ def get_postgres_db(contents_table: str | None = None) -> PostgresDb:
 # ---------------------------------------------------------------------------
 _user_engines: dict[str, Engine] = {}
 _user_ro_engines: dict[str, Engine] = {}
+_engine_timestamps: dict[str, float] = {}
+_engine_lock = threading.Lock()
+_ENGINE_CACHE_MAX = 200
+_ENGINE_CACHE_TTL = 3600  # 1 hour
+
+
+def _evict_stale_engines():
+    """Remove expired engines to prevent memory leak. Call under _engine_lock."""
+    now = _time.time()
+    expired = [k for k, ts in _engine_timestamps.items() if now - ts > _ENGINE_CACHE_TTL]
+    for k in expired:
+        for cache in (_user_engines, _user_ro_engines, _project_engines, _project_ro_engines):
+            eng = cache.pop(k, None)
+            if eng:
+                try:
+                    eng.dispose()
+                except Exception:
+                    pass
+        _engine_timestamps.pop(k, None)
 
 
 def _sanitize_user_id(user_id: str) -> str:
@@ -144,7 +181,7 @@ def _sanitize_user_id(user_id: str) -> str:
 def create_user_schema(user_id: str) -> str:
     """Create a per-user PostgreSQL schema. Returns the schema name."""
     schema = _sanitize_user_id(user_id)
-    bootstrap = create_engine(db_url)
+    bootstrap = create_engine(db_url, poolclass=NullPool)
     with bootstrap.connect() as conn:
         conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
         conn.commit()
@@ -153,26 +190,27 @@ def create_user_schema(user_id: str) -> str:
 
 
 def get_user_engine(user_id: str) -> Engine:
-    """SQLAlchemy engine scoped to user's schema (cached).
-
-    search_path = user_{id}, public — user data first, shared data second.
-    Public schema write guard applied.
-    """
+    """SQLAlchemy engine scoped to user's schema (cached)."""
     schema = _sanitize_user_id(user_id)
-    if schema in _user_engines:
-        return _user_engines[schema]
+    with _engine_lock:
+        _evict_stale_engines()
+        if schema in _user_engines:
+            _engine_timestamps[schema] = _time.time()
+            return _user_engines[schema]
 
     create_user_schema(user_id)
     eng = create_engine(
         db_url,
-        connect_args={"options": f'-c search_path="{schema}",public'},
-        pool_size=5,
-        max_overflow=10,
+        pool_size=2,
+        max_overflow=3,
         pool_recycle=3600,
         pool_pre_ping=True,
     )
+    event.listen(eng, "begin", _make_search_path_listener(f'"{schema}",public'))
     event.listen(eng, "before_cursor_execute", _guard_public_schema)
-    _user_engines[schema] = eng
+    with _engine_lock:
+        _user_engines[schema] = eng
+        _engine_timestamps[schema] = _time.time()
     return eng
 
 
@@ -185,12 +223,13 @@ def get_user_readonly_engine(user_id: str) -> Engine:
     create_user_schema(user_id)
     eng = create_engine(
         db_url,
-        connect_args={"options": f'-c search_path="{schema}",public -c default_transaction_read_only=on -c statement_timeout=30000'},
-        pool_size=5,
-        max_overflow=10,
+        pool_size=2,
+        max_overflow=3,
         pool_recycle=3600,
         pool_pre_ping=True,
     )
+    event.listen(eng, "begin", _make_search_path_listener(f'"{schema}",public'))
+    event.listen(eng, "begin", _make_readonly_listener())
     _user_ro_engines[schema] = eng
     return eng
 
@@ -217,7 +256,7 @@ _project_ro_engines: dict[str, Engine] = {}
 def create_project_schema(slug: str) -> str:
     """Create a project PostgreSQL schema. Returns the schema name."""
     safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
-    bootstrap = create_engine(db_url)
+    bootstrap = create_engine(db_url, poolclass=NullPool)
     with bootstrap.connect() as conn:
         conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{safe}"'))
         conn.commit()
@@ -227,32 +266,31 @@ def create_project_schema(slug: str) -> str:
 
 def get_project_engine(slug: str) -> Engine:
     """Engine scoped to project schema (cached, NullPool — PgBouncer handles pooling)."""
-    from sqlalchemy.pool import NullPool
     safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
     if safe in _project_engines:
         return _project_engines[safe]
     create_project_schema(slug)
     eng = create_engine(
         db_url,
-        connect_args={"options": f'-c search_path="{safe}"'},
         poolclass=NullPool,
     )
+    event.listen(eng, "begin", _make_search_path_listener(f'"{safe}"'))
     _project_engines[safe] = eng
     return eng
 
 
 def get_project_readonly_engine(slug: str) -> Engine:
     """Read-only engine scoped to project schema ONLY (cached, NullPool)."""
-    from sqlalchemy.pool import NullPool
     safe = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
     if safe in _project_ro_engines:
         return _project_ro_engines[safe]
     create_project_schema(slug)
     eng = create_engine(
         db_url,
-        connect_args={"options": f'-c search_path="{safe}" -c default_transaction_read_only=on -c statement_timeout=30000'},
         poolclass=NullPool,
     )
+    event.listen(eng, "begin", _make_search_path_listener(f'"{safe}"'))
+    event.listen(eng, "begin", _make_readonly_listener())
     _project_ro_engines[safe] = eng
     return eng
 
@@ -270,15 +308,7 @@ def create_project_learnings(slug: str) -> Knowledge:
 
 
 def create_knowledge(name: str, table_name: str) -> Knowledge:
-    """Create a Knowledge instance with PgVector hybrid search.
-
-    Args:
-        name: Display name for the knowledge base.
-        table_name: PostgreSQL table name for vector storage.
-
-    Returns:
-        Configured Knowledge instance.
-    """
+    """Create a Knowledge instance with PgVector hybrid search."""
     return Knowledge(
         name=name,
         vector_db=PgVector(

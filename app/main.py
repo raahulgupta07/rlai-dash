@@ -8,6 +8,7 @@ Run:
     python -m app.main
 """
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from os import getenv
@@ -25,7 +26,7 @@ try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
     from slowapi.util import get_remote_address
     from slowapi.errors import RateLimitExceeded
-    _limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+    _limiter = Limiter(key_func=get_remote_address, default_limits=[getenv("RATE_LIMIT", "200/minute")])
     _HAS_LIMITER = True
 except ImportError:
     _HAS_LIMITER = False
@@ -36,9 +37,10 @@ from dash.agents.researcher import researcher
 from dash.settings import SLACK_SIGNING_SECRET, SLACK_TOKEN, TRAINING_MODEL, dash_knowledge, dash_learnings
 from dash.team import dash
 from db import get_postgres_db, db_url
-from sqlalchemy import create_engine, text as sa_text
+from sqlalchemy import create_engine as _sa_create_engine, text as sa_text
+from sqlalchemy.pool import NullPool
 
-_shared_engine = create_engine(db_url, pool_size=5, max_overflow=10, pool_recycle=3600)
+_shared_engine = _sa_create_engine(db_url, poolclass=NullPool)
 
 # ---------------------------------------------------------------------------
 # Environment
