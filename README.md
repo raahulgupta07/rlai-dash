@@ -19,7 +19,7 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **HTML Slide Deck Download** -- interactive HTML slide decks for offline viewing
 - **Presentations Tab** -- save, version, and recall slide decks within projects
 - **Document Table Extraction** -- tables embedded in PPTX, PDF, and DOCX files are extracted and loaded into PostgreSQL
-- **10 File Format Support** -- CSV, Excel, JSON, SQL, PPTX, DOCX, PDF, MD, TXT, PY
+- **13 File Format Support** -- CSV, Excel (multi-sheet AI), JSON, SQL, PPTX, DOCX, PDF (scanned OCR), JPG, PNG, MD, TXT, PY
 - **Proactive Insights** -- collapsible insight cards with anomaly detection after each chat
 - **INSIGHT Tab** -- badge parsing with MODE, ANALYSIS, UP/DOWN/FLAT trends, and RISK indicators
 - **Icon Picker** -- SVG Lucide icons selectable on project cards
@@ -219,12 +219,13 @@ Background processes run after every chat: quality scoring, rule suggestion, pro
 
 ## Supported File Formats
 
-- **CSV, Excel, JSON** -- data tables
-- **PPTX, DOCX, PDF** -- text + embedded tables + images (vision-described) extracted
+- **CSV, Excel, JSON** -- data tables (Excel: AI multi-sheet with header detection, multi-table split, merged cell forward-fill)
+- **PPTX, DOCX, PDF** -- text + embedded tables + images (vision-described). Scanned PDFs get OCR via vision LLM
+- **JPG, JPEG, PNG** -- images described by vision LLM and indexed as searchable knowledge
 - **SQL** -- query patterns
 - **MD, TXT, PY** -- knowledge base
 
-All file formats receive full brain training — no data tables required.
+All file formats receive full brain training — no data tables required. Upload Intelligence Agent (`_conduct_upload`) routes each file to specialized handler.
 
 ## Troubleshooting
 

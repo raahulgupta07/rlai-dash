@@ -25,6 +25,7 @@
   let uploadResult = $state<any>(null);
   let uploadResults = $state<any[]>([]);
   let uploadError = $state('');
+  let uploadFileProgress = $state<{index: number, total: number, name: string, status: string}[]>([]);
   let fileInputEl: HTMLInputElement;
 
   // Doc upload
@@ -634,7 +635,7 @@
     // Detect file type from extension
     const ext = f.name.split('.').pop()?.toLowerCase() || '';
     if (ext === 'sql') uploadFileType = 'sql_patterns';
-    else if (['md', 'txt', 'docx', 'pptx', 'pdf'].includes(ext)) uploadFileType = 'document';
+    else if (['md', 'txt', 'docx', 'pptx', 'pdf', 'jpg', 'jpeg', 'png'].includes(ext)) uploadFileType = 'document';
     else uploadFileType = 'data';
     uploadMatch = null;
     uploadAction = 'auto';
@@ -649,7 +650,7 @@
     uploadResult = null; uploadResults = []; uploadError = ''; uploadSteps = [];
     const ext = arr[0].name.split('.').pop()?.toLowerCase() || '';
     if (ext === 'sql') uploadFileType = 'sql_patterns';
-    else if (['md', 'txt', 'docx', 'pptx', 'pdf'].includes(ext)) uploadFileType = 'document';
+    else if (['md', 'txt', 'docx', 'pptx', 'pdf', 'jpg', 'jpeg', 'png'].includes(ext)) uploadFileType = 'document';
     else uploadFileType = 'data';
     uploadMatch = null;
     uploadAction = 'auto';
@@ -659,23 +660,27 @@
     const filesToUpload = selectedFiles.length > 0 ? selectedFiles : (selectedFile ? [selectedFile] : []);
     if (filesToUpload.length === 0 || uploading) return;
     uploading = true; uploadError = ''; uploadResult = null; uploadResults = [];
-    uploadSteps = ['Detecting', 'Parsing', 'Loading', 'Analyzing', 'Saving', 'Training'].map(l => ({ label: l, status: 'pending' }));
-    uploadSteps = uploadSteps.map((s, i) => i === 0 ? { ...s, status: 'done' } : s);
+    uploadSteps = [];
+
+    // Build per-file progress list
+    uploadFileProgress = filesToUpload.map((f, i) => ({
+      index: i, total: filesToUpload.length, name: f.name, status: 'pending'
+    }));
 
     for (let fi = 0; fi < filesToUpload.length; fi++) {
       const currentFile = filesToUpload[fi];
+      uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'uploading' } : p);
+
       const fd = new FormData();
       fd.append('file', currentFile);
-      // Only use custom table name for single file
       if (filesToUpload.length === 1 && tableName) fd.append('table_name', tableName);
       if (uploadAction !== 'auto') fd.append('action', uploadAction);
 
-      if (filesToUpload.length > 1) cLog(`${ts()} │  uploading ${fi + 1}/${filesToUpload.length}: ${currentFile.name}`);
+      cLog(`${ts()} │  uploading ${fi + 1}/${filesToUpload.length}: ${currentFile.name}`);
 
       try {
-        // Route doc files to upload-doc endpoint, data files to upload endpoint
         const ext = currentFile.name.split('.').pop()?.toLowerCase() || '';
-        const isDoc = ['pptx', 'docx', 'pdf', 'md', 'txt', 'sql', 'py'].includes(ext);
+        const isDoc = ['pptx', 'docx', 'pdf', 'md', 'txt', 'sql', 'py', 'jpg', 'jpeg', 'png'].includes(ext);
         const uploadUrl = isDoc
           ? `/api/upload-doc?project=${slug}`
           : `/api/upload?project=${slug}&action=${uploadAction}`;
@@ -685,50 +690,49 @@
           if (res.status === 409 && e.detail?.match && filesToUpload.length === 1) {
             uploadMatch = e.detail.match;
             uploadError = `Table "${e.detail.match?.table}" already exists (${e.detail.match?.overlap_pct}% match). Choose an action below.`;
-            uploadSteps = uploadSteps.map((s: any) => s.status === 'pending' ? { ...s, status: 'error' } : s);
+            uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'error' } : p);
             uploading = false;
             return;
           }
           const errMsg = typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail);
           cLog(`${ts()} │  ✗ ${currentFile.name}: ${errMsg}`);
+          uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'error' } : p);
           continue;
         }
         const result = await res.json();
-        uploadResults = [...uploadResults, { file: currentFile.name, ...result }];
+        const detail = result?.multi_sheet ? `${result.tables_created} tables, ${result.total_rows} rows` :
+                       result?.rows ? `${result.rows} rows` :
+                       result?.size ? `${result.size} chars indexed` :
+                       result?.tables_saved ? `${result.tables_saved} tables` : 'ok';
+        uploadResults = [...uploadResults, { file: currentFile.name, detail, ...result }];
         uploadResult = result;
+        uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'done' } : p);
 
-        // Log smart info to CLI
+        // Log to CLI
         const smart = result?.smart;
         if (smart) {
-          cLog(`${ts()} │  file type: ${smart.file_type || result.file_type}`);
+          if (smart.file_type) cLog(`${ts()} │  type: ${smart.file_type}`);
+          if (smart.tables_created) cLog(`${ts()} │  ✓ ${smart.tables_created} tables created (multi-sheet)`);
           if (smart.rows_appended) cLog(`${ts()} │  ✓ ${smart.rows_appended} rows appended`);
           if (smart.rows_upserted) cLog(`${ts()} │  ✓ ${smart.rows_upserted} rows updated`);
           if (smart.annotations) cLog(`${ts()} │  ✓ ${smart.annotations} annotations saved`);
           if (smart.rules) cLog(`${ts()} │  ✓ ${smart.rules} rules extracted`);
           if (smart.patterns_saved) cLog(`${ts()} │  ✓ ${smart.patterns_saved} SQL patterns saved`);
-          if (smart.facts) cLog(`${ts()} │  ✓ ${smart.facts} facts extracted`);
         } else {
-          cLog(`${ts()} │  ✓ ${currentFile.name} uploaded`);
+          cLog(`${ts()} │  ✓ ${currentFile.name} → ${detail}`);
         }
-        if (result?.tables_extracted) cLog(`${ts()} │  ✓ ${result.tables_extracted} tables extracted from document`);
       } catch (e: any) {
         cLog(`${ts()} │  ✗ ${currentFile.name}: ${e.message}`);
+        uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'error' } : p);
       }
     }
 
-    // Update steps
-    for (let i = 1; i < uploadSteps.length; i++) {
-      uploadSteps = uploadSteps.map((s: any, idx: number) => idx === i ? { ...s, status: 'done' } : s);
-      await new Promise(r => setTimeout(r, 150));
-    }
-
     await loadDetail(); await loadKnowledgeFiles(); await loadRules(); await loadBrainData(); await loadDocs();
-    if (uploadResults.length === 0 && !uploadResult) {
+    const doneCount = uploadFileProgress.filter(p => p.status === 'done').length;
+    if (doneCount === 0) {
       uploadError = 'All files failed to upload';
-      uploadSteps = uploadSteps.map((s: any) => s.status === 'pending' ? { ...s, status: 'error' } : s);
     } else {
-      // Auto-hide upload panel after success (with delay so user sees result)
-      setTimeout(() => { showUpload = false; selectedFile = null; selectedFiles = []; }, 3000);
+      setTimeout(() => { showUpload = false; selectedFile = null; selectedFiles = []; uploadFileProgress = []; }, 5000);
     }
     uploading = false;
   }
@@ -1077,7 +1081,7 @@
     <div class="flex items-center justify-between mb-4">
       <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Datasets</div>
       <div>
-        <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
+        <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf,.jpg,.jpeg,.png" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
         {#if canEdit}<button class="send-btn" onclick={() => fileInputEl?.click()} style="padding: 6px 14px; font-size: 10px; cursor: pointer;">↑ UPLOAD DATA</button>{/if}
       </div>
     </div>
@@ -1123,28 +1127,59 @@
           {/if}
         {/if}
 
-        {#if uploadSteps.length > 0}
+        {#if uploadFileProgress.length > 0}
           <div style="margin-top: 10px; padding: 10px; background: var(--color-surface-dim); border-left: 3px solid var(--color-primary);">
-            {#each uploadSteps as step}<div style="font-size: 11px; padding: 1px 0;">{#if step.status === 'done'}<span style="color: var(--color-primary);">✓</span>{:else if step.status === 'error'}<span style="color: var(--color-error);">✗</span>{:else}<span style="color: var(--color-on-surface-dim);">○</span>{/if} {step.label}</div>{/each}
-            {#if uploadResult}
-              <div style="margin-top: 6px; font-size: 11px; color: var(--color-primary); font-weight: 900;">
-                {#if uploadResult.file_type === 'column_definition'}
-                  ✓ Column definitions — {uploadResult.smart?.annotations} annotations, {uploadResult.smart?.memories} memories
-                {:else if uploadResult.file_type === 'business_rules'}
-                  ✓ Rules extracted — {uploadResult.smart?.rules} rules, {uploadResult.smart?.facts} facts
-                {:else if uploadResult.file_type === 'sql_patterns'}
-                  ✓ SQL patterns — {uploadResult.smart?.patterns_saved} saved
-                {:else}
-                  ✓ {uploadResult.table_name} — {uploadResult.rows} rows
-                  {#if uploadResult.smart?.rows_appended > 0} ({uploadResult.smart.rows_appended} appended){/if}
-                  {#if uploadResult.smart?.rows_upserted > 0} ({uploadResult.smart.rows_upserted} updated){/if}
-                {/if}
-              </div>
-              {#if uploadResult?.tables_extracted}
-                <div style="font-size: 11px; color: var(--color-primary);">
-                  ✓ {uploadResult.tables_extracted} tables extracted from document
+            <!-- Progress bar -->
+            {#if uploadFileProgress.length > 1}
+              {@const done = uploadFileProgress.filter(p => p.status === 'done').length}
+              {@const errors = uploadFileProgress.filter(p => p.status === 'error').length}
+              {@const pct = Math.round(((done + errors) / uploadFileProgress.length) * 100)}
+              <div style="margin-bottom: 8px;">
+                <div style="display: flex; justify-content: space-between; font-size: 10px; font-weight: 900; margin-bottom: 3px;">
+                  <span>{done + errors}/{uploadFileProgress.length} files processed</span>
+                  <span>{pct}%</span>
                 </div>
-              {/if}
+                <div style="height: 6px; background: var(--color-surface); border-radius: 3px; overflow: hidden;">
+                  <div style="height: 100%; width: {pct}%; background: var(--color-primary); transition: width 0.3s;"></div>
+                </div>
+              </div>
+            {/if}
+            <!-- Per-file list -->
+            <div style="max-height: 200px; overflow-y: auto;">
+              {#each uploadFileProgress as fp}
+                <div style="font-size: 11px; padding: 2px 0; display: flex; align-items: center; gap: 6px;">
+                  {#if fp.status === 'done'}
+                    <span style="color: var(--color-primary); flex-shrink: 0;">✓</span>
+                  {:else if fp.status === 'uploading'}
+                    <span style="color: var(--color-warning); flex-shrink: 0; animation: pulse 1s infinite;">●</span>
+                  {:else if fp.status === 'error'}
+                    <span style="color: var(--color-error); flex-shrink: 0;">✗</span>
+                  {:else}
+                    <span style="color: var(--color-on-surface-dim); flex-shrink: 0;">○</span>
+                  {/if}
+                  <span style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; {fp.status === 'uploading' ? 'font-weight: 700;' : ''}">{fp.name}</span>
+                  {#if fp.status === 'done'}
+                    {@const r = uploadResults.find(r => r.file === fp.name)}
+                    {#if r?.detail}
+                      <span style="font-size: 9px; color: var(--color-primary); flex-shrink: 0;">{r.detail}</span>
+                    {/if}
+                  {:else if fp.status === 'uploading'}
+                    <span style="font-size: 9px; color: var(--color-warning); flex-shrink: 0;">processing...</span>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+            <!-- Summary when done -->
+            {#if !uploading && uploadResults.length > 0}
+              {@const totalTables = uploadResults.reduce((s, r) => s + (r.tables_created || (r.table_name ? 1 : 0) || r.tables_saved || 0), 0)}
+              {@const totalRows = uploadResults.reduce((s, r) => s + (r.total_rows || r.rows || 0), 0)}
+              {@const totalIndexed = uploadResults.filter(r => r.indexed).length}
+              <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--color-surface); font-size: 11px; font-weight: 900; color: var(--color-primary);">
+                ✓ {uploadResults.length} files uploaded
+                {#if totalTables > 0} · {totalTables} tables{/if}
+                {#if totalRows > 0} · {totalRows} rows{/if}
+                {#if totalIndexed > 0} · {totalIndexed} docs indexed{/if}
+              </div>
             {/if}
             {#if uploadError}<div style="margin-top: 6px; font-size: 11px; color: var(--color-error);">{uploadError}</div>{/if}
           </div>

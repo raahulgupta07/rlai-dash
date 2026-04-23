@@ -12,6 +12,7 @@ ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends curl nodejs npm \
     libjpeg-dev libpng-dev zlib1g-dev libfreetype6-dev \
     libffi-dev libssl-dev libxml2-dev libxslt-dev \
+    tesseract-ocr \
     && curl -sSfL "https://github.com/jwilder/dockerize/releases/download/${DOCKERIZE_VERSION}/dockerize-linux-${TARGETARCH}-${DOCKERIZE_VERSION}.tar.gz" \
        | tar -xz -C /usr/local/bin \
     && rm -rf /var/lib/apt/lists/*

@@ -69,7 +69,20 @@ _engine = create_engine(db_url)
 PROTECTED_TABLES = {"customers", "subscriptions", "plan_changes", "invoices", "usage_metrics", "support_tickets", "dash_users", "dash_tokens", "dash_projects", "shared_results"}
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
-ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".json", ".sql", ".py", ".txt", ".md", ".pptx", ".docx", ".pdf"}
+ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".json", ".sql", ".py", ".txt", ".md", ".pptx", ".docx", ".pdf", ".jpg", ".jpeg", ".png"}
+
+# Universal vision prompt — handles charts, scanned docs, photos, diagrams in one call
+_UNIVERSAL_VISION_PROMPT = (
+    "Analyze this image from a business document.\n"
+    "If it contains TEXT (scanned document, certificate, letter): extract ALL text exactly as written. "
+    "Preserve layout. Render any tables as markdown tables.\n"
+    "If it contains a CHART or GRAPH: extract ALL data points, axis labels, legend items as a markdown table. "
+    "Describe the trend: increasing/decreasing/flat and by how much.\n"
+    "If it contains a DIAGRAM or FLOWCHART: describe all components, connections, and flow.\n"
+    "If it contains a PHOTO: describe what is visible and any text, signage, or labels.\n"
+    "If it contains a TABLE rendered as image: extract ALL rows and columns as a markdown table.\n"
+    "Be precise with all numbers, dates, and labels. Miss nothing."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2407,19 +2420,19 @@ def _extract_images_pptx(file_path: str) -> list[dict]:
         import base64
         prs = Presentation(file_path)
         for si, slide in enumerate(prs.slides):
-            if len(images) >= 10:
+            if len(images) >= 30:
                 break
             for shape in slide.shapes:
                 if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                     blob = shape.image.blob
-                    if len(blob) < 5000:
+                    if len(blob) < 3000:
                         continue
                     images.append({
                         "b64": base64.b64encode(blob).decode(),
                         "mime": shape.image.content_type or "image/png",
                         "source": f"slide_{si + 1}",
                     })
-                    if len(images) >= 10:
+                    if len(images) >= 30:
                         break
     except Exception:
         pass
@@ -2459,7 +2472,7 @@ def _extract_images_pdf(file_path: str) -> list[dict]:
         import base64
         doc = fitz.open(file_path)
         for pi, page in enumerate(doc):
-            if len(images) >= 10:
+            if len(images) >= 30:
                 break
             for img_info in page.get_images(full=True):
                 xref = img_info[0]
@@ -2467,7 +2480,7 @@ def _extract_images_pdf(file_path: str) -> list[dict]:
                 if not extracted:
                     continue
                 raw = extracted["image"]
-                if len(raw) < 5000:
+                if len(raw) < 3000:
                     continue
                 ext = extracted.get("ext", "png")
                 images.append({
@@ -2475,9 +2488,41 @@ def _extract_images_pdf(file_path: str) -> list[dict]:
                     "mime": f"image/{ext}",
                     "source": f"page_{pi + 1}",
                 })
-                if len(images) >= 10:
+                if len(images) >= 30:
                     break
         doc.close()
+    except Exception:
+        pass
+    return images
+
+
+def _extract_images_docx(file_path: str) -> list[dict]:
+    """Extract images from DOCX document relationships. Returns [{"b64": str, "mime": str, "source": str}]."""
+    images: list[dict] = []
+    try:
+        from docx import Document
+        import base64
+        doc = Document(file_path)
+        mime_map = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "gif": "image/gif", "bmp": "image/bmp", "tiff": "image/tiff",
+                    "emf": "image/emf", "wmf": "image/wmf"}
+        for rel in doc.part.rels.values():
+            if "image" in rel.reltype:
+                try:
+                    blob = rel.target_part.blob
+                    if len(blob) < 3000:
+                        continue
+                    ref = getattr(rel, 'target_ref', '') or ''
+                    ext = ref.rsplit(".", 1)[-1].lower() if "." in ref else "png"
+                    images.append({
+                        "b64": base64.b64encode(blob).decode(),
+                        "mime": mime_map.get(ext, "image/png"),
+                        "source": f"docx_image_{len(images) + 1}",
+                    })
+                    if len(images) >= 30:
+                        break
+                except Exception:
+                    continue
     except Exception:
         pass
     return images
@@ -2567,20 +2612,429 @@ def _describe_images_with_vision(images: list[dict], filename: str) -> str:
         return ""
     from dash.settings import training_vision_call
     descriptions = []
-    for img in images[:10]:
+    for img in images[:30]:
         result = training_vision_call(
-            prompt=(
-                "Describe this image from a business document in detail. "
-                "If it's a chart or graph, extract ALL data points, labels, numbers, axes, and trends. "
-                "If it's a diagram, describe the structure and relationships. "
-                "If it's a table rendered as image, extract all the data. "
-                "Be precise with all numbers and labels."
-            ),
+            prompt=_UNIVERSAL_VISION_PROMPT,
             images=[img],
         )
         if result:
             descriptions.append(f"[Image from {img['source']} in {filename}]: {result}")
     return "\n\n".join(descriptions)
+
+
+# ---------------------------------------------------------------------------
+# Upload Intelligence: Handlers + Conductor
+# Each handler returns: {"tables": [...], "text": str, "images": [...],
+#                        "metadata": dict, "errors": [...], "warnings": [...]}
+# ---------------------------------------------------------------------------
+
+def _handle_image(file_path: str, filename: str) -> dict:
+    """Handle JPG/PNG image upload — Tesseract OCR first, vision fallback for charts/diagrams."""
+    import base64
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        with open(file_path, "rb") as f:
+            blob = f.read()
+        ext = Path(file_path).suffix.lower()
+        mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+
+        # Try Tesseract first (local, fast, free)
+        try:
+            import pytesseract
+            from PIL import Image as PILImage
+            img = PILImage.open(file_path)
+            ocr_text = pytesseract.image_to_string(img)
+            if len(ocr_text.strip()) > 30:
+                result["text"] = f"[OCR from {filename}]\n{ocr_text.strip()}"
+                result["warnings"].append("Text extracted via Tesseract OCR (local)")
+                # Still send to vision for richer description (charts, diagrams)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # Always add to images for vision (may be a chart/diagram that needs AI understanding)
+        result["images"] = [{
+            "b64": base64.b64encode(blob).decode(),
+            "mime": mime_map.get(ext, "image/png"),
+            "source": filename,
+        }]
+    except Exception as e:
+        result["errors"].append(f"Failed to read image: {e}")
+    return result
+
+
+def _handle_excel(file_path: str, filename: str) -> dict:
+    """Handle Excel upload — AI multi-sheet analysis with fallback."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    ext = Path(file_path).suffix.lower()
+
+    # Step 1: Enumerate all sheets and read previews
+    sheet_previews = {}
+    sheet_names = []
+    try:
+        if ext == ".xlsx":
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            sheet_names = wb.sheetnames
+            for sname in sheet_names:
+                ws = wb[sname]
+                rows = []
+                for ri, row in enumerate(ws.iter_rows(max_row=25, values_only=True)):
+                    if ri >= 25:
+                        break
+                    rows.append([str(v)[:60] if v is not None else "" for v in row[:15]])
+                sheet_previews[sname] = {"rows": rows, "max_row": ws.max_row, "max_col": ws.max_column}
+            wb.close()
+        elif ext == ".xls":
+            import xlrd
+            wb = xlrd.open_workbook(file_path)
+            sheet_names = wb.sheet_names()
+            for sname in sheet_names:
+                ws = wb.sheet_by_name(sname)
+                rows = []
+                for ri in range(min(25, ws.nrows)):
+                    rows.append([str(ws.cell_value(ri, ci))[:60] for ci in range(min(15, ws.ncols))])
+                sheet_previews[sname] = {"rows": rows, "max_row": ws.nrows, "max_col": ws.ncols}
+    except Exception as e:
+        result["errors"].append(f"Failed to scan sheets: {e}")
+        # Fallback: try basic read
+        try:
+            df = pd.read_excel(file_path, header=_find_header_row(file_path, ext))
+            df = _clean_dataframe(df)
+            tname = _sanitize_table_name(Path(filename).stem)
+            result["tables"].append({"name": tname, "df": df, "source": "sheet_1"})
+        except Exception as e2:
+            result["errors"].append(f"Fallback read failed: {e2}")
+        return result
+
+    if not sheet_names:
+        result["warnings"].append("No sheets found in Excel file")
+        return result
+
+    # Step 2: AI analysis — send previews, get extraction plan
+    ai_plan = None
+    try:
+        from dash.settings import training_llm_call
+        preview_text = ""
+        # Limit preview rows per sheet based on sheet count to stay within LLM context
+        max_preview_rows = 25 if len(sheet_names) <= 5 else (15 if len(sheet_names) <= 10 else 10)
+        for sname in sheet_names:
+            info = sheet_previews[sname]
+            preview_text += f"\n\nSheet: '{sname}' ({info['max_row']} rows × {info['max_col']} cols)\n"
+            for ri, row in enumerate(info["rows"][:max_preview_rows]):
+                preview_text += f"  Row {ri}: {row}\n"
+
+        prompt = f"""Analyze this Excel file with {len(sheet_names)} sheets. For each sheet I show the first 25 rows as raw cell values. Empty cells are ''.
+
+{preview_text}
+
+Return ONLY a valid JSON array. For each sheet return an object with:
+- "sheet": sheet name (exact match)
+- "action": "load" (single table), "split" (multiple tables in one sheet separated by blank rows), or "skip" (empty/irrelevant)
+- "table_name": clean lowercase PostgreSQL table name (a-z, 0-9, underscore only, max 50 chars)
+- "header_row": 0-indexed row number with column headers
+- "data_start_row": 0-indexed row where data begins
+- "skip_rows": array of 0-indexed row numbers to skip (blank/separator rows between header and data)
+- "forward_fill_columns": array of 0-indexed column positions that use merged cells and need forward-fill (e.g. plant name appears once then blank for related rows)
+- "description": brief description of table content
+
+For "split" action, instead of single header_row/data_start_row, return:
+- "tables": array of objects each with "table_name", "header_row", "data_start_row", "data_end_row" (inclusive, null=end of sheet), "description"
+
+IMPORTANT:
+- Metadata rows at top (Company, Period, Date, Rate) are NOT headers — find the real column header row
+- Blank rows between data sections signal multiple tables
+- Sub-header rows (units like "Sachets", "kg") should be in skip_rows
+- Empty sheets (all blank or only metadata) should be "skip"
+- Table names should be descriptive: use file context + sheet content"""
+
+        raw = training_llm_call(prompt, "excel_analysis")
+        if raw:
+            ai_plan = json.loads(raw)
+    except Exception:
+        ai_plan = None
+
+    # Step 3: Extract tables per AI plan or fallback
+    if ai_plan and isinstance(ai_plan, list):
+        file_slug = _sanitize_table_name(Path(filename).stem)
+        for sheet_plan in ai_plan:
+            sname = sheet_plan.get("sheet", "")
+            action = sheet_plan.get("action", "skip")
+
+            if action == "skip":
+                result["warnings"].append(f"Skipped sheet '{sname}': {sheet_plan.get('reason', 'empty')}")
+                continue
+
+            if sname not in sheet_names:
+                result["warnings"].append(f"Sheet '{sname}' not found in file")
+                continue
+
+            if action == "split":
+                # Multiple tables in one sheet
+                for sub in sheet_plan.get("tables", []):
+                    try:
+                        hrow = sub.get("header_row", 0)
+                        dstart = sub.get("data_start_row", hrow + 1)
+                        dend = sub.get("data_end_row")
+                        nrows = (dend - dstart + 1) if dend is not None else None
+                        skip = [r for r in range(0, hrow)] + sub.get("skip_rows", [])
+                        df = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=skip, nrows=nrows)
+                        df = _clean_dataframe(df)
+                        if len(df) == 0:
+                            continue
+                        tname = sub.get("table_name") or f"{file_slug}_{_sanitize_table_name(sname)}"
+                        tname = _sanitize_table_name(tname)
+                        # Forward-fill
+                        for col_idx in sub.get("forward_fill_columns", []):
+                            if isinstance(col_idx, int) and col_idx < len(df.columns):
+                                df.iloc[:, col_idx] = df.iloc[:, col_idx].ffill()
+                        result["tables"].append({"name": tname, "df": df, "source": f"{sname} [split]"})
+                    except Exception as e:
+                        result["warnings"].append(f"Split table from '{sname}' failed: {e}")
+            else:
+                # Single table from sheet
+                try:
+                    hrow = sheet_plan.get("header_row", 0)
+                    skip = sheet_plan.get("skip_rows", [])
+                    df = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=skip)
+                    df = _clean_dataframe(df)
+                    if len(df) == 0:
+                        result["warnings"].append(f"Sheet '{sname}' produced empty table after cleanup")
+                        continue
+                    tname = sheet_plan.get("table_name") or f"{file_slug}_{_sanitize_table_name(sname)}"
+                    tname = _sanitize_table_name(tname)
+                    # Forward-fill
+                    for col_idx in sheet_plan.get("forward_fill_columns", []):
+                        if isinstance(col_idx, int) and col_idx < len(df.columns):
+                            df.iloc[:, col_idx] = df.iloc[:, col_idx].ffill()
+                    result["tables"].append({"name": tname, "df": df, "source": sname})
+                except Exception as e:
+                    result["warnings"].append(f"Sheet '{sname}' extraction failed: {e}")
+
+        # Collect metadata text from AI descriptions
+        descriptions = [sp.get("description", "") for sp in ai_plan if sp.get("description")]
+        if descriptions:
+            result["text"] = f"Excel file: {filename}\n" + "\n".join(f"- {d}" for d in descriptions)
+
+    else:
+        # FALLBACK: No AI — read all sheets with basic header detection
+        result["warnings"].append("AI analysis unavailable, using fallback for all sheets")
+        file_slug = _sanitize_table_name(Path(filename).stem)
+        try:
+            all_sheets = pd.read_excel(file_path, sheet_name=None, header=None)
+            for sname, raw_df in all_sheets.items():
+                if raw_df.dropna(how='all').empty:
+                    result["warnings"].append(f"Skipped empty sheet '{sname}'")
+                    continue
+                # Find header row for this sheet
+                best_row = 0
+                best_score = 0
+                for i in range(min(10, len(raw_df))):
+                    row = raw_df.iloc[i]
+                    non_null = row.dropna()
+                    score = sum(3 for v in non_null if isinstance(v, str) and 1 < len(str(v).strip()) < 50)
+                    if score > best_score:
+                        best_score = score
+                        best_row = i
+                df = pd.read_excel(file_path, sheet_name=sname, header=best_row)
+                df = _clean_dataframe(df)
+                if len(df) == 0:
+                    continue
+                tname = f"{file_slug}_{_sanitize_table_name(str(sname))}"
+                result["tables"].append({"name": tname, "df": df, "source": str(sname)})
+        except Exception as e:
+            result["errors"].append(f"Fallback read all sheets failed: {e}")
+
+    return result
+
+
+def _handle_pdf(file_path: str, filename: str) -> dict:
+    """Handle PDF upload — text extraction + scanned page OCR via vision + tables + images."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        import fitz
+        import base64
+        doc = fitz.open(file_path)
+        if len(doc) == 0:
+            result["errors"].append("PDF has 0 pages — file may be corrupt or encrypted")
+            return result
+
+        texts = []
+        scanned_count = 0
+        tesseract_ok = False
+        try:
+            import pytesseract
+            from PIL import Image as PILImage
+            tesseract_ok = True
+        except ImportError:
+            pass
+
+        for pi, page in enumerate(doc):
+            page_text = page.get_text()
+            if len(page_text.strip()) < 50:
+                # Scanned page — try Tesseract first (local, fast, free)
+                scanned_count += 1
+                try:
+                    pixmap = page.get_pixmap(dpi=150)
+                    if tesseract_ok:
+                        img = PILImage.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+                        ocr_text = pytesseract.image_to_string(img)
+                        if len(ocr_text.strip()) > 30:
+                            texts.append(f"[Page {pi + 1} — OCR]\n{ocr_text.strip()}")
+                            continue  # Got text via Tesseract, skip vision
+                    # Tesseract failed or got no text → send to vision LLM as fallback
+                    if len(result["images"]) < 10:
+                        png_bytes = pixmap.tobytes("png")
+                        if len(png_bytes) < 5_000_000:
+                            result["images"].append({
+                                "b64": base64.b64encode(png_bytes).decode(),
+                                "mime": "image/png",
+                                "source": f"page_{pi + 1}_scanned",
+                            })
+                except Exception:
+                    pass
+            else:
+                texts.append(page_text)
+        doc.close()
+        result["text"] = "\n".join(texts)
+
+        if scanned_count > 0:
+            result["metadata"]["scanned_pages"] = scanned_count
+            vision_pages = len([i for i in result["images"] if "scanned" in i.get("source", "")])
+            if tesseract_ok:
+                result["warnings"].append(f"{scanned_count} scanned page(s) — Tesseract OCR (local), {vision_pages} sent to vision")
+            else:
+                result["warnings"].append(f"{scanned_count} scanned page(s) — sent to vision for OCR")
+
+        # Extract tables (existing)
+        tables = _extract_tables_pdf(file_path)
+        result["tables"] = [{"name": f"{_sanitize_table_name(Path(filename).stem)}_{t['source']}", "df": t["df"], "source": t["source"]} for t in tables]
+
+        # Extract embedded images (charts, diagrams)
+        embedded_images = _extract_images_pdf(file_path)
+        result["images"].extend(embedded_images)
+
+    except Exception as e:
+        result["errors"].append(f"PDF processing failed: {e}")
+    return result
+
+
+def _handle_pptx(file_path: str, filename: str) -> dict:
+    """Handle PPTX upload — text + tables + images (existing logic, raised caps)."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        from pptx import Presentation
+        prs = Presentation(file_path)
+        texts = []
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        t = para.text.strip()
+                        if t:
+                            texts.append(t)
+        result["text"] = "\n".join(texts)
+        result["metadata"]["slides"] = len(prs.slides)
+    except Exception as e:
+        result["errors"].append(f"PPTX text extraction failed: {e}")
+
+    tables = _extract_tables_pptx(file_path)
+    result["tables"] = [{"name": f"{_sanitize_table_name(Path(filename).stem)}_{t['source']}", "df": t["df"], "source": t["source"]} for t in tables]
+    result["images"] = _extract_images_pptx(file_path)
+    return result
+
+
+def _handle_docx(file_path: str, filename: str) -> dict:
+    """Handle DOCX upload — text + tables + image extraction (new)."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        from docx import Document
+        doc = Document(file_path)
+        result["text"] = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    except Exception as e:
+        result["errors"].append(f"DOCX text extraction failed: {e}")
+
+    tables = _extract_tables_docx(file_path)
+    result["tables"] = [{"name": f"{_sanitize_table_name(Path(filename).stem)}_{t['source']}", "df": t["df"], "source": t["source"]} for t in tables]
+    result["images"] = _extract_images_docx(file_path)
+    return result
+
+
+def _handle_csv(file_path: str, filename: str) -> dict:
+    """Handle CSV upload — existing read logic wrapped in standard result."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        header_row = _find_header_row(file_path, ".csv")
+        sep = _detect_delimiter(file_path)
+        df = pd.read_csv(file_path, header=header_row, sep=sep)
+        df = _clean_dataframe(df)
+        tname = _sanitize_table_name(Path(filename).stem)
+        result["tables"].append({"name": tname, "df": df, "source": "csv"})
+    except Exception as e:
+        result["errors"].append(f"CSV read failed: {e}")
+    return result
+
+
+def _handle_json(file_path: str, filename: str) -> dict:
+    """Handle JSON upload — existing read logic wrapped in standard result."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        try:
+            df = pd.read_json(file_path)
+        except ValueError:
+            df = pd.read_json(file_path, orient='records')
+        df = _clean_dataframe(df)
+        tname = _sanitize_table_name(Path(filename).stem)
+        result["tables"].append({"name": tname, "df": df, "source": "json"})
+    except Exception as e:
+        result["errors"].append(f"JSON read failed: {e}")
+    return result
+
+
+def _handle_text(file_path: str, filename: str, raw_content: bytes = b"") -> dict:
+    """Handle text file upload — TXT, MD, SQL, PY."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        if raw_content:
+            result["text"] = raw_content.decode("utf-8", errors="ignore")
+        else:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                result["text"] = f.read()
+    except Exception as e:
+        result["errors"].append(f"Text read failed: {e}")
+    return result
+
+
+def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_content: bytes = b"") -> dict:
+    """Upload Conductor — routes to handler, runs vision on images, returns unified result."""
+    # Route to handler
+    if ext in (".xlsx", ".xls"):
+        result = _handle_excel(file_path, filename)
+    elif ext == ".pdf":
+        result = _handle_pdf(file_path, filename)
+    elif ext == ".pptx":
+        result = _handle_pptx(file_path, filename)
+    elif ext == ".docx":
+        result = _handle_docx(file_path, filename)
+    elif ext in (".jpg", ".jpeg", ".png"):
+        result = _handle_image(file_path, filename)
+    elif ext == ".csv":
+        result = _handle_csv(file_path, filename)
+    elif ext == ".json":
+        result = _handle_json(file_path, filename)
+    elif ext in (".txt", ".md", ".sql", ".py"):
+        result = _handle_text(file_path, filename, raw_content)
+    else:
+        result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [f"Unsupported: {ext}"], "warnings": []}
+
+    # Run vision on all collected images (scanned pages, charts, photos, DOCX images)
+    if result.get("images"):
+        image_text = _describe_images_with_vision(result["images"], filename)
+        if image_text:
+            result["text"] = (result.get("text", "") + f"\n\n--- IMAGE DESCRIPTIONS ---\n{image_text}").strip()
+
+    return result
 
 
 def _extract_document_structure(file_path: str, ext: str) -> list[dict]:
@@ -2733,12 +3187,12 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
     else:
         content = b''  # Don't hold file content in memory
 
-    # Smart routing for non-data files (SQL, MD, TXT, DOCX, PPTX, PDF)
-    if ext in (".sql", ".md", ".txt", ".docx", ".pptx", ".pdf") and project:
+    # Smart routing for non-data files (SQL, MD, TXT, DOCX, PPTX, PDF, images)
+    if ext in (".sql", ".md", ".txt", ".docx", ".pptx", ".pdf", ".jpg", ".jpeg", ".png") and project:
         try:
-            extracted = _extract_content(tmp_path, ext, content)
-            text_content = extracted["text"]
-            doc_tables = extracted["tables"]
+            conductor_result = _conduct_upload(tmp_path, ext, project, file.filename, raw_content=content)
+            text_content = conductor_result.get("text", "")
+            doc_tables = conductor_result.get("tables", [])
             file_type = classify_file(file.filename, content_sample=text_content[:500])
 
             if file_type == "sql_patterns":
@@ -2815,7 +3269,86 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
             pass
 
     try:
-        # 1. Parse file to validate
+        # Excel multi-sheet: use AI handler for .xlsx/.xls
+        if ext in (".xlsx", ".xls") and not table_name:
+            excel_result = _handle_excel(tmp_path, file.filename)
+            if excel_result.get("tables") and len(excel_result["tables"]) > 1:
+                # Multi-sheet Excel — create each sheet as its own table
+                proj_schema = _get_project_schema(request, project)
+                if proj_schema:
+                    from db import get_project_engine
+                    user_schema = proj_schema
+                    engine = get_project_engine(project or '')
+                else:
+                    from db import create_user_schema, get_user_engine
+                    user_schema = create_user_schema(user_id)
+                    engine = get_user_engine(user_id)
+
+                tables_created = []
+                total_rows = 0
+                for tbl_info in excel_result["tables"]:
+                    df = tbl_info["df"]
+                    if df.empty or len(df.columns) == 0:
+                        continue
+                    tbl_name = _sanitize_table_name(tbl_info["name"])
+                    try:
+                        df.to_sql(tbl_name, engine, schema=user_schema, if_exists='replace', index=False)
+                        tables_created.append({"table": tbl_name, "rows": len(df), "cols": len(df.columns), "source": tbl_info.get("source", "")})
+                        total_rows += len(df)
+
+                        # Generate metadata + queries for each table
+                        if project:
+                            col_analyses = [_analyze_column(df[col]) for col in df.columns]
+                            try:
+                                metadata = _generate_metadata(tbl_name, df, col_analyses)
+                                if metadata:
+                                    meta_dir = KNOWLEDGE_DIR / project / "tables"
+                                    meta_dir.mkdir(parents=True, exist_ok=True)
+                                    _safe_write_json(meta_dir / f"{tbl_name}.json", metadata)
+                            except Exception:
+                                pass
+                            try:
+                                _generate_sample_queries(project, tbl_name, col_analyses)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        excel_result.setdefault("warnings", []).append(f"Table '{tbl_name}' failed: {e}")
+
+                # Index text descriptions into knowledge
+                if excel_result.get("text") and project:
+                    try:
+                        from agno.knowledge.reader.text_reader import TextReader
+                        from db.session import create_project_knowledge
+                        knowledge = create_project_knowledge(project)
+                        knowledge.insert(
+                            name=f"doc-{Path(file.filename).stem}",
+                            text_content=f"Excel file: {file.filename}\n\n{excel_result['text'][:10000]}",
+                            reader=TextReader(), skip_if_exists=False,
+                        )
+                    except Exception:
+                        pass
+
+                # Reload knowledge
+                if project:
+                    try:
+                        from db.session import create_project_knowledge
+                        pk = create_project_knowledge(project)
+                        pk.load(recreate=False)
+                    except Exception:
+                        pass
+
+                Path(tmp_path).unlink(missing_ok=True)
+                return {
+                    "status": "ok",
+                    "multi_sheet": True,
+                    "tables_created": len(tables_created),
+                    "total_rows": total_rows,
+                    "tables": tables_created,
+                    "warnings": excel_result.get("warnings", []),
+                    "smart": {"file_type": "excel_multi_sheet", "tables_created": len(tables_created)},
+                }
+
+        # 1. Parse file to validate (single table: CSV, JSON, single-sheet Excel)
         try:
             df = _read_file(tmp_path, ext)
         except Exception as parse_err:
@@ -3182,7 +3715,7 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
         raise HTTPException(400, "No filename provided")
 
     ext = Path(file.filename).suffix.lower()
-    allowed = {".sql", ".py", ".txt", ".md", ".pptx", ".docx", ".pdf"}
+    allowed = {".sql", ".py", ".txt", ".md", ".pptx", ".docx", ".pdf", ".jpg", ".jpeg", ".png"}
     if ext not in allowed:
         raise HTTPException(400, f"Unsupported: {ext}. Allowed: {', '.join(allowed)}")
 
@@ -3190,23 +3723,16 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large")
 
-    # Extract text and tables from binary formats
-    if ext in (".pptx", ".docx", ".pdf"):
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        extracted = _extract_content(tmp_path, ext, content)
-        text_content = extracted["text"]
-        doc_tables = extracted["tables"]
-        doc_images = extracted.get("images", [])
-        if doc_images:
-            image_text = _describe_images_with_vision(doc_images, file.filename)
-            if image_text:
-                text_content += f"\n\n--- IMAGE DESCRIPTIONS ---\n{image_text}"
-        import os; os.unlink(tmp_path)
-    else:
-        text_content = content.decode("utf-8", errors="replace")
-        doc_tables = []
+    # Use Upload Conductor for all formats
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    conductor_result = _conduct_upload(tmp_path, ext, project or "", file.filename, raw_content=content)
+    text_content = conductor_result.get("text", "")
+    doc_tables = conductor_result.get("tables", [])
+
+    import os; os.unlink(tmp_path)
     doc_name = Path(file.filename).stem
 
     # Per-project or global docs dir
@@ -3220,7 +3746,7 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
         f.write(text_content)
 
     # Save raw binary for structure extraction (doc-to-workflow)
-    if ext in (".pptx", ".docx", ".pdf") and project:
+    if ext in (".pptx", ".docx", ".pdf", ".jpg", ".jpeg", ".png") and project:
         docs_raw_dir = KNOWLEDGE_DIR / project / "docs_raw"
         docs_raw_dir.mkdir(parents=True, exist_ok=True)
         (docs_raw_dir / file.filename).write_bytes(content)
@@ -3257,11 +3783,14 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
                 df = tbl_info["df"]
                 if len(df) < 2 or len(df.columns) < 2:
                     continue
-                # Generate table name from filename + source
-                base_name = Path(file.filename).stem.lower()
-                base_name = re.sub(r'[^a-z0-9_]', '_', base_name)[:30]
-                tbl_name = f"{base_name}_{tbl_info['source']}"
-                tbl_name = re.sub(r'_+', '_', tbl_name).strip('_')
+                # Use conductor-provided name or generate from filename + source
+                tbl_name = tbl_info.get("name", "")
+                if not tbl_name:
+                    base_name = Path(file.filename).stem.lower()
+                    base_name = re.sub(r'[^a-z0-9_]', '_', base_name)[:30]
+                    tbl_name = f"{base_name}_{tbl_info.get('source', 'table')}"
+                tbl_name = re.sub(r'[^a-z0-9_]', '_', tbl_name.lower())
+                tbl_name = re.sub(r'_+', '_', tbl_name).strip('_')[:63]
                 try:
                     df.to_sql(tbl_name, engine, schema=schema, if_exists='replace', index=False)
                     tables_saved += 1

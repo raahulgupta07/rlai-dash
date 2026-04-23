@@ -381,25 +381,49 @@ On-Demand Features:
 
 ## Upload System
 
-- **Multi-file upload** — batch upload multiple files per project
-- **File types:** CSV, Excel (.xlsx/.xls), JSON, SQL, PPTX, DOCX, PDF, MD, TXT
+### Upload Intelligence Agent (Conductor + Handlers)
+
+All uploads route through `_conduct_upload()` which dispatches to specialized handlers:
+
+```
+_conduct_upload(file, ext, project)
+  ├── _handle_excel()   ← AI multi-sheet analyzer (training_llm_call)
+  ├── _handle_pdf()     ← scanned page detection → vision OCR
+  ├── _handle_pptx()    ← text + tables + images (cap 30)
+  ├── _handle_docx()    ← text + tables + images (NEW)
+  ├── _handle_image()   ← JPG/PNG → vision → knowledge
+  ├── _handle_csv()     ← delimiter auto-detection
+  ├── _handle_json()    ← records/object orientation
+  └── _handle_text()    ← TXT/MD/SQL/PY → knowledge
+  ↓
+  All images → _describe_images_with_vision(UNIVERSAL_PROMPT) → text
+  ↓
+  tables → PostgreSQL | text → PgVector | metadata → JSON
+```
+
+Every handler returns: `{"tables": [...], "text": str, "images": [...], "metadata": dict, "errors": [...], "warnings": [...]}`
+
+### Key Features
+
+- **13 File formats:** CSV, Excel (.xlsx/.xls), JSON, SQL, PPTX, DOCX, PDF, JPG, JPEG, PNG, MD, TXT, PY
+- **Excel AI multi-sheet** — `_handle_excel()` enumerates all sheets, sends previews to LLM (`training_llm_call("excel_analysis")`), gets JSON extraction plan per sheet (header_row, skip_rows, forward_fill, split tables). Fallback: `pd.read_excel(sheet_name=None)` reads all sheets with rule-based header detection
+- **Multi-table per sheet** — AI detects blank row gaps between tables within a single sheet, extracts each as separate PostgreSQL table
+- **Forward-fill merged cells** — AI identifies columns where values appear once then blank (grouped cells), applies `df.ffill()`
+- **Scanned PDF OCR** — `_handle_pdf()` detects scanned pages (text < 50 chars), renders at 200 DPI via `page.get_pixmap()`, sends to vision LLM for text extraction. No Tesseract needed
+- **DOCX image extraction** — `_extract_images_docx()` extracts images from `doc.part.rels` relationships, sends to vision for description
+- **JPG/PNG direct upload** — `_handle_image()` base64 encodes image, vision LLM describes content (certificates, photos, diagrams)
+- **Universal vision prompt** — `_UNIVERSAL_VISION_PROMPT` handles all image types: scanned text, charts, diagrams, photos, tables. One prompt, auto-detects content type
+- **Image cap: 30** per document (was 10), min size 3KB (was 5KB)
+- **Corrupt PDF detection** — 0 pages = error returned to user
 - **Smart classification:** data, column_definition, sql_patterns, business_rules, documentation
 - **CSV delimiter auto-detection:** comma, semicolon, tab, pipe
-- **PostgreSQL reserved word protection** — auto-escapes column names that clash with reserved words
+- **PostgreSQL reserved word protection** — auto-escapes column names
 - **Smart upsert with PK detection** — detects primary keys, upserts on conflict
-- **Date column auto-detection** — identifies and parses date columns automatically
-- **PPTX/DOCX/PDF text extraction** — extracts text content and indexes for knowledge search
 - **Stream upload** — 1MB chunks, never holds full file in memory
-- **Table extraction from PPTX** — extracts slide table shapes into PostgreSQL tables
-- **Table extraction from PDF** — uses pdfplumber to extract tabular data
-- **Table extraction from DOCX** — extracts doc.tables into PostgreSQL tables
-- **pdfminer.six dependency** — for PDF text extraction
-- **Smart file routing** — PPTX/PDF/DOCX/SQL/MD/TXT → upload-doc, CSV/Excel/JSON → upload
+- **Smart file routing** — PPTX/PDF/DOCX/SQL/MD/TXT/JPG/PNG → upload-doc, CSV/Excel/JSON → upload
 - Doc-only projects fully supported — no CSV/data table required for training
-- Training progress UI works for doc-only projects (step tracking in DB)
-- **Vision pipeline** — extracts images from PPTX (shape.image.blob) and PDF (fitz extract_image), sends to vision LLM, saves descriptions as searchable text
 - **Document-to-workflow** — extracts slide/section structure, LLM converts to reusable workflow steps
-- **Raw binary preservation** — original PPTX/PDF/DOCX saved to docs_raw/ for structure and image extraction
+- **Raw binary preservation** — original files saved to docs_raw/ for re-processing
 
 ## Export System
 

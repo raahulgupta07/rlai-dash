@@ -40,6 +40,7 @@ TRAINING_CONFIGS = {
     "meta_learning":    {"temp": 0.0, "tokens": 300,  "thinking": "none"},
     "vision":           {"temp": 0.1, "tokens": 1000, "thinking": "none"},
     "dashboard":        {"temp": 0.2, "tokens": 3000, "thinking": "minimal"},
+    "excel_analysis":   {"temp": 0.1, "tokens": 3000, "thinking": "medium"},
 }
 
 
@@ -136,7 +137,7 @@ def training_vision_call(prompt: str, images: list[dict], task: str = "vision") 
         return None
     cfg = TRAINING_CONFIGS.get(task, TRAINING_CONFIGS["extraction"])
     content: list[dict] = [{"type": "text", "text": prompt}]
-    for img in images[:10]:
+    for img in images[:30]:
         content.append({"type": "image_url", "image_url": {"url": f"data:{img['mime']};base64,{img['b64']}"}})
     import httpx
     body: dict = {
