@@ -2812,92 +2812,105 @@ IMPORTANT: column_names should use the ACTUAL header text cleaned up. e.g. "Jul'
                 continue
 
             if action == "unpivot":
-                # Time-based columns → melt into rows, merge blocks
+                # AI-powered conversion: send raw data to AI, let it decide column mapping
                 try:
-                    hrow = sheet_plan.get("header_row", 0)
-                    skip = sheet_plan.get("skip_rows", [])
-                    df_raw = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=skip)
+                    # Read raw data with no header — let AI figure out everything
+                    df_raw_all = pd.read_excel(file_path, sheet_name=sname, header=None)
+                    raw_preview = ""
+                    for ri in range(min(20, len(df_raw_all))):
+                        vals = [str(v)[:30] if pd.notna(v) else "" for v in df_raw_all.iloc[ri].values[:18]]
+                        raw_preview += f"  Row {ri}: {vals}\n"
 
-                    # Apply AI column names
-                    col_names = sheet_plan.get("column_names", {})
-                    if col_names:
-                        new_cols = []
-                        for i, c in enumerate(df_raw.columns):
-                            new_cols.append(col_names.get(str(i), str(c).lower().replace(" ", "_").replace("'", "_")[:50]))
-                        df_raw.columns = new_cols
+                    convert_prompt = f"""Convert this Excel sheet from WIDE to LONG format.
 
-                    id_cols_idx = sheet_plan.get("id_columns", [])
-                    val_cols_idx = sheet_plan.get("value_columns", [])
-                    id_cols = [df_raw.columns[i] for i in id_cols_idx if i < len(df_raw.columns)]
-                    val_cols = [df_raw.columns[i] for i in val_cols_idx if i < len(df_raw.columns)]
-                    value_name = sheet_plan.get("value_name", "value")
-                    variable_name = sheet_plan.get("variable_name", "period")
+RAW DATA (first 20 rows, 0-indexed, no header):
+{raw_preview}
 
-                    blocks = sheet_plan.get("blocks", [])
+Return ONLY valid JSON:
+{{
+  "header_row": <0-indexed row with column headers like month names (Jul'21, Aug'21 etc)>,
+  "skip_after_header": [<0-indexed rows to skip AFTER header: unit rows (Sachets/kg), summary rows (Utilisation/Total), blank rows>],
+  "id_columns": [<0-indexed col numbers for identifiers: plant, product, capacity>],
+  "value_columns": [<0-indexed col numbers for time-period values to unpivot>],
+  "id_names": ["plant", "product", "annual_capacity"],
+  "value_name": "output",
+  "variable_name": "month",
+  "blocks": [
+    {{"data_start": <first data row 0-indexed>, "data_end": <last data row 0-indexed>, "extra": {{"plant": "IB Plant", "unit": "Sachets"}} }}
+  ],
+  "extra_columns": {{"fiscal_year": "FY2022"}}
+}}"""
+
+                    from dash.settings import training_llm_call
+                    convert_raw = training_llm_call(convert_prompt, "excel_analysis")
+                    if not convert_raw:
+                        raise ValueError("AI conversion returned empty")
+                    cp = json.loads(convert_raw)
+
+                    # Read with AI-determined header
+                    ai_hrow = cp.get("header_row", 1)
+                    skip_after = cp.get("skip_after_header", [])
+                    skip_for_read = [s for s in skip_after if s > ai_hrow]
+                    df_data = pd.read_excel(file_path, sheet_name=sname, header=ai_hrow, skiprows=skip_for_read)
+
+                    # Use AI conversion plan for column mapping
+                    id_col_idx = cp.get("id_columns", [0, 1, 2])
+                    val_col_idx = cp.get("value_columns", [])
+                    id_names_ai = cp.get("id_names", [])
+                    value_name = cp.get("value_name", "value")
+                    variable_name = cp.get("variable_name", "period")
+
+                    # Rename ID columns with AI names
+                    for i, name in enumerate(id_names_ai):
+                        if i < len(id_col_idx) and id_col_idx[i] < len(df_data.columns):
+                            df_data.rename(columns={df_data.columns[id_col_idx[i]]: name}, inplace=True)
+
+                    id_cols = [id_names_ai[i] if i < len(id_names_ai) else df_data.columns[idx]
+                               for i, idx in enumerate(id_col_idx) if idx < len(df_data.columns)]
+                    val_cols = [df_data.columns[i] for i in val_col_idx if i < len(df_data.columns)]
+
+                    blocks = cp.get("blocks", [])
                     tname = sheet_plan.get("table_name") or f"{file_slug}_{_sanitize_table_name(sname)}"
                     tname = _sanitize_table_name(tname)
 
-                    if blocks:
-                        # Multiple blocks (e.g. IB Plant + Tea Plant + Cereal Plant)
+                    if blocks and val_cols:
                         all_melted = []
                         for block in blocks:
-                            bstart = block.get("data_start", 0) - hrow - 1
-                            bend = block.get("data_end", bstart) - hrow - 1
-                            # Adjust for skipped rows
-                            bstart = max(0, bstart - len([s for s in skip if s < block.get("data_start", 0)]))
-                            bend = max(bstart, bend - len([s for s in skip if s < block.get("data_end", 0)]))
-                            if bstart < len(df_raw) and bend < len(df_raw):
-                                df_block = df_raw.iloc[bstart:bend + 1].copy()
-                            elif bstart < len(df_raw):
-                                df_block = df_raw.iloc[bstart:bstart + 1].copy()
-                            else:
+                            bstart = block.get("data_start", 0) - ai_hrow - 1
+                            bend = block.get("data_end", bstart + ai_hrow + 1) - ai_hrow - 1
+                            skipped = len([s for s in skip_for_read if s < block.get("data_start", 0)])
+                            bstart = max(0, bstart - skipped)
+                            bend = max(bstart, bend - len([s for s in skip_for_read if s < block.get("data_end", 0)]))
+                            bend = min(bend, len(df_data) - 1)
+                            if bstart >= len(df_data):
                                 continue
-
-                            # Forward-fill within block
-                            for col_idx in sheet_plan.get("forward_fill_columns", []):
-                                if isinstance(col_idx, int) and col_idx < len(df_block.columns):
-                                    df_block.iloc[:, col_idx] = df_block.iloc[:, col_idx].ffill()
-
-                            if val_cols:
-                                melted = df_block.melt(id_vars=id_cols, value_vars=val_cols,
-                                                       var_name=variable_name, value_name=value_name)
-                            else:
-                                melted = df_block
-
-                            # Add block-specific extra columns
+                            df_block = df_data.iloc[bstart:bend + 1].copy()
+                            if id_cols and id_cols[0] in df_block.columns:
+                                df_block[id_cols[0]] = df_block[id_cols[0]].ffill()
+                            df_block = df_block.dropna(subset=val_cols, how='all')
+                            melted = df_block.melt(id_vars=id_cols, value_vars=val_cols,
+                                                   var_name=variable_name, value_name=value_name)
                             for k, v in block.get("extra", {}).items():
                                 melted[k] = v
                             all_melted.append(melted)
-
-                        if all_melted:
-                            df_final = pd.concat(all_melted, ignore_index=True)
-                        else:
-                            df_final = pd.DataFrame()
+                        df_final = pd.concat(all_melted, ignore_index=True) if all_melted else pd.DataFrame()
+                    elif val_cols:
+                        if id_cols and id_cols[0] in df_data.columns:
+                            df_data[id_cols[0]] = df_data[id_cols[0]].ffill()
+                        df_final = df_data.melt(id_vars=id_cols, value_vars=val_cols,
+                                                var_name=variable_name, value_name=value_name)
                     else:
-                        # Single block unpivot
-                        for col_idx in sheet_plan.get("forward_fill_columns", []):
-                            if isinstance(col_idx, int) and col_idx < len(df_raw.columns):
-                                df_raw.iloc[:, col_idx] = df_raw.iloc[:, col_idx].ffill()
+                        df_final = df_data
 
-                        if val_cols:
-                            df_final = df_raw.melt(id_vars=id_cols, value_vars=val_cols,
-                                                    var_name=variable_name, value_name=value_name)
-                        else:
-                            df_final = df_raw
-
-                    # Add sheet-level extra columns
-                    for k, v in sheet_plan.get("extra_columns", {}).items():
+                    # Add extra columns
+                    for k, v in cp.get("extra_columns", {}).items():
                         df_final[k] = v
+                    for k, v in sheet_plan.get("extra_columns", {}).items():
+                        if k not in df_final.columns:
+                            df_final[k] = v
 
-                    # Try to parse period/month to date
-                    if variable_name in df_final.columns:
-                        try:
-                            df_final["date"] = pd.to_datetime(df_final[variable_name], format="mixed", dayfirst=False)
-                        except Exception:
-                            pass
-
-                    # Drop NaN values and clean
-                    df_final = df_final.dropna(subset=[value_name], how='all') if value_name in df_final.columns else df_final
+                    if value_name in df_final.columns:
+                        df_final = df_final.dropna(subset=[value_name])
                     df_final = df_final.dropna(how='all')
 
                     if len(df_final) > 0:
