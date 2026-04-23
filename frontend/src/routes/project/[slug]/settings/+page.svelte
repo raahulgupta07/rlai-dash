@@ -1127,26 +1127,29 @@
           {/if}
         {/if}
 
-        {#if uploadFileProgress.length > 0}
+        {#if uploadFileProgress.length > 0 || uploading}
+          {#if true}
+            {@const done = uploadFileProgress.filter(p => p.status === 'done').length}
+            {@const errors = uploadFileProgress.filter(p => p.status === 'error').length}
+            {@const total = uploadFileProgress.length || 1}
+            {@const pct = Math.round(((done + errors) / total) * 100)}
           <div style="margin-top: 10px; padding: 10px; background: var(--color-surface-dim); border-left: 3px solid var(--color-primary);">
-            <!-- Progress bar -->
-            {#if uploadFileProgress.length > 1}
-              {@const done = uploadFileProgress.filter(p => p.status === 'done').length}
-              {@const errors = uploadFileProgress.filter(p => p.status === 'error').length}
-              {@const pct = Math.round(((done + errors) / uploadFileProgress.length) * 100)}
-              <div style="margin-bottom: 8px;">
-                <div style="display: flex; justify-content: space-between; font-size: 10px; font-weight: 900; margin-bottom: 3px;">
-                  <span>{done + errors}/{uploadFileProgress.length} files processed</span>
-                  <span>{pct}%</span>
-                </div>
-                <div style="height: 6px; background: var(--color-surface); border-radius: 3px; overflow: hidden;">
-                  <div style="height: 100%; width: {pct}%; background: var(--color-primary); transition: width 0.3s;"></div>
-                </div>
+            <div style="margin-bottom: 8px;">
+              <div style="display: flex; justify-content: space-between; font-size: 10px; font-weight: 900; margin-bottom: 3px;">
+                <span>{uploading ? `Processing ${done + errors + 1}/${total}` : `${done} of ${total} completed`}</span>
+                <span>{uploading ? `${pct}%` : (errors > 0 ? `${done} ok · ${errors} failed` : '100%')}</span>
               </div>
-            {/if}
+              <div style="height: 6px; background: var(--color-surface); border-radius: 3px; overflow: hidden;">
+                {#if uploading && pct === 0}
+                  <div style="height: 100%; width: 100%; background: linear-gradient(90deg, transparent 0%, var(--color-primary) 50%, transparent 100%); animation: shimmer 1.5s infinite;"></div>
+                {:else}
+                  <div style="height: 100%; width: {pct}%; background: var(--color-primary); transition: width 0.3s;"></div>
+                {/if}
+              </div>
+            </div>
             <!-- Per-file list -->
-            <div style="max-height: 200px; overflow-y: auto;">
-              {#each uploadFileProgress as fp}
+            <div style="max-height: 250px; overflow-y: auto;">
+              {#each uploadFileProgress as fp, idx}
                 <div style="font-size: 11px; padding: 2px 0; display: flex; align-items: center; gap: 6px;">
                   {#if fp.status === 'done'}
                     <span style="color: var(--color-primary); flex-shrink: 0;">✓</span>
@@ -1157,6 +1160,7 @@
                   {:else}
                     <span style="color: var(--color-on-surface-dim); flex-shrink: 0;">○</span>
                   {/if}
+                  <span style="font-size: 9px; color: var(--color-on-surface-dim); flex-shrink: 0; width: 24px;">{idx + 1}.</span>
                   <span style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; {fp.status === 'uploading' ? 'font-weight: 700;' : ''}">{fp.name}</span>
                   {#if fp.status === 'done'}
                     {@const r = uploadResults.find(r => r.file === fp.name)}
@@ -1171,18 +1175,25 @@
             </div>
             <!-- Summary when done -->
             {#if !uploading && uploadResults.length > 0}
-              {@const totalTables = uploadResults.reduce((s, r) => s + (r.tables_created || (r.table_name ? 1 : 0) || r.tables_saved || 0), 0)}
-              {@const totalRows = uploadResults.reduce((s, r) => s + (r.total_rows || r.rows || 0), 0)}
-              {@const totalIndexed = uploadResults.filter(r => r.indexed).length}
-              <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--color-surface); font-size: 11px; font-weight: 900; color: var(--color-primary);">
-                ✓ {uploadResults.length} files uploaded
-                {#if totalTables > 0} · {totalTables} tables{/if}
-                {#if totalRows > 0} · {totalRows} rows{/if}
-                {#if totalIndexed > 0} · {totalIndexed} docs indexed{/if}
-              </div>
+              {#if true}
+                {@const totalTables = uploadResults.reduce((s, r) => s + (r.tables_created || (r.table_name ? 1 : 0) || r.tables_saved || 0), 0)}
+                {@const totalRows = uploadResults.reduce((s, r) => s + (r.total_rows || r.rows || 0), 0)}
+                {@const totalIndexed = uploadResults.filter(r => r.indexed).length}
+                {@const hasEngineer = uploadResults.some(r => r.engineer)}
+                <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--color-surface); font-size: 11px; font-weight: 900; color: var(--color-primary);">
+                  ✓ {uploadResults.length} files uploaded
+                  {#if totalTables > 0} · {totalTables} tables{/if}
+                  {#if totalRows > 0} · {totalRows} rows{/if}
+                  {#if totalIndexed > 0} · {totalIndexed} docs indexed{/if}
+                </div>
+                {#if hasEngineer}
+                  <div style="font-size: 10px; color: var(--color-warning); margin-top: 4px;">⚙ Engineer running — creating views and discovering relationships...</div>
+                {/if}
+              {/if}
             {/if}
             {#if uploadError}<div style="margin-top: 6px; font-size: 11px; color: var(--color-error);">{uploadError}</div>{/if}
           </div>
+          {/if}
         {/if}
       </div>
     {/if}
@@ -3111,5 +3122,14 @@
     0% { opacity: 1; }
     50% { opacity: 0.3; }
     100% { opacity: 1; }
+  }
+  @keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.3; }
+    100% { opacity: 1; }
+  }
+  @keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
   }
 </style>

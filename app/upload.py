@@ -2675,6 +2675,18 @@ def _handle_excel(file_path: str, filename: str) -> dict:
     try:
         if ext == ".xlsx":
             import openpyxl
+            # First pass: read merged cells (needs non-read-only mode)
+            merged_info = {}
+            try:
+                wb_full = openpyxl.load_workbook(file_path, data_only=True)
+                for sname in wb_full.sheetnames:
+                    ws = wb_full[sname]
+                    if ws.merged_cells.ranges:
+                        merged_info[sname] = [str(r) for r in ws.merged_cells.ranges]
+                wb_full.close()
+            except Exception:
+                pass
+            # Second pass: read data (read-only for speed)
             wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
             sheet_names = wb.sheetnames
             for sname in sheet_names:
@@ -2684,7 +2696,7 @@ def _handle_excel(file_path: str, filename: str) -> dict:
                     if ri >= 25:
                         break
                     rows.append([str(v)[:60] if v is not None else "" for v in row[:15]])
-                sheet_previews[sname] = {"rows": rows, "max_row": ws.max_row, "max_col": ws.max_column}
+                sheet_previews[sname] = {"rows": rows, "max_row": ws.max_row, "max_col": ws.max_column, "merged_cells": merged_info.get(sname, [])}
             wb.close()
         elif ext == ".xls":
             import xlrd
@@ -2721,7 +2733,9 @@ def _handle_excel(file_path: str, filename: str) -> dict:
         max_preview_rows = 25 if len(sheet_names) <= 5 else (15 if len(sheet_names) <= 10 else 10)
         for sname in sheet_names:
             info = sheet_previews[sname]
-            preview_text += f"\n\nSheet: '{sname}' ({info['max_row']} rows × {info['max_col']} cols)\n"
+            merged = info.get("merged_cells", [])
+            merged_note = f" | Merged cells: {', '.join(merged[:10])}" if merged else ""
+            preview_text += f"\n\nSheet: '{sname}' ({info['max_row']} rows × {info['max_col']} cols{merged_note})\n"
             for ri, row in enumerate(info["rows"][:max_preview_rows]):
                 preview_text += f"  Row {ri}: {row}\n"
 
@@ -2747,7 +2761,9 @@ IMPORTANT:
 - Blank rows between data sections signal multiple tables
 - Sub-header rows (units like "Sachets", "kg") should be in skip_rows
 - Empty sheets (all blank or only metadata) should be "skip"
-- Table names should be descriptive: use file context + sheet content"""
+- Table names should be descriptive: use file context + sheet content
+- Merged cells are shown. If a column has a value in one row then blank in next rows (merged), add that column INDEX (0-based) to forward_fill_columns so values propagate down
+- Write a clear "description" for each table explaining what data it contains"""
 
         raw = training_llm_call(prompt, "excel_analysis")
         if raw:
@@ -2789,7 +2805,8 @@ IMPORTANT:
                         for col_idx in sub.get("forward_fill_columns", []):
                             if isinstance(col_idx, int) and col_idx < len(df.columns):
                                 df.iloc[:, col_idx] = df.iloc[:, col_idx].ffill()
-                        result["tables"].append({"name": tname, "df": df, "source": f"{sname} [split]"})
+                        sheet_idx = sheet_names.index(sname) + 1 if sname in sheet_names else 0
+                        result["tables"].append({"name": tname, "df": df, "source": f"{sname} [split]", "sheet_number": sheet_idx, "description": sub.get("description", "")})
                     except Exception as e:
                         result["warnings"].append(f"Split table from '{sname}' failed: {e}")
             else:
@@ -2804,11 +2821,12 @@ IMPORTANT:
                         continue
                     tname = sheet_plan.get("table_name") or f"{file_slug}_{_sanitize_table_name(sname)}"
                     tname = _sanitize_table_name(tname)
-                    # Forward-fill
+                    # Forward-fill merged cells
                     for col_idx in sheet_plan.get("forward_fill_columns", []):
                         if isinstance(col_idx, int) and col_idx < len(df.columns):
                             df.iloc[:, col_idx] = df.iloc[:, col_idx].ffill()
-                    result["tables"].append({"name": tname, "df": df, "source": sname})
+                    sheet_idx = sheet_names.index(sname) + 1 if sname in sheet_names else 0
+                    result["tables"].append({"name": tname, "df": df, "source": sname, "sheet_number": sheet_idx, "description": sheet_plan.get("description", "")})
                 except Exception as e:
                     result["warnings"].append(f"Sheet '{sname}' extraction failed: {e}")
 
@@ -2842,7 +2860,8 @@ IMPORTANT:
                 if len(df) == 0:
                     continue
                 tname = f"{file_slug}_{_sanitize_table_name(str(sname))}"
-                result["tables"].append({"name": tname, "df": df, "source": str(sname)})
+                sheet_idx = list(all_sheets.keys()).index(sname) + 1 if sname in all_sheets else 0
+                result["tables"].append({"name": tname, "df": df, "source": str(sname), "sheet_number": sheet_idx, "description": ""})
         except Exception as e:
             result["errors"].append(f"Fallback read all sheets failed: {e}")
 
@@ -3360,7 +3379,7 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                     tbl_name = _sanitize_table_name(tbl_info["name"])
                     try:
                         df.to_sql(tbl_name, engine, schema=user_schema, if_exists='replace', index=False)
-                        tables_created.append({"table": tbl_name, "rows": len(df), "cols": len(df.columns), "source": tbl_info.get("source", "")})
+                        tables_created.append({"table": tbl_name, "rows": len(df), "cols": len(df.columns), "source": tbl_info.get("source", ""), "sheet_number": tbl_info.get("sheet_number", 0), "description": tbl_info.get("description", "")})
                         total_rows += len(df)
 
                         # Generate metadata + queries for each table
