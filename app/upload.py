@@ -3652,10 +3652,166 @@ def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_c
 
 
 def _post_upload_engineer(project_slug: str, tables_created: list[dict], user_id: int = 1):
-    """After upload, call Engineer agent to inspect tables, create views, discover relationships.
+    """After upload: Engineer merges same-structure tables, Inspector validates, safe delete originals.
     Runs in background thread — does not block upload response."""
     if not project_slug or not tables_created:
         return
+    import logging
+    log = logging.getLogger("dash.upload")
+
+    try:
+        schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+        merge_engine = create_engine(db_url)
+
+        # STEP 1: Get ALL tables in project with their columns
+        all_tables = {}
+        with merge_engine.connect() as conn:
+            conn.execute(text(f"SET LOCAL search_path TO {schema}, public"))
+            from sqlalchemy import inspect as sa_inspect
+            insp = sa_inspect(merge_engine)
+            for tbl in insp.get_table_names(schema=schema):
+                try:
+                    cols = insp.get_columns(tbl, schema=schema)
+                    col_names = [c["name"] for c in cols]
+                    row_count = conn.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{tbl}"')).scalar() or 0
+                    all_tables[tbl] = {"columns": col_names, "rows": row_count, "col_set": set(col_names)}
+                except Exception:
+                    pass
+
+        if len(all_tables) < 2:
+            log.info(f"Post-upload: only {len(all_tables)} table(s), skipping merge")
+            # Still run Engineer for relationships
+            _run_engineer_agent(project_slug, tables_created, user_id)
+            return
+
+        # STEP 2: Find merge groups (tables with >80% column overlap)
+        merge_groups = []
+        used = set()
+        table_names = list(all_tables.keys())
+
+        for i, t1 in enumerate(table_names):
+            if t1 in used:
+                continue
+            group = [t1]
+            cols1 = all_tables[t1]["col_set"]
+            for j in range(i + 1, len(table_names)):
+                t2 = table_names[j]
+                if t2 in used:
+                    continue
+                cols2 = all_tables[t2]["col_set"]
+                overlap = len(cols1 & cols2) / max(len(cols1 | cols2), 1)
+                if overlap >= 0.8:
+                    group.append(t2)
+            if len(group) >= 2:
+                merge_groups.append(group)
+                used.update(group)
+
+        if not merge_groups:
+            log.info("Post-upload: no merge candidates found")
+            _run_engineer_agent(project_slug, tables_created, user_id)
+            return
+
+        # STEP 3: Merge each group
+        for group in merge_groups:
+            # Pick merged table name (shortest common prefix or first table)
+            import os
+            prefix = os.path.commonprefix(group).rstrip("_") or group[0]
+            merged_name = _sanitize_table_name(f"{prefix}_merged" if len(prefix) > 3 else f"{group[0]}_merged")
+
+            # Get union of all columns
+            all_cols = set()
+            for tbl in group:
+                all_cols.update(all_tables[tbl]["col_set"])
+            all_cols_list = sorted(all_cols)
+
+            # Count expected rows
+            expected_rows = sum(all_tables[tbl]["rows"] for tbl in group)
+
+            try:
+                with merge_engine.connect() as conn:
+                    conn.execute(text(f"SET LOCAL search_path TO {schema}, public"))
+
+                    # Build UNION ALL with source_table column
+                    parts = []
+                    for tbl in group:
+                        tbl_cols = all_tables[tbl]["col_set"]
+                        select_parts = []
+                        for col in all_cols_list:
+                            if col in tbl_cols:
+                                select_parts.append(f'"{col}"')
+                            else:
+                                select_parts.append(f"NULL AS \"{col}\"")
+                        select_parts.append(f"'{tbl}' AS _source_table")
+                        parts.append(f"SELECT {', '.join(select_parts)} FROM \"{schema}\".\"{tbl}\"")
+
+                    union_sql = " UNION ALL ".join(parts)
+                    create_sql = f'CREATE TABLE "{schema}"."{merged_name}" AS {union_sql}'
+                    conn.execute(text(create_sql))
+                    conn.commit()
+
+                # STEP 4: Inspector validates merged table
+                actual_rows = 0
+                with merge_engine.connect() as conn:
+                    actual_rows = conn.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{merged_name}"')).scalar() or 0
+
+                merge_valid = actual_rows >= expected_rows  # Must have ALL rows
+
+                if merge_valid:
+                    # Profile the merged table
+                    try:
+                        df_sample = pd.read_sql(f'SELECT * FROM "{schema}"."{merged_name}" LIMIT 5000', merge_engine)
+                        profile = _profile_table(df_sample, project_slug, merged_name)
+                        health = profile.get("health", 0)
+                        merge_valid = health >= 50  # Must pass minimum quality
+                    except Exception:
+                        pass
+
+                if merge_valid:
+                    # PASS — safe to delete originals
+                    with merge_engine.connect() as conn:
+                        for tbl in group:
+                            try:
+                                conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{tbl}" CASCADE'))
+                            except Exception:
+                                pass
+                        conn.commit()
+                    log.info(f"Post-upload MERGED: {group} → {merged_name} ({actual_rows} rows, health={profile.get('health', '?')}%)")
+
+                    # Save source metadata for merged table
+                    src_dir = KNOWLEDGE_DIR / project_slug / "table_sources"
+                    src_dir.mkdir(parents=True, exist_ok=True)
+                    _safe_write_json(src_dir / f"{merged_name}.json", {
+                        "source_file": f"Merged from {len(group)} tables",
+                        "source_detail": f"Sources: {', '.join(group)}",
+                        "description": f"Merged table combining {len(group)} tables with same structure ({actual_rows} rows)",
+                    })
+                    # Clean up old source metadata
+                    for tbl in group:
+                        old_src = src_dir / f"{tbl}.json"
+                        if old_src.exists():
+                            old_src.unlink(missing_ok=True)
+                        old_profile = src_dir / f"{tbl}_profile.json"
+                        if old_profile.exists():
+                            old_profile.unlink(missing_ok=True)
+                else:
+                    # FAIL — drop merged, keep originals
+                    with merge_engine.connect() as conn:
+                        conn.execute(text(f'DROP TABLE IF EXISTS "{schema}"."{merged_name}" CASCADE'))
+                        conn.commit()
+                    log.warning(f"Post-upload MERGE FAILED validation: {group} → kept separate (expected={expected_rows}, actual={actual_rows})")
+
+            except Exception as e:
+                log.warning(f"Post-upload merge error for {group}: {e}")
+
+        # STEP 5: Run Engineer for relationships + views on final state
+        _run_engineer_agent(project_slug, tables_created, user_id)
+
+    except Exception as e:
+        log.warning(f"Post-upload engineer failed: {e}")
+
+
+def _run_engineer_agent(project_slug: str, tables_created: list[dict], user_id: int = 1):
+    """Run Engineer agent to discover relationships and create useful views."""
     try:
         from dash.agents.engineer import create_engineer
         from db.session import create_project_knowledge, create_project_learnings
@@ -3663,59 +3819,33 @@ def _post_upload_engineer(project_slug: str, tables_created: list[dict], user_id
 
         knowledge = create_project_knowledge(project_slug)
         learnings = create_project_learnings(project_slug)
-        learning = LearningMachine(
-            knowledge=learnings,
-            learned_knowledge=LearnedKnowledgeConfig(mode=LearningMode.AGENTIC),
-        )
-        engineer = create_engineer(
-            project_slug=project_slug,
-            knowledge=knowledge,
-            learning=learning,
-            dashboard_user_id=user_id,
-        )
+        learning = LearningMachine(knowledge=learnings, learned_knowledge=LearnedKnowledgeConfig(mode=LearningMode.AGENTIC))
+        engineer = create_engineer(project_slug=project_slug, knowledge=knowledge, learning=learning, dashboard_user_id=user_id)
 
-        # Build table summary for Engineer
-        table_summary = "\n".join(
-            f"  - {t['table']} ({t['rows']} rows, {t.get('cols', '?')} cols) from {t.get('source', '?')}"
-            for t in tables_created
-        )
+        table_summary = "\n".join(f"  - {t['table']} ({t['rows']} rows)" for t in tables_created[:20])
 
-        prompt = f"""You just received {len(tables_created)} new tables uploaded to this project.
+        prompt = f"""Inspect the project tables and optimize:
+1. INSPECT all tables — run introspect_schema
+2. DISCOVER RELATIONSHIPS — find JOINable columns (shared IDs, dates, categories)
+3. FIX COLUMN TYPES — dates stored as text → ALTER to DATE
+4. REPORT relationships found
 
-TABLES CREATED:
+Tables in project:
 {table_summary}
 
-Your job:
-1. INSPECT all tables — run introspect_schema to see columns and types
-2. DISCOVER RELATIONSHIPS — find tables that can be JOINed (shared columns like date, id, location, plant, asset category)
-3. CREATE USEFUL VIEWS — if related tables exist, create SQL VIEWs that combine them for easier analysis. For example:
-   - If there are multiple location tables (factory, HQ, MDY) with same structure → CREATE VIEW combining all with a location column
-   - If there are summary + detail tables → no view needed, just note the relationship
-4. FIX COLUMN TYPES — if you see dates stored as text, ALTER the column type
-5. REPORT what you did — list views created and relationships found
+Use SQL tools. Be concise."""
 
-Use your SQL tools. Be concise. Only create views that add real value for cross-table analysis."""
-
-        # Run Engineer (synchronous in background thread)
         response = engineer.run(prompt)
         content = response.content if response else ""
-
-        # Save Engineer's findings to knowledge
         if content:
             from agno.knowledge.reader.text_reader import TextReader
             try:
-                knowledge.insert(
-                    name=f"engineer-upload-analysis",
-                    text_content=f"Engineer Post-Upload Analysis:\n\n{content[:5000]}",
-                    reader=TextReader(),
-                    skip_if_exists=False,
-                )
+                knowledge.insert(name="engineer-upload-analysis", text_content=f"Engineer Analysis:\n\n{content[:5000]}", reader=TextReader(), skip_if_exists=False)
             except Exception:
                 pass
-
     except Exception as e:
         import logging
-        logging.getLogger("dash").warning(f"Post-upload engineer failed: {e}")
+        logging.getLogger("dash.upload").warning(f"Engineer agent failed: {e}")
 
 
 def _extract_document_structure(file_path: str, ext: str) -> list[dict]:
