@@ -3759,6 +3759,95 @@ def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_c
     return result
 
 
+def _ai_review_and_fix_table(project_slug: str, table_name: str, engine=None):
+    """AI reviews a stored table, detects issues, generates and runs SQL fixes.
+    No hardcoded rules — LLM decides what to clean based on actual data."""
+    schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+    if not engine:
+        engine = create_engine(db_url)
+    try:
+        # Read sample + stats for LLM
+        with engine.connect() as conn:
+            conn.execute(text(f"SET LOCAL search_path TO {schema}, public"))
+            # Sample rows
+            sample = conn.execute(text(f'SELECT * FROM "{table_name}" LIMIT 15')).fetchall()
+            cols = conn.execute(text(f'SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = :s AND table_name = :t ORDER BY ordinal_position'),
+                               {"s": schema, "t": table_name}).fetchall()
+            row_count = conn.execute(text(f'SELECT COUNT(*) FROM "{table_name}"')).scalar() or 0
+            # Per-column null counts
+            null_stats = []
+            for col_name, _ in cols:
+                null_count = conn.execute(text(f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_name}" IS NULL')).scalar() or 0
+                null_stats.append(f"{col_name}: {null_count}/{row_count} null ({round(null_count/max(row_count,1)*100)}%)")
+
+        # Build sample as text
+        col_names = [c[0] for c in cols]
+        sample_text = " | ".join(col_names) + "\n"
+        for row in sample[:10]:
+            sample_text += " | ".join(str(v)[:30] if v is not None else "NULL" for v in row) + "\n"
+
+        prompt = f"""You are a data quality expert. Review this table and fix any issues.
+
+TABLE: "{table_name}" in schema "{schema}" ({row_count} rows)
+
+COLUMNS + TYPES:
+{chr(10).join(f"  {c[0]} ({c[1]})" for c in cols)}
+
+NULL STATS:
+{chr(10).join(f"  {s}" for s in null_stats)}
+
+SAMPLE DATA (first 10 rows):
+{sample_text}
+
+FIND AND FIX these types of issues:
+1. Columns that should be forward-filled (value appears once then NULL for related rows — e.g. plant name, category)
+2. Values that are actually NULL but stored as text: "-", "–", "—", empty string, "N/A", "None"
+3. Header rows leaked into data (a row where a value equals the column name like "Products")
+4. Columns that should be numeric but are stored as text (have numbers as strings)
+5. Columns with a single value for all rows (useless, could note it)
+
+Return ONLY a valid JSON array of SQL UPDATE/DELETE statements to fix issues.
+Each fix should have "description" and "sql".
+If no issues found, return empty array [].
+
+Example:
+[
+  {{"description": "Forward-fill plant column where NULL", "sql": "UPDATE \\"{table_name}\\" SET plant = sub.plant FROM (SELECT ctid, plant FROM (SELECT ctid, plant, COALESCE(plant, LAG(plant) OVER (ORDER BY ctid)) as filled FROM \\"{table_name}\\") sub) sub WHERE \\"{table_name}\\".ctid = sub.ctid AND \\"{table_name}\\".plant IS NULL"}},
+  {{"description": "Clean dash values in output", "sql": "UPDATE \\"{table_name}\\" SET output = NULL WHERE output IN ('-', '–', '—', '')"}},
+  {{"description": "Remove header leak rows", "sql": "DELETE FROM \\"{table_name}\\" WHERE products = 'Products'"}}
+]
+
+Use schema "{schema}" in all SQL. Only return fixes you are confident about."""
+
+        from dash.settings import training_llm_call
+        raw = training_llm_call(prompt, "excel_analysis")
+        if not raw:
+            return []
+
+        fixes = json.loads(raw)
+        if not isinstance(fixes, list) or not fixes:
+            return []
+
+        # Execute each fix
+        applied = []
+        with engine.connect() as conn:
+            conn.execute(text(f"SET LOCAL search_path TO {schema}, public"))
+            for fix in fixes:
+                sql = fix.get("sql", "")
+                desc = fix.get("description", "")
+                if not sql:
+                    continue
+                try:
+                    conn.execute(text(sql))
+                    applied.append(desc)
+                except Exception as e:
+                    pass  # Skip failed fixes silently
+            conn.commit()
+        return applied
+    except Exception:
+        return []
+
+
 def _run_pandasai_experiments(project_slug: str, table_name: str, col_analyses: list[dict], _log=None):
     """Run SQL experiments to generate 25+ verified Q&A pairs from real data.
     Executes real SQL against PostgreSQL, saves question + verified answer.
@@ -3987,6 +4076,14 @@ def _post_upload_engineer(project_slug: str, tables_created: list[dict], user_id
                                 pass
                         conn.commit()
                     log.info(f"Post-upload MERGED: {group} → {merged_name} ({actual_rows} rows, health={profile.get('health', '?')}%)")
+
+                    # AI review and fix data quality issues
+                    try:
+                        fixes = _ai_review_and_fix_table(project_slug, merged_name, merge_engine)
+                        if fixes:
+                            log.info(f"Post-upload AI FIXES on {merged_name}: {fixes}")
+                    except Exception:
+                        pass
 
                     # Save source metadata for merged table
                     src_dir = KNOWLEDGE_DIR / project_slug / "table_sources"
@@ -4606,11 +4703,18 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                 "description": metadata.get("description", "") if isinstance(metadata, dict) else "",
             })
 
-        # Run YData Profiling for real health %
+        # Run profiling for real health %
         try:
             _profile_table(df, project or proj_schema, tbl)
         except Exception:
             pass
+
+        # AI review and fix data quality issues (LLM decides what to clean)
+        if proj_schema:
+            try:
+                _ai_review_and_fix_table(project or proj_schema, tbl)
+            except Exception:
+                pass
 
         queries_file = queries_dir / f"{tbl}_queries.sql"
         with open(queries_file, "w") as f:
