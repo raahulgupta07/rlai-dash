@@ -3217,12 +3217,19 @@ DETECT THESE PATTERNS:
 - Summary/total rows (Utilisation, Total) → skip_rows
 - Merged cells → forward_fill_columns
 - Empty sheets → "skip"
-- NEVER invent column names. Use the EXACT text from the header row, just cleaned for PostgreSQL:
-  "No of FFS machines" → "no_of_ffs_machines"
-  "Annual Capacity" → "annual_capacity"
-  "Products" → "products"
-  "Jul'21" → keep as "Jul'21" (readable for unpivot values)
-- column_names mapping: key=column index, value=cleaned REAL header text"""
+
+CRITICAL for "split" with multiple sub-tables in one sheet:
+- If sub-tables have SAME structure but different first column name (e.g. "No of FFS machines" vs "No of Spray Dryer" vs "No of Drum Roller"), these are the SAME table with different machine types
+- Use COMMON column names across all sub-tables: rename first column to generic name like "machine_count"
+- Add extra column to distinguish: "machine_type": "FFS" / "Spray Dryer" / "Drum Roller"
+- This way all sub-tables can be merged into ONE table later
+- In "tables" array for split, each sub-table should have: "extra": {"machine_type": "FFS", "unit": "Sachets"}
+
+Column naming rules:
+- Use EXACT text from header row, cleaned for PostgreSQL
+- "No of FFS machines" and "No of Spray Dryer" should BOTH become "machine_count" (standardized)
+- "Products" → "products", "SKU" → "sku", "Speed" → "speed"
+- column_names mapping: key=column index, value=cleaned standardized name"""
 
         raw = training_llm_call(prompt, "excel_analysis")
         if raw:
@@ -3415,6 +3422,15 @@ Return ONLY a JSON object mapping each period to its date:
                         if not data_rows:
                             continue
                         df = pd.DataFrame(data_rows, columns=headers[:len(df_raw.columns)])
+
+                        # Apply AI column_names mapping (standardize across sub-tables)
+                        col_names = sub.get("column_names", {})
+                        if col_names:
+                            new_cols = []
+                            for i, c in enumerate(df.columns):
+                                new_cols.append(col_names.get(str(i), str(c)))
+                            df.columns = new_cols
+
                         df = _clean_dataframe(df)
                         if len(df) == 0:
                             continue
@@ -3424,8 +3440,17 @@ Return ONLY a JSON object mapping each period to its date:
                         for col_idx in sub.get("forward_fill_columns", []):
                             if isinstance(col_idx, int) and col_idx < len(df.columns):
                                 df.iloc[:, col_idx] = df.iloc[:, col_idx].ffill()
+                        # Add extra columns (machine_type, unit, etc from AI plan)
+                        for k, v in sub.get("extra", {}).items():
+                            df[k] = v
+                        # Merge with existing table of same name (cross-sheet merge)
                         sheet_idx = sheet_names.index(sname) + 1 if sname in sheet_names else 0
-                        result["tables"].append({"name": tname, "df": df, "source": f"{sname} [split]", "sheet_number": sheet_idx, "description": sub.get("description", "")})
+                        existing = [t for t in result["tables"] if t["name"] == tname]
+                        if existing:
+                            existing[0]["df"] = pd.concat([existing[0]["df"], df], ignore_index=True)
+                            existing[0]["source"] += f" + {sname}"
+                        else:
+                            result["tables"].append({"name": tname, "df": df, "source": f"{sname} [split]", "sheet_number": sheet_idx, "description": sub.get("description", "")})
                     except Exception as e:
                         result["warnings"].append(f"Split table from '{sname}' failed: {e}")
             else:
