@@ -1,4 +1,4 @@
-from dash.settings import TRAINING_MODEL
+from dash.settings import LITE_MODEL
 """
 Meta-Learning
 =============
@@ -56,7 +56,7 @@ If no corrections: {{"corrections": []}}"""
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 300, "temperature": 0},
+            json={"model": LITE_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 300, "temperature": 0},
             timeout=15,
         )
         result = resp.json()

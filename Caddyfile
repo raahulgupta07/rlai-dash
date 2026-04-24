@@ -1,5 +1,13 @@
 {$DOMAIN:localhost} {
-    reverse_proxy dash-api:8000
+    request_body {
+        max_size 250MB
+    }
+    reverse_proxy dash-api:8000 {
+        transport http {
+            read_timeout 300s
+            write_timeout 300s
+        }
+    }
 
     header {
         X-Content-Type-Options "nosniff"

@@ -216,6 +216,49 @@ Always include the chart hint after the table. Example:
 [CHART:pie|title:Revenue Distribution by Region]
 ```
 
+## Analysis Tools — MANDATORY USAGE
+
+You have specialist analysis tools. You MUST use the matching tool when the question matches these patterns.
+Do NOT write raw SQL for these — the tools provide deeper analysis than manual SQL.
+
+MANDATORY tool usage (call the tool, do not skip):
+- Compare / vs / period / month / year → MUST call comparator_analysis
+- Why / caused / reason / dropped / increased → MUST call diagnostic_analysis
+- Summary / board update / overview / executive → MUST call narrator_analysis
+- Data quality / issues / check / validate → MUST call validator_analysis
+- What if / scenario / close / change → MUST call planner_analysis
+- Trend / over time / monthly / growth rate → MUST call trend_analysis
+- Top / drivers / 80/20 / pareto / biggest → MUST call pareto_analysis
+- Unusual / anomaly / outlier / strange → MUST call anomaly_analysis
+- Compare to average / benchmark / rank → MUST call benchmark_analysis
+- Root cause / drill down / decompose → MUST call root_cause_analysis
+- Recommend / should / action / improve → MUST call prescriptive_analysis
+
+ONLY use raw run_sql for simple direct questions like:
+- "Show me the data" / "List all records" / "How many rows" / "What tables do we have"
+
+When in doubt, USE THE TOOL. The tools provide better formatting, comparisons, and insights than raw SQL.
+
+## Deep Context (on-demand)
+Call `load_context(topic, project_slug)` when you need MORE detail than the summary above provides:
+  • "formulas" — all formulas with SQL examples + column mapping
+  • "aliases" — all entity aliases + which columns/tables contain them
+  • "thresholds" — all targets + alert rules + flag SQL (CASE WHEN)
+  • "patterns" — proven SQL from past successful queries
+  • "domain" — full glossary + calendar + best practices
+  • "quality" — known data issues per table + NULL handling
+  • "relationships" — all table joins + cardinality
+  • "documents" — document summaries + key excerpts
+  • "corrections" — past mistakes + what fixed them
+  • "org" — company structure + brand hierarchy
+Only load what you need. For simple queries, the summary above is sufficient.
+
+## Visualization
+After getting data results, ALWAYS call `auto_visualize` to generate the best chart.
+The Visualization Agent auto-detects the right chart type (bar, line, pie, scatter, KPI cards).
+You do NOT need to choose the chart type — the Visualizer handles it.
+Just pass the question and project slug.
+
 ## Analysis Frameworks
 
 Auto-detect the analysis type from the question and apply the right framework:
@@ -519,6 +562,25 @@ def build_leader_instructions(user_id: str | None = None, project_slug: str | No
                     f"- NEVER say 'I need more context' — the Researcher has all the content\n"
                 )
 
+    # Inject knowledge graph context for leader
+    if project_slug:
+        try:
+            from dash.tools.knowledge_graph import get_knowledge_graph_context
+            kg_context = get_knowledge_graph_context(project_slug, for_agent="leader")
+            if kg_context:
+                instructions += "\n\n" + kg_context
+        except Exception:
+            pass
+
+    # Company Brain context for Leader
+    try:
+        from app.brain import get_brain_context
+        brain_ctx = get_brain_context(for_agent="leader")
+        if brain_ctx:
+            instructions += "\n\n" + brain_ctx
+    except Exception:
+        pass
+
     if SLACK_TOKEN:
         instructions += SLACK_LEADER_INSTRUCTIONS
     else:
@@ -714,6 +776,17 @@ def _build_self_learning_context(project_slug: str, actual_user_id: int | None =
                     lines.append(f"- {m[0]}")
                 lines.append("")
 
+            # Grounded facts from LangExtract (source-verified, prefer over unverified memories)
+            grounded = conn.execute(sa_text(
+                "SELECT fact FROM public.dash_memories WHERE project_slug = :s AND source = 'langextract' AND (archived IS NULL OR archived = FALSE) ORDER BY created_at DESC LIMIT 15"
+            ), {"s": project_slug}).fetchall()
+            if grounded:
+                lines.append("## GROUNDED FACTS (source-verified from documents)\n")
+                lines.append("These facts were extracted with source grounding. Prefer these over unverified information.\n")
+                for g in grounded:
+                    lines.append(f"- {g[0]}")
+                lines.append("")
+
             # Human annotations (override column descriptions)
             annotations = conn.execute(sa_text(
                 "SELECT table_name, column_name, annotation FROM public.dash_annotations WHERE project_slug = :s"
@@ -793,6 +866,24 @@ def _build_self_learning_context(project_slug: str, actual_user_id: int | None =
                 lines.append(evolved[0])
                 lines.append("")
 
+    except Exception:
+        pass
+
+    # Knowledge Graph context
+    try:
+        from dash.tools.knowledge_graph import get_knowledge_graph_context
+        kg_context = get_knowledge_graph_context(project_slug, for_agent="analyst")
+        if kg_context:
+            lines.append(kg_context)
+    except Exception:
+        pass
+
+    # ── 13. Company Brain ──
+    try:
+        from app.brain import get_brain_context
+        brain_ctx = get_brain_context(for_agent="analyst")
+        if brain_ctx:
+            lines.append(brain_ctx)
     except Exception:
         pass
 

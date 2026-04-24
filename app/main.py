@@ -34,7 +34,7 @@ except ImportError:
 from dash.agents.analyst import analyst
 from dash.agents.engineer import engineer
 from dash.agents.researcher import researcher
-from dash.settings import SLACK_SIGNING_SECRET, SLACK_TOKEN, TRAINING_MODEL, dash_knowledge, dash_learnings
+from dash.settings import SLACK_SIGNING_SECRET, SLACK_TOKEN, TRAINING_MODEL, LITE_MODEL, dash_knowledge, dash_learnings
 from dash.team import dash
 from db import get_postgres_db, db_url
 from sqlalchemy import create_engine as _sa_create_engine, text as sa_text
@@ -94,6 +94,17 @@ async def lifespan(app):  # type: ignore[no-untyped-def]
         raise RuntimeError("OPENROUTER_API_KEY environment variable is required")
     from app.auth import init_auth
     init_auth()
+    from app.sharepoint import init_sharepoint
+    init_sharepoint()
+    from app.connectors import init_connectors
+    init_connectors()
+    from app.gdrive import init_gdrive
+    init_gdrive()
+    try:
+        from app.brain import init_brain
+        init_brain()
+    except ImportError:
+        pass
     _register_schedules()
     yield
 
@@ -140,6 +151,13 @@ from app.scores import router as scores_router
 from app.export import router as export_router
 from app.schedules import router as schedules_router
 from app.learning import router as learning_router
+from app.sharepoint import router as sharepoint_router
+from app.connectors import router as connectors_router
+from app.gdrive import router as gdrive_router
+try:
+    from app.brain import router as brain_router
+except ImportError:
+    brain_router = None
 
 app.include_router(auth_router)
 app.include_router(projects_router)
@@ -151,6 +169,11 @@ app.include_router(scores_router)
 app.include_router(export_router)
 app.include_router(schedules_router)
 app.include_router(learning_router)
+app.include_router(sharepoint_router)
+app.include_router(connectors_router)
+app.include_router(gdrive_router)
+if brain_router is not None:
+    app.include_router(brain_router)
 
 # ---------------------------------------------------------------------------
 # CORS Middleware (production)
@@ -188,7 +211,7 @@ from starlette.responses import JSONResponse
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    SKIP_PATHS = {"/health", "/", "/info", "/config", "/api/auth/login", "/api/auth/register"}
+    SKIP_PATHS = {"/health", "/", "/info", "/config", "/api/auth/login", "/api/auth/register", "/api/sharepoint/callback", "/api/gdrive/callback"}
     SKIP_PREFIXES = ("/ui", "/docs", "/openapi.json", "/redoc")
 
     async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
@@ -348,25 +371,48 @@ _DEEP_KEYWORDS = _re.compile(
     r'what should|how can|investigate|diagnose|root cause)\b', _re.IGNORECASE
 )
 
+# Smart routing: detect if question needs data, context, or BOTH
+_DATA_KEYWORDS = _re.compile(
+    r'\b(how many|total|count|sum|average|revenue|sales|amount|cost|growth|'
+    r'margin|budget|show me|list|top \d|trend|forecast|predict)\b', _re.IGNORECASE
+)
+_CONTEXT_KEYWORDS = _re.compile(
+    r'\b(why|what caused|context|document|slide|pptx|pdf|report|presentation|'
+    r'according to|what did|summary|narrative|board|executive|explain why|'
+    r'reason|background|mentioned|decision|risk)\b', _re.IGNORECASE
+)
+
+
+def _detect_routing_hint(message: str) -> str:
+    """Detect if question needs data agent, context agent, or BOTH.
+    Returns: 'data', 'context', or 'both'."""
+    has_data = bool(_DATA_KEYWORDS.search(message))
+    has_context = bool(_CONTEXT_KEYWORDS.search(message))
+    if has_data and has_context:
+        return "both"
+    if has_context and not has_data:
+        return "context"
+    return "data"  # default: most questions need data
+
 
 def _apply_reasoning_mode(message: str, mode: str, analysis_type: str = "auto") -> str:
     """Apply FAST/DEEP reasoning + analysis type. Called server-side."""
     parts = []
 
-    # Analysis type instruction
+    # Analysis type → TOOL CALL instruction (forces Analyst to use the right specialist tool)
     if analysis_type and analysis_type != "auto":
         type_instructions = {
-            "descriptive": "Provide a descriptive analysis: answer the question directly with key metrics and a clean data table.",
-            "diagnostic": "Provide a diagnostic analysis: decompose the metric into sub-dimensions, find what's driving the result, and explain WHY with SO WHAT for each finding.",
-            "comparative": "Provide a comparative analysis: show side-by-side comparison with deltas, percentage changes, and identify the winner/loser.",
-            "trend": "Provide a trend analysis: show the metric over time, calculate rate of change, identify inflection points and direction.",
-            "predictive": "Provide a predictive analysis: calculate the current growth rate, extrapolate forward, and show projected values with confidence level.",
-            "prescriptive": "Provide a prescriptive analysis: analyze the data, then give 3 specific actionable recommendations with expected quantified impact.",
-            "anomaly": "Provide an anomaly analysis: establish the normal pattern, identify what's unusual, quantify the deviation, and explain why it matters.",
-            "root_cause": "Provide a root cause analysis: start with the top-level metric, decompose into dimensions, drill down until you isolate the specific cause.",
-            "pareto": "Provide a Pareto analysis: sort by impact, calculate cumulative percentage, identify what drives 80% of the result.",
-            "scenario": "Provide a scenario analysis: show current state, then model base case (60%), upside (25%), and downside (15%) with quantified impact.",
-            "benchmark": "Provide a benchmark analysis: calculate the metric, compare to the overall average, and show the gap.",
+            "descriptive": "ANALYSIS TYPE: DESCRIPTIVE. Answer directly with key metrics and a clean data table. Use run_sql to query the data. Keep it concise. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "diagnostic": "ANALYSIS TYPE: DIAGNOSTIC. You MUST call the diagnostic_analysis tool to decompose the metric into sub-dimensions and find what's driving the result. Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "comparative": "ANALYSIS TYPE: COMPARATIVE. You MUST call the comparator_analysis tool to show period-over-period comparison with MoM and YoY deltas. Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "trend": "ANALYSIS TYPE: TREND. You MUST call the trend_analysis tool to show the metric over time with moving averages and direction detection. Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "predictive": "ANALYSIS TYPE: PREDICTIVE. You MUST call the run_forecast tool to generate a time-series forecast with confidence intervals. If run_forecast is not available, use trend_analysis and extrapolate. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "prescriptive": "ANALYSIS TYPE: PRESCRIPTIVE. You MUST call the prescriptive_analysis tool to generate actionable recommendations with expected quantified impact. Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "anomaly": "ANALYSIS TYPE: ANOMALY. You MUST call the anomaly_analysis tool to detect Z-score outliers across numeric columns. Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "root_cause": "ANALYSIS TYPE: ROOT CAUSE. You MUST call the root_cause_analysis tool to iteratively drill down from top-level metric to specific cause. Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "pareto": "ANALYSIS TYPE: PARETO. You MUST call the pareto_analysis tool to sort by impact and calculate cumulative percentage (80/20 rule). Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "scenario": "ANALYSIS TYPE: SCENARIO. You MUST call the planner_analysis tool to model base case (60%), upside (25%), and downside (15%) scenarios. Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
+            "benchmark": "ANALYSIS TYPE: BENCHMARK. You MUST call the benchmark_analysis tool to compare entities against the group average. Pass the user's question and project slug. After getting the tool result, format the response with [KPI:...] tags for key metrics and [CONFIDENCE:...] tag.",
         }
         if analysis_type in type_instructions:
             parts.append(type_instructions[analysis_type])
@@ -390,7 +436,21 @@ def _apply_reasoning_mode(message: str, mode: str, analysis_type: str = "auto") 
             "Do NOT write executive summary, findings, recommendations, scenarios, or next steps. "
             "Do NOT explain your methodology. "
             "Do NOT show SOURCES section. "
-            "Include [MODE:fast] at the start of your response."
+            "Include [MODE:fast] at the start of your response. "
+            "Output these structured tags for the frontend to render (the frontend will parse and display them visually): "
+            "- At the very start: [CONFIDENCE:HIGH] or [CONFIDENCE:MEDIUM] or [CONFIDENCE:LOW] based on data quality. "
+            "- For key metrics, output one line per metric: [KPI:value|label|change_vs_previous] "
+            "Example: [KPI:578|Total Calls|+56% vs Apr] "
+            "Example: [KPI:80.3%|Top 4 Coverage|] "
+            "Output 2-4 KPI lines for the most important numbers. "
+            "- In tables, add a TREND column showing direction vs previous period: ▲ +5%, ▼ -2%, ━ 0%. "
+            "- At the end before SOURCES, add: [IMPACT:percentage|recovered|total] "
+            "Example: [IMPACT:49%|285|578] means 'if addressed, could recover 285 out of 578'. "
+            "- Keep SOURCES section with Tables:, Rules applied:, Confidence: as today. "
+            "- After feedback section, add 3 related follow-up questions prefixed with [RELATED:] "
+            "Example: [RELATED:Compare to April data] "
+            "Example: [RELATED:Break down by city] "
+            "Example: [RELATED:Show successful call reasons]"
         )
     else:
         parts.append(
@@ -403,15 +463,36 @@ def _apply_reasoning_mode(message: str, mode: str, analysis_type: str = "auto") 
             "5. NEXT STEPS (3-4 specific follow-up questions) "
             "Think and write like a McKinsey senior consultant. "
             "Every number must have context (vs last period, vs average, vs total). "
-            "Include [MODE:deep] at the start of your response."
+            "Include [MODE:deep] at the start of your response. "
+            "Output these structured tags for the frontend to render: "
+            "- At the very start: [CONFIDENCE:HIGH] or [CONFIDENCE:VERY HIGH] based on cross-validation. "
+            "- For key metrics: [KPI:value|label|change_vs_previous] Output 3-5 KPI lines. "
+            "- In tables, add a TREND column: ▲ +5%, ▼ -2%, ━ 0%. "
+            "- Each KEY FINDING must have its own SO WHAT paragraph explaining why it matters. "
+            "- RECOMMENDATIONS must include: expected impact, cost level (low/medium/high), timeline. "
+            "- After SCENARIOS section, add NEXT STEPS as checkbox items: □ action item. "
+            "- Before SOURCES, add: [IMPACT:percentage|recovered|total]. "
+            "- Add [RELATED:question] for 3 deep follow-up questions."
         )
 
     return " ".join(parts) + f"\n\nQuestion: {message}"
 
 
-def _smart_route(message: str, projects: list[dict]) -> dict | None:
-    """Pick the best project for a question using keyword matching + LLM fallback."""
+def _smart_route(message: str, projects: list[dict], session_id: str | None = None) -> dict | None:
+    """Pick the best project for a question using keyword matching + LLM fallback.
+
+    Routing signals (in priority order):
+    1. Explicit agent/project name mention → score 10/8
+    2. Table name match → score 5
+    3. Column name match → score 3 (e.g., "revenue" matches total_revenue column)
+    4. Persona/domain keyword match → score 2 (e.g., "factory" for manufacturing project)
+    5. Role keyword match → score 2
+    6. Session continuity → score 4 (if last message went to same project)
+    7. LLM fallback → picks from catalog with table+column context
+    """
     msg_lower = message.lower()
+    # Tokenize message for word-level matching
+    msg_words = set(msg_lower.replace(",", " ").replace("?", " ").replace(".", " ").split())
 
     # Check if it's a general question (no project needed)
     general_patterns = ['who are you', 'what can you do', 'hello', 'hi ', 'hey', 'help',
@@ -419,40 +500,94 @@ def _smart_route(message: str, projects: list[dict]) -> dict | None:
     if any(msg_lower.startswith(p) or msg_lower.strip() == p.strip() for p in general_patterns):
         return None
 
-    # Step 1: Keyword matching — check if question mentions project tables or agent name
+    # Step 0: Session continuity — check what project the last message was routed to
+    last_routed_slug = None
+    if session_id:
+        try:
+            from sqlalchemy import text as sa_text
+            from db import get_sql_engine
+            _eng = get_sql_engine()
+            with _eng.connect() as conn:
+                row = conn.execute(sa_text(
+                    "SELECT project_slug FROM public.dash_chat_sessions "
+                    "WHERE session_id = :sid ORDER BY updated_at DESC LIMIT 1"
+                ), {"sid": session_id}).fetchone()
+                if row and row[0]:
+                    last_routed_slug = row[0]
+        except Exception:
+            pass
+
+    # Step 1: Multi-signal keyword scoring
     scores = []
     for p in projects:
         score = 0
+        reasons = []
         # Match agent name
-        if p["agent_name"].lower().replace(" agent", "") in msg_lower:
+        agent_clean = p["agent_name"].lower().replace(" agent", "").strip()
+        if agent_clean and agent_clean in msg_lower:
             score += 10
+            reasons.append(f"agent name '{agent_clean}'")
         # Match project name
-        if p["name"].lower().replace(" demo", "") in msg_lower:
+        proj_clean = p["name"].lower().replace(" demo", "").strip()
+        if proj_clean and len(proj_clean) > 2 and proj_clean in msg_lower:
             score += 8
+            reasons.append(f"project name '{proj_clean}'")
         # Match table names
         for t in p.get("tables", []):
-            if t.lower() in msg_lower:
+            tl = t.lower()
+            if tl in msg_lower:
                 score += 5
-            # Match partial table name (e.g. "invoice" matches "invoices")
-            if len(t) > 3 and t.lower().rstrip('s') in msg_lower:
+                reasons.append(f"table '{t}'")
+            elif len(tl) > 3 and tl.rstrip('s') in msg_lower:
                 score += 3
+                reasons.append(f"partial table '{t}'")
+        # Match column names (new: e.g., "revenue" matches total_revenue)
+        for col in p.get("columns", []):
+            col_lower = col.lower()
+            # Exact word match (avoid substring false positives)
+            col_words = col_lower.replace("_", " ").split()
+            matched_col_words = [w for w in col_words if len(w) > 3 and w in msg_words]
+            if matched_col_words:
+                score += 3
+                reasons.append(f"column '{col}'")
+                break  # Don't over-count columns
+        # Match persona/domain keywords
+        for kw in p.get("persona_keywords", []):
+            if kw in msg_words:
+                score += 2
+                reasons.append(f"domain '{kw}'")
+                if score > 20:
+                    break  # Cap persona contribution
         # Match role keywords
         if p.get("agent_role"):
             role_words = [w for w in p["agent_role"].lower().split() if len(w) > 3]
             for w in role_words:
-                if w in msg_lower:
+                if w in msg_words:
                     score += 2
-        scores.append((p, score))
+                    reasons.append(f"role '{w}'")
+                    break
+        # Session continuity bonus
+        if last_routed_slug and p["slug"] == last_routed_slug:
+            score += 4
+            reasons.append("session continuity")
+        scores.append((p, score, reasons))
 
     scores.sort(key=lambda x: x[1], reverse=True)
 
-    # If clear winner with score >= 3, use it
+    # If clear winner with score >= 3, AND not a tie (>2 point gap), use it
     if scores and scores[0][1] >= 3:
-        winner = scores[0][0]
-        winner["reason"] = f"keyword match (score: {scores[0][1]})"
-        return winner
+        is_tie = len(scores) > 1 and (scores[0][1] - scores[1][1]) <= 2 and scores[1][1] >= 3
+        if not is_tie:
+            winner = scores[0][0]
+            top_reasons = scores[0][2][:3]
+            winner["reason"] = f"matched: {', '.join(top_reasons)} (score: {scores[0][1]})"
+            return winner
+        # Tie detected — fall through to LLM for disambiguation
+        # Only send tied candidates to LLM for faster response
+        tie_threshold = scores[0][1] - 2
+        projects = [p for p, s, _ in scores if s >= tie_threshold]
 
-    # Step 2: LLM routing for ambiguous questions
+    # Step 2: LLM routing for ambiguous questions (also handles ties)
     try:
         import json as _json
         from os import getenv
@@ -465,7 +600,14 @@ def _smart_route(message: str, projects: list[dict]) -> dict | None:
         catalog = []
         for p in projects:
             tables_str = ", ".join(p["tables"][:10]) if p["tables"] else "no tables"
-            catalog.append(f"- slug: {p['slug']} | agent: {p['agent_name']} | role: {p.get('agent_role', '')} | tables: {tables_str}")
+            cols_str = ", ".join(set(p.get("columns", [])[:15])) if p.get("columns") else ""
+            domain_str = ", ".join(p.get("persona_keywords", [])[:8])
+            line = f"- slug: {p['slug']} | agent: {p['agent_name']} | role: {p.get('agent_role', '')} | tables: {tables_str}"
+            if cols_str:
+                line += f" | columns: {cols_str}"
+            if domain_str:
+                line += f" | domain: {domain_str}"
+            catalog.append(line)
 
         prompt = f"""Pick the BEST project to answer this question. If this is a greeting or general question, respond with "none".
 
@@ -479,7 +621,7 @@ Respond with ONLY valid JSON: {{"slug": "the_slug_or_none", "reason": "brief rea
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 80, "temperature": 0},
+            json={"model": LITE_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 80, "temperature": 0},
             timeout=20,
         )
         result = resp.json()
@@ -505,6 +647,84 @@ Respond with ONLY valid JSON: {{"slug": "the_slug_or_none", "reason": "brief rea
             return scores[0][0]
 
     return None
+
+
+def _route_message(message: str, projects: list[dict], session_id: str | None = None) -> dict | None:
+    """2-tier routing: keyword pre-filter → Router Agent for ambiguous cases.
+
+    Tier 1: Fast keyword scoring (same as _smart_route, < 10ms, $0)
+    Tier 2: Router Agent with tools (LITE_MODEL, < 1.5s, ~$0.001)
+    """
+    msg_lower = message.lower()
+
+    # General question check (instant)
+    general_patterns = ['who are you', 'what can you do', 'hello', 'hi ', 'hey', 'help',
+                        'what are you', 'introduce', 'thanks', 'thank you', 'bye']
+    if any(msg_lower.startswith(p) or msg_lower.strip() == p.strip() for p in general_patterns):
+        return None
+
+    # Tier 1: Keyword pre-filter (reuse _smart_route logic)
+    # Run keyword scoring from _smart_route
+    result = _smart_route(message, projects, session_id=session_id)
+
+    # Check if it was a clear win (score gap >= 5) or if _smart_route already used LLM
+    # If _smart_route returned a result, check if the reason indicates it was a keyword match with high score
+    if result:
+        reason = result.get("reason", "")
+        # If keyword match with high score (>= 8), trust it
+        import re
+        score_match = re.search(r'score:\s*(\d+)', reason)
+        if score_match and int(score_match.group(1)) >= 8:
+            return result
+        # If it was already LLM-routed, trust it
+        if "LLM:" in reason:
+            return result
+
+    # Tier 2: Router Agent for ambiguous/low-confidence cases
+    try:
+        from dash.agents.router import create_router_agent
+        import json as _json
+
+        router = create_router_agent(projects, session_id=session_id)
+
+        # Run synchronously with timeout
+        import asyncio
+        import concurrent.futures
+
+        response = router.run(message)
+        content = response.content if hasattr(response, 'content') else str(response)
+
+        # Parse JSON from response
+        # Strip markdown fences if present
+        content = content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        if content.startswith("json"):
+            content = content[4:].strip()
+
+        parsed = _json.loads(content)
+        slugs = parsed.get("slugs", [])
+        reason = parsed.get("reason", "Router Agent")
+        confidence = parsed.get("confidence", "medium")
+
+        if not slugs:
+            return None  # General question
+
+        # Find matching project
+        primary_slug = slugs[0]
+        matched = [p for p in projects if p["slug"] == primary_slug]
+        if matched:
+            result = matched[0].copy()
+            result["reason"] = f"Router: {reason} (confidence: {confidence})"
+            if len(slugs) > 1:
+                result["multi_slugs"] = slugs
+            return result
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Router Agent failed: {e}")
+
+    # Fallback: return whatever _smart_route found (even if low confidence)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -537,8 +757,25 @@ async def super_chat(request: Request):
         from fastapi import HTTPException
         raise HTTPException(413, "Message too long (max 50000 chars)")
 
-    # Apply reasoning mode (backend detection)
-    context_msg = _apply_reasoning_mode(message, reasoning, analysis_type)
+    # Apply reasoning mode — build as SYSTEM instruction, not user message
+    reasoning_instructions = _apply_reasoning_mode("", reasoning, analysis_type)
+
+    # Smart routing hint
+    routing_hint = _detect_routing_hint(message)
+    if routing_hint == "both":
+        reasoning_instructions = (
+            "[ROUTING: This question needs BOTH data AND context. "
+            "Ask Analyst for numbers/SQL AND Researcher for document context. "
+            "Merge both answers into a comprehensive response.]\n\n" + reasoning_instructions
+        )
+    elif routing_hint == "context":
+        reasoning_instructions = (
+            "[ROUTING: This question is about context/documents. "
+            "Ask Researcher first. Only involve Analyst if specific numbers are needed.]\n\n" + reasoning_instructions
+        )
+
+    # User message stays CLEAN (no system prompt prepended)
+    context_msg = message
 
     # Load user's projects for routing
     from dash.team import _load_user_projects, create_project_team
@@ -567,7 +804,7 @@ async def super_chat(request: Request):
         from dash.team import create_team
         team = create_team(user_id=str(user.get("user_id", "")))
         project_info = "You have no projects yet. Go to /ui/projects to create one and upload data."
-        context_msg = f"[CONTEXT: {project_info}]\n\nUser: {context_msg}"
+        reasoning_instructions += f"\n[CONTEXT: {project_info}]"
         routing_info = {"routed_to": "Dash Agent", "slug": None, "reason": "no projects"}
     elif len(all_projects) == 1:
         # Only one project — route directly
@@ -579,7 +816,7 @@ async def super_chat(request: Request):
         routing_info = {"routed_to": p["agent_name"], "slug": p["slug"], "reason": "only project"}
     else:
         # Multiple projects — smart routing
-        target = _smart_route(message, all_projects)
+        target = _route_message(message, all_projects, session_id=session_id)
         if target:
             team = create_project_team(
                 project_slug=target["slug"], agent_name=target["agent_name"], agent_role=target["agent_role"],
@@ -591,10 +828,32 @@ async def super_chat(request: Request):
             from dash.team import create_team
             team = create_team(user_id=str(user.get("user_id", "")))
             agents_list = ", ".join(f"{p['agent_name']} ({', '.join(p['tables'][:5])})" for p in all_projects)
-            context_msg = f"[CONTEXT: User has these data agents: {agents_list}. Help them use the right agent.]\n\nUser: {context_msg}"
+            reasoning_instructions += f"\n[CONTEXT: User has these data agents: {agents_list}. Help them use the right agent.]"
             routing_info = {"routed_to": "Dash Agent", "slug": None, "reason": "general question"}
 
     routed_slug = routing_info.get("slug")  # Which project was routed to (None for general)
+
+    # Update session with routed project slug (for session continuity)
+    if routed_slug and session_id:
+        try:
+            from sqlalchemy import text as sa_text
+            from db import get_sql_engine
+            _eng = get_sql_engine()
+            with _eng.connect() as conn:
+                conn.execute(sa_text(
+                    "UPDATE public.dash_chat_sessions SET project_slug = :slug, updated_at = NOW() "
+                    "WHERE session_id = :sid"
+                ), {"slug": routed_slug, "sid": session_id})
+                conn.commit()
+        except Exception:
+            pass
+
+    # Inject reasoning/analysis instructions into team (NOT into user message)
+    if reasoning_instructions.strip():
+        existing = team.instructions or ""
+        if isinstance(existing, list):
+            existing = "\n".join(existing)
+        team.instructions = existing + "\n\n" + reasoning_instructions
 
     def _run_super_bg(question: str, answer: str):
         """Run self-learning background tasks for the routed project."""
@@ -631,12 +890,40 @@ async def super_chat(request: Request):
             except Exception as e:
                 import logging
                 logging.error(f"Background task meta_learning failed for {routed_slug}: {e}")
+            # Continuous KG learning — extract triples from every chat
+            try:
+                from dash.tools.knowledge_graph import extract_chat_triples
+                extract_chat_triples(routed_slug, question, answer)
+            except Exception as e:
+                import logging
+                logging.error(f"Background task chat_triples failed for {routed_slug}: {e}")
+            # Auto-memory promotion — save facts without approval
+            try:
+                from dash.tools.knowledge_graph import auto_promote_facts
+                auto_promote_facts(routed_slug, question, answer)
+            except Exception as e:
+                import logging
+                logging.error(f"Background task auto_promote failed for {routed_slug}: {e}")
+            # Rich user preference tracking
+            try:
+                from dash.tools.knowledge_graph import track_user_preferences
+                track_user_preferences(routed_slug, user.get("user_id"), question, answer)
+            except Exception:
+                pass
+            # Episodic memory — save user reactions as events
+            try:
+                from dash.tools.knowledge_graph import extract_episodic_memory
+                extract_episodic_memory(routed_slug, question, answer)
+            except Exception:
+                pass
         _bg_executor.submit(_bg)
 
     if stream:
         def event_generator():
             import time
             yield f"event: Routing\ndata: {_json.dumps(routing_info, default=str)}\n\n"
+            # Send original message so frontend shows clean question (not system prompt)
+            yield f"event: OriginalMessage\ndata: {_json.dumps({'message': message}, default=str)}\n\n"
             full_content = []
             _stream_start = time.time()
             try:

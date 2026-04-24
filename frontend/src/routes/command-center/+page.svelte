@@ -20,6 +20,7 @@
     { id: 'chatLogs', label: 'CHAT LOGS' },
     { id: 'health',   label: 'HEALTH' },
     { id: 'stats',    label: 'STATS' },
+    { id: 'integrations', label: 'INTEGRATIONS' },
   ];
 
   /* ─── USERS state ─── */
@@ -67,6 +68,72 @@
   /* ─── STATS state ─── */
   let stats = $state<any>(null);
 
+  /* ─── INTEGRATIONS state ─── */
+  let spAdminConfig = $state<any>({});
+  let spAdminSaving = $state(false);
+  let spAdminMsg = $state('');
+  let spAdminClientId = $state('');
+  let spAdminClientSecret = $state('');
+  let spAdminTenantId = $state('');
+  let spAllSources = $state<any[]>([]);
+
+  let gdAdminClientId = $state('');
+  let gdAdminClientSecret = $state('');
+  let gdAdminConfig = $state<any>({});
+  let gdAdminSaving = $state(false);
+  let gdAdminMsg = $state('');
+  let dbAllSources = $state<any[]>([]);
+
+  // DB connector form (admin can connect to any project)
+  let dbAdminStep = $state<'idle' | 'form' | 'tables'>('idle');
+  let dbAdminType = $state('postgresql');
+  let dbAdminHost = $state('');
+  let dbAdminPort = $state('5432');
+  let dbAdminUser = $state('');
+  let dbAdminPass = $state('');
+  let dbAdminName = $state('');
+  let dbAdminProject = $state('');
+  let dbAdminTesting = $state(false);
+  let dbAdminTestResult = $state<any>(null);
+  let dbAdminTables = $state<any[]>([]);
+  let dbAdminSelectedTables = $state<string[]>([]);
+  let dbAdminConnecting = $state(false);
+  let dbAdminMsg2 = $state('');
+
+  async function dbAdminTest() {
+    dbAdminTesting = true; dbAdminTestResult = null;
+    try {
+      const r = await fetch('/api/connectors/test', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: dbAdminHost, port: parseInt(dbAdminPort), username: dbAdminUser, password: dbAdminPass, database: dbAdminName, db_type: dbAdminType })
+      });
+      dbAdminTestResult = await r.json();
+      if (dbAdminTestResult.tables) { dbAdminTables = dbAdminTestResult.tables; dbAdminStep = 'tables'; }
+    } catch { dbAdminTestResult = { error: 'Connection failed' }; }
+    dbAdminTesting = false;
+  }
+  async function dbAdminConnect() {
+    if (!dbAdminProject) { dbAdminMsg2 = 'Select a project first'; return; }
+    dbAdminConnecting = true; dbAdminMsg2 = '';
+    try {
+      const r = await fetch('/api/connectors/connect', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_slug: dbAdminProject, host: dbAdminHost, port: parseInt(dbAdminPort),
+          username: dbAdminUser, password: dbAdminPass, database: dbAdminName,
+          db_type: dbAdminType, selected_tables: dbAdminSelectedTables, sync_schedule: 'manual',
+        })
+      });
+      if (r.ok) {
+        dbAdminMsg2 = `Connected ${dbAdminSelectedTables.length} tables to ${dbAdminProject}!`;
+        dbAdminStep = 'idle'; dbAdminHost = ''; dbAdminUser = ''; dbAdminPass = ''; dbAdminName = '';
+        dbAdminSelectedTables = []; dbAdminTables = [];
+        tabLoaded['integrations'] = false; await loadIntegrations();
+      } else { const d = await r.json(); dbAdminMsg2 = d.detail || 'Failed'; }
+    } catch { dbAdminMsg2 = 'Failed'; }
+    dbAdminConnecting = false;
+  }
+
   /* ─── tab switch loader ─── */
   let tabLoaded = $state<Record<string, boolean>>({});
   let tabData = $state<Record<string, any>>({});
@@ -84,6 +151,7 @@
       if (id === 'chatLogs') await loadChatLogs();
       if (id === 'health')   await loadHealth();
       if (id === 'stats')    await loadStats();
+      if (id === 'integrations') await loadIntegrations();
     } catch {}
     loading = false;
   }
@@ -193,6 +261,81 @@
       const res = await fetch('/api/auth/admin/stats', { headers: _h() });
       if (res.ok) stats = await res.json();
     } catch {}
+  }
+
+  async function loadIntegrations() {
+    try {
+      const res = await fetch('/api/sharepoint/admin/config', { headers: _h() });
+      if (res.ok) {
+        const d = await res.json();
+        spAdminConfig = d;
+        spAdminClientId = d.client_id || '';
+        spAdminClientSecret = '';
+        spAdminTenantId = d.tenant_id || '';
+        spAllSources = d.sources || [];
+      }
+    } catch {}
+    try {
+      const res = await fetch('/api/gdrive/admin/config', { headers: _h() });
+      if (res.ok) {
+        const d = await res.json();
+        gdAdminConfig = d;
+        gdAdminClientId = d.client_id || '';
+        gdAdminClientSecret = '';
+      }
+    } catch {}
+    try {
+      const res = await fetch('/api/connectors/admin/sources', { headers: _h() });
+      if (res.ok) {
+        const d = await res.json();
+        dbAllSources = d.sources || d || [];
+      }
+    } catch {}
+    // Load projects for DB connector project picker
+    if (!projects.length) await loadProjects();
+  }
+
+  async function saveSharePointConfig() {
+    spAdminSaving = true; spAdminMsg = '';
+    try {
+      const res = await fetch('/api/sharepoint/admin/config', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: spAdminClientId,
+          client_secret: spAdminClientSecret,
+          tenant_id: spAdminTenantId,
+        })
+      });
+      if (res.ok) {
+        spAdminMsg = 'Saved! Restart Docker for changes to take effect.';
+        spAdminClientSecret = '';
+      } else {
+        const d = await res.json();
+        spAdminMsg = d.detail || 'Failed to save';
+      }
+    } catch { spAdminMsg = 'Failed to save'; }
+    spAdminSaving = false;
+  }
+
+  async function saveGDriveConfig() {
+    gdAdminSaving = true; gdAdminMsg = '';
+    try {
+      const res = await fetch('/api/gdrive/admin/config', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: gdAdminClientId,
+          client_secret: gdAdminClientSecret,
+        })
+      });
+      if (res.ok) {
+        gdAdminMsg = 'Saved! Restart Docker for changes to take effect.';
+        gdAdminClientSecret = '';
+      } else {
+        const d = await res.json();
+        gdAdminMsg = d.detail || 'Failed to save';
+      }
+    } catch { gdAdminMsg = 'Failed to save'; }
+    gdAdminSaving = false;
   }
 
   /* ─── helpers ─── */
@@ -832,6 +975,290 @@
   {:else}
     <div style="font-size: 12px; color: var(--color-on-surface-dim);">Stats unavailable.</div>
   {/if}
+
+{:else if activeTab === 'integrations'}
+  <div class="cli-terminal" style="margin-bottom: 16px; padding: 8px 14px;">
+    <div class="cli-line">
+      <span class="cli-prompt">$</span>
+      <span class="cli-command">dash admin --integrations</span>
+      <span style="margin-left: auto; font-size: 11px; opacity: 0.6;">external connectors</span>
+    </div>
+  </div>
+
+  <!-- SharePoint Configuration -->
+  <div style="font-size: 18px; font-weight: 900; text-transform: uppercase; margin-bottom: 16px;">SharePoint Connector</div>
+
+  <div class="ink-border" style="padding: 16px; background: var(--color-surface-bright); margin-bottom: 16px;">
+    <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px;">AZURE APP REGISTRATION</div>
+    <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-bottom: 16px; line-height: 1.6;">
+      1. Go to <strong>Azure Portal</strong> &rarr; App Registrations &rarr; New Registration<br>
+      2. Name: <code style="background: #222; color: #0f0; padding: 1px 4px; font-size: 9px;">Dash SharePoint Connector</code><br>
+      3. Redirect URI: <code style="background: #222; color: #0f0; padding: 1px 4px; font-size: 9px;">https://your-domain/api/sharepoint/callback</code><br>
+      4. API Permissions &rarr; Add: <strong>Sites.Read.All</strong>, <strong>Files.Read.All</strong>, <strong>User.Read</strong>, <strong>offline_access</strong><br>
+      5. Certificates &amp; Secrets &rarr; New Client Secret &rarr; Copy value below
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 10px; max-width: 500px;">
+      <div>
+        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">CLIENT ID (Application ID)</div>
+        <input type="text" bind:value={spAdminClientId} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+      </div>
+      <div>
+        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">CLIENT SECRET</div>
+        <input type="password" bind:value={spAdminClientSecret} placeholder="{spAdminConfig.has_secret ? '••••••••  (already set, leave blank to keep)' : 'paste secret value here'}" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+      </div>
+      <div>
+        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">TENANT ID (Directory ID)</div>
+        <input type="text" bind:value={spAdminTenantId} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 12px; margin-top: 4px;">
+        <button class="send-btn" style="padding: 8px 20px; font-size: 11px;" disabled={spAdminSaving || !spAdminClientId || !spAdminTenantId} onclick={saveSharePointConfig}>
+          {spAdminSaving ? 'SAVING...' : 'SAVE CONFIGURATION'}
+        </button>
+        {#if spAdminConfig.configured}
+          <span style="font-size: 10px; color: #00fc40; font-weight: 700;">&#10003; CONFIGURED</span>
+        {:else}
+          <span style="font-size: 10px; color: var(--color-on-surface-dim);">NOT CONFIGURED</span>
+        {/if}
+      </div>
+      {#if spAdminMsg}
+        <div style="font-size: 10px; color: {spAdminMsg.includes('Saved') ? '#00fc40' : '#e74c3c'}; font-weight: 700;">{spAdminMsg}</div>
+      {/if}
+    </div>
+  </div>
+
+  <!-- Connected Sources across all projects -->
+  {#if spAllSources.length > 0}
+    <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">ALL CONNECTED SOURCES ({spAllSources.length})</div>
+    <div style="overflow-x: auto;">
+      <table style="width: 100%; font-size: 11px; border-collapse: collapse;">
+        <thead>
+          <tr style="border-bottom: 2px solid var(--color-on-surface); text-align: left;">
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">PROJECT</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">SITE</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">FOLDER</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">FILES</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">LAST SYNC</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">STATUS</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each spAllSources as src}
+            <tr style="border-bottom: 1px solid var(--color-surface-dim);">
+              <td style="padding: 6px 8px; font-weight: 700;">{src.project_slug}</td>
+              <td style="padding: 6px 8px;">{src.site_name || '-'}</td>
+              <td style="padding: 6px 8px; font-size: 10px; color: var(--color-on-surface-dim);">{src.folder_path || '/'}</td>
+              <td style="padding: 6px 8px;">{src.files_synced}</td>
+              <td style="padding: 6px 8px; font-size: 10px;">{src.last_sync_at ? fmtDate(src.last_sync_at) : '-'}</td>
+              <td style="padding: 6px 8px;">
+                <span style="font-size: 9px; font-weight: 700; padding: 1px 6px; background: {src.status === 'active' ? '#00fc40' : '#888'}; color: #1a1a1a;">{src.status?.toUpperCase()}</span>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  {:else}
+    <div style="font-size: 11px; color: var(--color-on-surface-dim);">No SharePoint sources connected yet. Users can connect from their project Settings &rarr; SOURCES tab.</div>
+  {/if}
+
+  <!-- Google Drive Configuration -->
+  <div style="font-size: 18px; font-weight: 900; text-transform: uppercase; margin-top: 30px; margin-bottom: 16px;">Google Drive Connector</div>
+
+  <div class="ink-border" style="padding: 16px; background: var(--color-surface-bright); margin-bottom: 16px;">
+    <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px;">GOOGLE OAUTH SETUP</div>
+    <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-bottom: 16px; line-height: 1.6;">
+      1. Go to <strong>Google Cloud Console</strong> &rarr; APIs &amp; Services &rarr; Credentials &rarr; Create OAuth Client ID
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 10px; max-width: 500px;">
+      <div>
+        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">GOOGLE_CLIENT_ID</div>
+        <input type="text" bind:value={gdAdminClientId} placeholder="xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+      </div>
+      <div>
+        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">GOOGLE_CLIENT_SECRET</div>
+        <input type="password" bind:value={gdAdminClientSecret} placeholder="{gdAdminConfig.has_secret ? '••••••••  (already set, leave blank to keep)' : 'paste client secret here'}" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 12px; margin-top: 4px;">
+        <button class="send-btn" style="padding: 8px 20px; font-size: 11px;" disabled={gdAdminSaving || !gdAdminClientId} onclick={saveGDriveConfig}>
+          {gdAdminSaving ? 'SAVING...' : 'SAVE CONFIGURATION'}
+        </button>
+        {#if gdAdminConfig.configured}
+          <span style="font-size: 10px; color: #00fc40; font-weight: 700;">&#10003; CONFIGURED</span>
+        {:else}
+          <span style="font-size: 10px; color: var(--color-on-surface-dim);">NOT CONFIGURED</span>
+        {/if}
+      </div>
+      {#if gdAdminMsg}
+        <div style="font-size: 10px; color: {gdAdminMsg.includes('Saved') ? '#00fc40' : '#e74c3c'}; font-weight: 700;">{gdAdminMsg}</div>
+      {/if}
+    </div>
+  </div>
+
+  <!-- Database Connectors -->
+  <div style="font-size: 18px; font-weight: 900; text-transform: uppercase; margin-top: 30px; margin-bottom: 16px;">Database Connectors</div>
+
+  {#if dbAdminStep === 'idle'}
+    <!-- DB type picker -->
+    <div style="display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap;">
+      {#each [['postgresql', 'PG', '#336791', '5432'], ['mysql', 'MY', '#00758f', '3306'], ['fabric', 'FB', '#0078d4', '1433']] as [type, icon, color, port]}
+        <button class="ink-border" style="padding: 14px 20px; background: var(--color-surface-bright); cursor: pointer; text-align: center; border-width: 2px; min-width: 140px;"
+          onclick={() => { dbAdminType = type; dbAdminPort = port; dbAdminStep = 'form'; }}>
+          <div style="width: 32px; height: 32px; background: {color}; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 10px; margin: 0 auto 6px;">{icon}</div>
+          <div style="font-size: 11px; font-weight: 900;">{type === 'fabric' ? 'Microsoft Fabric' : type === 'postgresql' ? 'PostgreSQL' : 'MySQL'}</div>
+        </button>
+      {/each}
+    </div>
+
+  {:else if dbAdminStep === 'form'}
+    <!-- Connection form -->
+    <div class="ink-border" style="padding: 16px; background: var(--color-surface-bright); max-width: 500px; margin-bottom: 16px;">
+      <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px;">CONNECT {dbAdminType.toUpperCase()}</div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div>
+          <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">HOST</div>
+          <input type="text" bind:value={dbAdminHost} placeholder={dbAdminType === 'fabric' ? 'workspace.datawarehouse.fabric.microsoft.com' : 'db.company.com'} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <div style="flex: 1;">
+            <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">PORT</div>
+            <input type="text" bind:value={dbAdminPort} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+          </div>
+          <div style="flex: 2;">
+            <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">DATABASE</div>
+            <input type="text" bind:value={dbAdminName} placeholder="analytics" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <div style="flex: 1;">
+            <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">USERNAME</div>
+            <input type="text" bind:value={dbAdminUser} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+          </div>
+          <div style="flex: 1;">
+            <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">PASSWORD</div>
+            <input type="password" bind:value={dbAdminPass} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px; margin-top: 4px;">
+          <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px;" onclick={() => dbAdminStep = 'idle'}>CANCEL</button>
+          <button class="send-btn" style="font-size: 10px; padding: 6px 16px;" disabled={dbAdminTesting || !dbAdminHost || !dbAdminName || !dbAdminUser} onclick={dbAdminTest}>
+            {dbAdminTesting ? 'TESTING...' : 'TEST CONNECTION'}
+          </button>
+        </div>
+        {#if dbAdminTestResult}
+          <div style="font-size: 10px; color: {dbAdminTestResult.error ? '#e74c3c' : '#00fc40'}; font-weight: 700;">
+            {dbAdminTestResult.error || `Connected! ${dbAdminTestResult.tables?.length || 0} tables found`}
+          </div>
+        {/if}
+      </div>
+    </div>
+
+  {:else if dbAdminStep === 'tables'}
+    <!-- Table selection + project picker -->
+    <div class="ink-border" style="padding: 16px; background: var(--color-surface-bright); max-width: 500px; margin-bottom: 16px;">
+      <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px;">SELECT TABLES & PROJECT</div>
+
+      <!-- Project selector -->
+      <div style="margin-bottom: 12px;">
+        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">ASSIGN TO PROJECT</div>
+        <select bind:value={dbAdminProject} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);">
+          <option value="">-- select project --</option>
+          {#each projects as p}
+            <option value={p.slug || p.project_slug}>{p.name || p.agent_name || p.slug || p.project_slug}</option>
+          {/each}
+        </select>
+      </div>
+
+      <!-- Table checkboxes -->
+      <div style="margin-bottom: 8px;">
+        <label style="font-size: 10px; cursor: pointer;">
+          <input type="checkbox" checked={dbAdminSelectedTables.length === dbAdminTables.length}
+            onchange={() => { dbAdminSelectedTables = dbAdminSelectedTables.length === dbAdminTables.length ? [] : [...dbAdminTables]; }} />
+          Select All ({dbAdminTables.length})
+        </label>
+      </div>
+      <div style="max-height: 250px; overflow-y: auto; border: 1px solid var(--color-surface-dim); padding: 6px;">
+        {#each dbAdminTables as tbl}
+          <label style="display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 11px; cursor: pointer;">
+            <input type="checkbox" checked={dbAdminSelectedTables.includes(tbl)}
+              onchange={() => {
+                if (dbAdminSelectedTables.includes(tbl)) dbAdminSelectedTables = dbAdminSelectedTables.filter(t => t !== tbl);
+                else dbAdminSelectedTables = [...dbAdminSelectedTables, tbl];
+              }} />
+            {tbl}
+          </label>
+        {/each}
+      </div>
+      <div style="display: flex; gap: 8px; margin-top: 10px;">
+        <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px;" onclick={() => dbAdminStep = 'form'}>BACK</button>
+        <button class="send-btn" style="font-size: 10px; padding: 6px 16px;" disabled={dbAdminConnecting || dbAdminSelectedTables.length === 0 || !dbAdminProject} onclick={dbAdminConnect}>
+          {dbAdminConnecting ? 'CONNECTING...' : `CONNECT ${dbAdminSelectedTables.length} TABLES`}
+        </button>
+      </div>
+      {#if dbAdminMsg2}
+        <div style="font-size: 10px; color: {dbAdminMsg2.includes('!') ? '#00fc40' : '#e74c3c'}; font-weight: 700; margin-top: 6px;">{dbAdminMsg2}</div>
+      {/if}
+    </div>
+  {/if}
+
+  <!-- All connected DB sources -->
+  {#if dbAllSources.length > 0}
+    <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; margin-top: 16px;">ALL DATABASE SOURCES ({dbAllSources.length})</div>
+    <div style="overflow-x: auto;">
+      <table style="width: 100%; font-size: 11px; border-collapse: collapse;">
+        <thead>
+          <tr style="border-bottom: 2px solid var(--color-on-surface); text-align: left;">
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">PROJECT</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">TYPE</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">HOST</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">DATABASE</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">TABLES</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">LAST SYNC</th>
+            <th style="padding: 6px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase;">STATUS</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each dbAllSources as src}
+            <tr style="border-bottom: 1px solid var(--color-surface-dim);">
+              <td style="padding: 6px 8px; font-weight: 700;">{src.project_slug || src.project || '-'}</td>
+              <td style="padding: 6px 8px;">
+                <span style="font-size: 9px; font-weight: 700; padding: 1px 6px; background: var(--color-surface-dim); color: var(--color-on-surface);">{(src.type || src.db_type || '-').toUpperCase()}</span>
+              </td>
+              <td style="padding: 6px 8px; font-size: 10px; color: var(--color-on-surface-dim); font-family: var(--font-family-display);">{src.host || '-'}</td>
+              <td style="padding: 6px 8px;">{src.database || src.db_name || '-'}</td>
+              <td style="padding: 6px 8px; font-weight: 900;">{src.tables ?? src.table_count ?? '-'}</td>
+              <td style="padding: 6px 8px; font-size: 10px;">{src.last_sync_at || src.last_sync ? fmtDate(src.last_sync_at || src.last_sync) : '-'}</td>
+              <td style="padding: 6px 8px;">
+                <span style="font-size: 9px; font-weight: 700; padding: 1px 6px; background: {src.status === 'active' || src.status === 'connected' ? '#00fc40' : '#888'}; color: #1a1a1a;">{(src.status || 'unknown').toUpperCase()}</span>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  {/if}
+
+  <!-- Future: Other integrations -->
+  <div style="margin-top: 30px; border-top: 1px solid var(--color-surface-dim); padding-top: 16px;">
+    <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; margin-bottom: 8px;">COMING SOON</div>
+    <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+      <div class="ink-border" style="padding: 12px 16px; background: var(--color-surface-bright); opacity: 0.5; min-width: 150px; text-align: center;">
+        <div style="font-size: 12px; font-weight: 900;">Snowflake</div>
+        <div style="font-size: 9px; color: var(--color-on-surface-dim);">Cloud data warehouse</div>
+      </div>
+      <div class="ink-border" style="padding: 12px 16px; background: var(--color-surface-bright); opacity: 0.5; min-width: 150px; text-align: center;">
+        <div style="font-size: 12px; font-weight: 900;">BigQuery</div>
+        <div style="font-size: 9px; color: var(--color-on-surface-dim);">Google analytics warehouse</div>
+      </div>
+      <div class="ink-border" style="padding: 12px 16px; background: var(--color-surface-bright); opacity: 0.5; min-width: 150px; text-align: center;">
+        <div style="font-size: 12px; font-weight: 900;">OneDrive</div>
+        <div style="font-size: 9px; color: var(--color-on-surface-dim);">File sync</div>
+      </div>
+    </div>
+  </div>
 
 {/if}
 

@@ -12,7 +12,9 @@ Usage:
 
 from agno.models.openrouter import OpenRouterResponses
 
-JUDGE_MODEL = OpenRouterResponses(id="openai/gpt-5.4-mini")
+from dash.settings import CHAT_MODEL
+
+JUDGE_MODEL = OpenRouterResponses(id=CHAT_MODEL)
 
 
 CATEGORIES: dict[str, dict] = {

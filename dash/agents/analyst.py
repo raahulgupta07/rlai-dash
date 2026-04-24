@@ -29,7 +29,11 @@ def create_analyst(
     return Agent(
         id="analyst",
         name="Analyst",
-        role="SQL generation, execution, schema introspection, data quality handling",
+        role=(
+            "Data analyst with 11 specialist analysis tools: comparator (period comparison), "
+            "diagnostic (root cause), narrator (executive summary), validator (data quality), "
+            "planner (what-if scenarios), trend, pareto, anomaly, benchmark, root_cause, prescriptive."
+        ),
         model=MODEL,
         db=agent_db,
         instructions=build_analyst_instructions(user_id=user_id or project_slug, project_slug=project_slug, actual_user_id=actual_user_id),

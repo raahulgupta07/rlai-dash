@@ -133,6 +133,49 @@ def create_project_team(
                 + "\n\n---\n\n".join(doc_texts[:5])
             )
 
+    # Load grounded facts from LangExtract for Researcher
+    try:
+        import json as _json
+        facts_file = KNOWLEDGE_DIR / project_slug / "training" / "grounded_facts.json"
+        if facts_file.exists():
+            with open(facts_file) as _ff:
+                grounded_facts = _json.load(_ff)
+            if grounded_facts:
+                fact_lines = []
+                for gf in grounded_facts[:20]:
+                    tag = "✅" if gf.get("grounded", True) else "⚠️"
+                    attrs = ""
+                    if gf.get("attributes"):
+                        attr_parts = [f"{k}: {v}" for k, v in gf["attributes"].items() if isinstance(v, str)]
+                        attrs = f" ({', '.join(attr_parts[:2])})" if attr_parts else ""
+                    fact_lines.append(f"- {tag} [{gf.get('type', 'fact').upper()}] {gf.get('text', '')}{attrs}")
+                if fact_lines:
+                    doc_instructions += (
+                        f"\n\n## GROUNDED FACTS ({len(fact_lines)} source-verified extractions)\n"
+                        f"These facts are verified against source documents. Prefer these over raw text.\n\n"
+                        + "\n".join(fact_lines)
+                    )
+    except Exception:
+        pass
+
+    # Inject knowledge graph context for Researcher
+    try:
+        from dash.tools.knowledge_graph import get_knowledge_graph_context
+        kg_context = get_knowledge_graph_context(project_slug, for_agent="researcher")
+        if kg_context:
+            doc_instructions += "\n\n" + kg_context
+    except Exception:
+        pass
+
+    # Company Brain context for Researcher
+    try:
+        from app.brain import get_brain_context
+        brain_ctx = get_brain_context(for_agent="researcher")
+        if brain_ctx:
+            doc_instructions += "\n\n" + brain_ctx
+    except Exception:
+        pass
+
     researcher = create_researcher(knowledge=knowledge, instructions=doc_instructions, project_slug=project_slug)
 
     team = Team(
@@ -173,16 +216,46 @@ def _load_user_projects(user_id: int | None) -> list[dict]:
         projects = []
         for r in rows:
             table_names = []
+            column_names = []
             try:
                 from sqlalchemy import inspect as sa_inspect
                 insp = sa_inspect(engine)
-                table_names = insp.get_table_names(schema=r[5]) if r[5] else []
+                schema = r[5] if r[5] else None
+                table_names = insp.get_table_names(schema=schema) if schema else []
+                # Load column names for better routing (first 5 tables, skip system cols)
+                _skip = {"id", "created_at", "updated_at", "source_table", "source_file"}
+                for tn in table_names[:5]:
+                    try:
+                        cols = insp.get_columns(tn, schema=schema)
+                        column_names.extend(
+                            c["name"] for c in cols
+                            if c["name"].lower() not in _skip
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Load persona keywords for domain matching
+            persona_keywords = []
+            try:
+                pr = conn.execute(sa_text(
+                    "SELECT persona FROM public.dash_personas WHERE project_slug = :s ORDER BY created_at DESC LIMIT 1"
+                ), {"s": r[0]}).fetchone()
+                if pr and pr[0]:
+                    # Extract meaningful words from persona (>4 chars, not common)
+                    _common = {"this", "that", "with", "from", "have", "will", "your", "about", "their", "which",
+                               "would", "there", "been", "some", "other", "than", "them", "each", "make", "like",
+                               "into", "over", "such", "after", "also", "most", "should", "could", "these", "agent",
+                               "data", "table", "query", "project", "based", "using", "provide", "analysis"}
+                    words = set(w.lower().strip(".,;:!?()[]") for w in pr[0].split() if len(w) > 4)
+                    persona_keywords = [w for w in words if w not in _common][:20]
             except Exception:
                 pass
             projects.append({
                 "slug": r[0], "name": r[1], "agent_name": r[2] or "Agent",
                 "agent_role": r[3] or "", "agent_personality": r[4] or "friendly",
-                "tables": table_names,
+                "tables": table_names, "columns": column_names,
+                "persona_keywords": persona_keywords,
             })
         return projects
     except Exception:

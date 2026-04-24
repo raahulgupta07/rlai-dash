@@ -15,7 +15,7 @@ from sqlalchemy import create_engine as _sa_create_engine, text
 from sqlalchemy.pool import NullPool
 
 from db import db_url
-from dash.settings import TRAINING_MODEL
+from dash.settings import TRAINING_MODEL, DEEP_MODEL, LITE_MODEL
 
 router = APIRouter(prefix="/api/projects", tags=["Learning"])
 _engine = _sa_create_engine(db_url, poolclass=NullPool)
@@ -578,8 +578,22 @@ def list_relationships(slug: str, request: Request):
             "SELECT id, from_table, from_column, to_table, to_column, rel_type, confidence, source "
             "FROM public.dash_relationships WHERE project_slug = :s ORDER BY confidence DESC"
         ), {"s": slug}).fetchall()
+    # Add knowledge graph triples
+    kg_triples = []
+    try:
+        with _engine.connect() as conn2:
+            kg_rows = conn2.execute(text(
+                "SELECT subject, predicate, object, source_type, source_id, confidence, inferred, community "
+                "FROM public.dash_knowledge_triples WHERE project_slug = :slug ORDER BY confidence DESC LIMIT 200"
+            ), {"slug": slug}).fetchall()
+            kg_triples = [{"subject": r[0], "predicate": r[1], "object": r[2], "source_type": r[3],
+                           "source_id": r[4], "confidence": float(r[5]) if r[5] else None, "inferred": r[6], "community": r[7]} for r in kg_rows]
+    except Exception:
+        pass
+
     return {"relationships": [{"id": r[0], "from_table": r[1], "from_column": r[2], "to_table": r[3],
-                               "to_column": r[4], "type": r[5], "confidence": r[6], "source": r[7]} for r in rows]}
+                               "to_column": r[4], "type": r[5], "confidence": r[6], "source": r[7]} for r in rows],
+            "knowledge_graph": kg_triples}
 
 
 # ---------------------------------------------------------------------------
@@ -596,15 +610,29 @@ def list_agents(slug: str, request: Request):
     has_tables = (KNOWLEDGE_DIR / slug / "tables").exists() and list((KNOWLEDGE_DIR / slug / "tables").glob("*.json"))
     has_docs = (KNOWLEDGE_DIR / slug / "docs").exists() and list((KNOWLEDGE_DIR / slug / "docs").iterdir())
     agents = [
-        {"name": "Leader", "role": "routes requests · synthesizes answers · no DB access", "type": "coordinator", "status": "active"},
-        {"name": "Analyst", "role": "READ-ONLY · SQL · reasoning · knowledge search" if has_tables else "document analysis · knowledge search", "type": "member", "status": "active"},
-        {"name": "Engineer", "role": "WRITE · views · computed data · schema updates", "type": "member", "status": "active" if has_tables else "standby"},
-        {"name": "Researcher", "role": "document RAG · PPTX/PDF/DOCX analysis · vision", "type": "member", "status": "active" if has_docs else "standby"},
+        {"name": "Leader", "role": "routes requests · synthesizes answers · no DB access", "type": "coordinator", "status": "active", "tools": 0},
+        {"name": "Analyst", "role": "READ-ONLY · SQL · reasoning · 23 tools", "type": "member", "status": "active", "tools": 23},
+        {"name": "Engineer", "role": "WRITE · views · computed data · schema updates", "type": "member", "status": "active" if has_tables else "standby", "tools": 5},
+        {"name": "Researcher", "role": "document RAG · PPTX/PDF/DOCX · grounded facts", "type": "member", "status": "active" if has_docs else "standby", "tools": 0},
     ]
+    # Specialist analysis agents (tools on Analyst, shown as sub-agents)
+    specialists = [
+        {"name": "Comparator", "role": "period comparison · MoM · YoY · delta analysis · auto-detects date columns", "type": "specialist", "status": "active" if has_tables else "standby", "parent": "Analyst", "tools": 1, "trigger": "compare, vs, period, month, year"},
+        {"name": "Diagnostician", "role": "root cause analysis · metric decomposition · waterfall breakdown · dimension contribution", "type": "specialist", "status": "active" if has_tables else "standby", "parent": "Analyst", "tools": 1, "trigger": "why, caused, reason, dropped, increased"},
+        {"name": "Narrator", "role": "executive summary · McKinsey-style narrative · key wins · key risks · recommendations", "type": "specialist", "status": "active", "parent": "Analyst", "tools": 1, "trigger": "summary, board update, overview, executive"},
+        {"name": "Validator", "role": "data quality profiling · NULL detection · duplicate check · health scoring per table", "type": "specialist", "status": "active" if has_tables else "standby", "parent": "Analyst", "tools": 1, "trigger": "data quality, issues, check, validate, health"},
+        {"name": "Planner", "role": "what-if scenarios · base/upside/downside · probability-weighted outcomes · impact modeling", "type": "specialist", "status": "active" if has_tables else "standby", "parent": "Analyst", "tools": 1, "trigger": "what if, scenario, close, open, change"},
+        {"name": "Trend Analyst", "role": "time series · moving averages · direction detection · inflection points", "type": "specialist", "status": "active" if has_tables else "standby", "parent": "Analyst", "tools": 1, "trigger": "trend, over time, monthly, growth rate"},
+        {"name": "Pareto Analyst", "role": "80/20 analysis · top drivers · cumulative impact · A/B/C classification", "type": "specialist", "status": "active" if has_tables else "standby", "parent": "Analyst", "tools": 1, "trigger": "top, drivers, 80/20, pareto, biggest"},
+        {"name": "Anomaly Detector", "role": "Z-score outlier detection · deviation alerts · unusual pattern identification", "type": "specialist", "status": "active" if has_tables else "standby", "parent": "Analyst", "tools": 1, "trigger": "unusual, anomaly, outlier, strange"},
+        {"name": "Benchmarker", "role": "entity vs average · gap analysis · performance ranking · above/below baseline", "type": "specialist", "status": "active" if has_tables else "standby", "parent": "Analyst", "tools": 1, "trigger": "compare to average, benchmark, rank, best, worst"},
+        {"name": "Prescriptor", "role": "actionable recommendations · expected impact · priority ranking · next steps", "type": "specialist", "status": "active", "parent": "Analyst", "tools": 1, "trigger": "recommend, should, action, next steps, improve"},
+    ]
+    agents.extend(specialists)
     return {
         "agents": agents,
         "team_mode": "TeamMode.coordinate",
-        "model": "openai/gpt-5.4-mini",
+        "model": DEEP_MODEL,
         "schema": slug,
         "reasoning": [
             {"mode": "FAST", "description": "direct SQL → answer (simple questions)"},
@@ -960,7 +988,7 @@ Respond with ONLY valid JSON (no markdown):
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1000, "temperature": 0.1},
+            json={"model": DEEP_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1000, "temperature": 0.1},
             timeout=30,
         )
         result = resp.json()
@@ -1102,7 +1130,7 @@ Respond with ONLY valid JSON (no markdown):
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1000, "temperature": 0.1},
+            json={"model": DEEP_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1000, "temperature": 0.1},
             timeout=30,
         )
         result = resp.json()
@@ -1203,7 +1231,7 @@ Respond with ONLY valid JSON (no markdown):
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1000, "temperature": 0.2},
+            json={"model": LITE_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1000, "temperature": 0.2},
             timeout=30,
         )
         result = resp.json()
@@ -1501,7 +1529,7 @@ Respond with ONLY valid JSON:
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500, "temperature": 0.1},
+            json={"model": DEEP_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 500, "temperature": 0.1},
             timeout=30,
         )
         result = resp.json()
@@ -1763,7 +1791,7 @@ async def evolve(slug: str, request: Request):
                     resp = httpx.post(
                         "https://openrouter.ai/api/v1/chat/completions",
                         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": f"Consolidate these {len(mem_rows)} facts into 5-8 insights:\n{facts_text}\n\nReturn JSON: {{\"insights\": [\"...\"]}}"}], "max_tokens": 800, "temperature": 0.1},
+                        json={"model": DEEP_MODEL, "messages": [{"role": "user", "content": f"Consolidate these {len(mem_rows)} facts into 5-8 insights:\n{facts_text}\n\nReturn JSON: {{\"insights\": [\"...\"]}}"}], "max_tokens": 800, "temperature": 0.1},
                         timeout=30,
                     )
                     content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")

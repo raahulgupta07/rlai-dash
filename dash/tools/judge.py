@@ -1,4 +1,4 @@
-from dash.settings import TRAINING_MODEL
+from dash.settings import LITE_MODEL
 """
 Judge
 =====
@@ -46,7 +46,7 @@ Respond with ONLY valid JSON (no markdown):
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": TRAINING_MODEL,
+                "model": LITE_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 100,
                 "temperature": 0,

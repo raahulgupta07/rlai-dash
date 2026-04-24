@@ -2615,6 +2615,35 @@ Return ONLY valid JSON (no markdown):
     if getenv("PANDASAI_EXPERIMENTS", "true").lower() in ("true", "1", "yes"):
         _run_pandasai_experiments(project_slug, table_name, col_analyses, _log)
 
+    # LangExtract — extract grounded facts from document text for Researcher agent
+    try:
+        docs_dir = KNOWLEDGE_DIR / project_slug / "docs"
+        if docs_dir.exists():
+            doc_texts = []
+            for f in sorted(docs_dir.iterdir()):
+                if f.is_file():
+                    try:
+                        doc_texts.append(f.read_text(errors='ignore')[:3000])
+                    except Exception:
+                        pass
+            if doc_texts:
+                combined_text = "\n\n---\n\n".join(doc_texts)
+                _langextract_facts(project_slug, combined_text, _log)
+    except Exception as e:
+        _log(f"⚠ fact extraction skipped: {str(e)[:80]}")
+
+    # Cross-Source Knowledge Graph — build entity-relationship graph across all sources
+    try:
+        _update_run("running", "knowledge_graph")
+        _log("building cross-source knowledge graph...")
+        from dash.tools.knowledge_graph import build_knowledge_graph
+        kg_stats = build_knowledge_graph(project_slug)
+        _log(f"✓ knowledge graph built ({kg_stats.get('triples', 0)} triples, {kg_stats.get('communities', 0)} communities)")
+    except Exception as e:
+        import logging
+        logging.error(f"Knowledge graph failed for {project_slug}: {e}")
+        _log(f"⚠ knowledge graph skipped: {str(e)[:80]}")
+
     # Save fingerprint for delta detection on next retrain
     save_fingerprint(project_slug, table_name, num_rows, [c.get("name", "") for c in (metadata.get("table_columns") or [])])
 
@@ -3813,18 +3842,45 @@ Return ONLY a JSON object mapping each period to its date:
 
 
 def _handle_pdf(file_path: str, filename: str) -> dict:
-    """Handle PDF upload — text extraction + scanned page OCR via vision + tables + images."""
+    """Handle PDF upload — PyMuPDF4LLM for text+tables (structured Markdown),
+    Tesseract OCR for scanned pages, Vision LLM for images/diagrams."""
     result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
     try:
         import fitz
         import base64
+
         doc = fitz.open(file_path)
         if len(doc) == 0:
             result["errors"].append("PDF has 0 pages — file may be corrupt or encrypted")
             return result
 
-        texts = []
+        total_pages = len(doc)
+        result["metadata"]["total_pages"] = total_pages
+
+        # ── STEP 1: PyMuPDF4LLM — structured Markdown (text + inline tables + layout) ──
+        pymupdf4llm_ok = False
+        md_text = ""
+        try:
+            import pymupdf4llm
+            md_pages = pymupdf4llm.to_markdown(
+                file_path,
+                page_chunks=True,       # one chunk per page
+                write_images=False,      # we handle images ourselves (Vision pipeline)
+            )
+            md_parts = []
+            for chunk in md_pages:
+                page_md = chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
+                if page_md.strip():
+                    md_parts.append(page_md)
+            md_text = "\n\n".join(md_parts)
+            pymupdf4llm_ok = True
+            result["warnings"].append(f"PyMuPDF4LLM: extracted {len(md_text):,} chars structured Markdown from {total_pages} pages")
+        except Exception as e:
+            result["warnings"].append(f"PyMuPDF4LLM unavailable ({e}), falling back to fitz raw extraction")
+
+        # ── STEP 2: Per-page scan — detect scanned pages + diagrams ──
         scanned_count = 0
+        fallback_texts = []  # only used if PyMuPDF4LLM failed
         tesseract_ok = False
         try:
             import pytesseract
@@ -3835,8 +3891,9 @@ def _handle_pdf(file_path: str, filename: str) -> dict:
 
         for pi, page in enumerate(doc):
             page_text = page.get_text()
+
             if len(page_text.strip()) < 50:
-                # Scanned page — try Tesseract first (local, fast, free)
+                # ── Scanned page — Tesseract first (local, free), Vision fallback ──
                 scanned_count += 1
                 try:
                     pixmap = page.get_pixmap(dpi=150)
@@ -3844,9 +3901,9 @@ def _handle_pdf(file_path: str, filename: str) -> dict:
                         img = PILImage.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
                         ocr_text = pytesseract.image_to_string(img)
                         if len(ocr_text.strip()) > 30:
-                            texts.append(f"[Page {pi + 1} — OCR]\n{ocr_text.strip()}")
+                            fallback_texts.append(f"[Page {pi + 1} — OCR]\n{ocr_text.strip()}")
                             continue  # Got text via Tesseract, skip vision
-                    # Tesseract failed or got no text → send to vision LLM as fallback
+                    # Tesseract failed → send to Vision LLM as fallback
                     if len(result["images"]) < 10:
                         png_bytes = pixmap.tobytes("png")
                         if len(png_bytes) < 5_000_000:
@@ -3858,15 +3915,16 @@ def _handle_pdf(file_path: str, filename: str) -> dict:
                 except Exception:
                     pass
             else:
-                texts.append(page_text)
-                # Diagram detection: if page has text but it's mostly short labels
-                # (flowcharts, process diagrams, org charts) → also render for Vision
+                if not pymupdf4llm_ok:
+                    fallback_texts.append(page_text)
+
+                # ── Diagram detection: short labels = flowchart/process/org chart ──
                 lines = [l.strip() for l in page_text.split("\n") if l.strip()]
                 avg_line_len = sum(len(l) for l in lines) / max(len(lines), 1)
                 is_diagram = (
-                    len(page_text.strip()) < 2000  # Not a full text page
-                    and len(lines) > 5              # Has multiple labels
-                    and avg_line_len < 30            # Short labels, not paragraphs
+                    len(page_text.strip()) < 2000
+                    and len(lines) > 5
+                    and avg_line_len < 30
                 )
                 if is_diagram and len(result["images"]) < 30:
                     try:
@@ -3881,8 +3939,22 @@ def _handle_pdf(file_path: str, filename: str) -> dict:
                             result["warnings"].append(f"Page {pi + 1}: diagram detected — sent to Vision for flow description")
                     except Exception:
                         pass
+
         doc.close()
-        result["text"] = "\n".join(texts)
+
+        # ── STEP 3: Combine text — prefer PyMuPDF4LLM, append OCR pages ──
+        text_parts = []
+        if pymupdf4llm_ok and md_text.strip():
+            text_parts.append(md_text)
+        elif fallback_texts:
+            text_parts.append("\n".join(fallback_texts))
+
+        # Append Tesseract OCR text for scanned pages (not in PyMuPDF4LLM output)
+        ocr_pages = [t for t in fallback_texts if "[Page " in t and "OCR]" in t]
+        if pymupdf4llm_ok and ocr_pages:
+            text_parts.append("\n\n--- SCANNED PAGES (OCR) ---\n" + "\n".join(ocr_pages))
+
+        result["text"] = "\n\n".join(text_parts)
 
         if scanned_count > 0:
             result["metadata"]["scanned_pages"] = scanned_count
@@ -3892,11 +3964,11 @@ def _handle_pdf(file_path: str, filename: str) -> dict:
             else:
                 result["warnings"].append(f"{scanned_count} scanned page(s) — sent to vision for OCR")
 
-        # Extract tables (existing)
+        # ── STEP 4: Extract tables as DataFrames (pdfplumber — structured data for PostgreSQL) ──
         tables = _extract_tables_pdf(file_path)
         result["tables"] = [{"name": f"{_sanitize_table_name(Path(filename).stem)}_{t['source']}", "df": t["df"], "source": t["source"]} for t in tables]
 
-        # Extract embedded images (charts, diagrams)
+        # ── STEP 5: Extract embedded images (charts, diagrams → Vision) ──
         embedded_images = _extract_images_pdf(file_path)
         result["images"].extend(embedded_images)
 
@@ -3906,20 +3978,30 @@ def _handle_pdf(file_path: str, filename: str) -> dict:
 
 
 def _handle_pptx(file_path: str, filename: str) -> dict:
-    """Handle PPTX upload — text + tables + images (existing logic, raised caps)."""
+    """Handle PPTX upload — text + tables + images + render image-heavy slides for Vision."""
     result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    image_only_slides = []  # slides with <10 chars text → render full slide for Vision
     try:
         from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
         prs = Presentation(file_path)
         texts = []
         notes = []
         for si, slide in enumerate(prs.slides):
+            slide_text = ""
+            has_images = False
             for shape in slide.shapes:
                 if shape.has_text_frame:
                     for para in shape.text_frame.paragraphs:
                         t = para.text.strip()
                         if t:
+                            slide_text += t + "\n"
                             texts.append(t)
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    has_images = True
+            # Track image-heavy slides with no/little text
+            if len(slide_text.strip()) < 10 and has_images:
+                image_only_slides.append(si)
             # Extract speaker notes
             try:
                 if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
@@ -3934,13 +4016,95 @@ def _handle_pptx(file_path: str, filename: str) -> dict:
         result["text"] = all_text
         result["metadata"]["slides"] = len(prs.slides)
         result["metadata"]["notes_count"] = len(notes)
+        result["metadata"]["image_only_slides"] = len(image_only_slides)
     except Exception as e:
         result["errors"].append(f"PPTX text extraction failed: {e}")
 
     tables = _extract_tables_pptx(file_path)
     result["tables"] = [{"name": f"{_sanitize_table_name(Path(filename).stem)}_{t['source']}", "df": t["df"], "source": t["source"]} for t in tables]
+
+    # Extract embedded images from picture shapes
     result["images"] = _extract_images_pptx(file_path)
+
+    # Render image-only slides as full-page images for Vision (Zerox-style)
+    # These slides have charts/dashboards/screenshots that text extraction misses
+    if image_only_slides:
+        rendered = _render_pptx_slides(file_path, image_only_slides)
+        if rendered:
+            result["images"].extend(rendered)
+            result["warnings"].append(f"Rendered {len(rendered)} image-only slides for Vision analysis")
+
     return result
+
+
+def _render_pptx_slides(file_path: str, slide_indices: list[int], max_slides: int = 15) -> list[dict]:
+    """Render specific PPTX slides as images for Vision analysis.
+
+    Uses python-pptx slide dimensions + Pillow to create slide screenshots
+    by compositing shape images onto a blank canvas. Falls back to sending
+    the largest embedded image per slide if rendering fails.
+    """
+    import base64
+    images: list[dict] = []
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+        from PIL import Image
+        import io
+
+        prs = Presentation(file_path)
+        slides = list(prs.slides)
+
+        for si in slide_indices[:max_slides]:
+            if si >= len(slides):
+                continue
+            slide = slides[si]
+
+            # Strategy: composite all picture shapes onto a canvas sized to the slide
+            slide_w = prs.slide_width.emu if hasattr(prs.slide_width, 'emu') else int(prs.slide_width)
+            slide_h = prs.slide_height.emu if hasattr(prs.slide_height, 'emu') else int(prs.slide_height)
+
+            # Scale to reasonable image size (max 2000px wide)
+            scale = min(2000 / (slide_w / 914400), 1500 / (slide_h / 914400))
+            canvas_w = int(slide_w / 914400 * scale)
+            canvas_h = int(slide_h / 914400 * scale)
+
+            canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+            placed = 0
+
+            for shape in slide.shapes:
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    try:
+                        blob = shape.image.blob
+                        if len(blob) < 1000:
+                            continue
+                        img = Image.open(io.BytesIO(blob))
+                        img = img.convert("RGB")
+
+                        # Position on canvas using shape coordinates
+                        x = int(shape.left / 914400 * scale) if hasattr(shape, 'left') and shape.left else 0
+                        y = int(shape.top / 914400 * scale) if hasattr(shape, 'top') and shape.top else 0
+                        w = int(shape.width / 914400 * scale) if hasattr(shape, 'width') and shape.width else img.width
+                        h = int(shape.height / 914400 * scale) if hasattr(shape, 'height') and shape.height else img.height
+
+                        img = img.resize((max(w, 10), max(h, 10)), Image.LANCZOS)
+                        canvas.paste(img, (max(x, 0), max(y, 0)))
+                        placed += 1
+                    except Exception:
+                        continue
+
+            if placed > 0:
+                buf = io.BytesIO()
+                canvas.save(buf, format="PNG", optimize=True)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                images.append({
+                    "b64": b64,
+                    "mime": "image/png",
+                    "source": f"slide_{si + 1}_rendered",
+                })
+    except Exception:
+        pass
+    return images
 
 
 def _handle_docx(file_path: str, filename: str) -> dict:
@@ -4043,33 +4207,69 @@ def _handle_text(file_path: str, filename: str, raw_content: bytes = b"") -> dic
     return result
 
 
-def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_content: bytes = b"") -> dict:
+def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_content: bytes = b"", _progress=None) -> dict:
     """Upload Conductor — routes to handler, runs vision on images, returns unified result."""
+    if not _progress:
+        _progress = lambda agent, step, detail: None
+
+    # Determine handler name for progress
+    handler_map = {
+        ".xlsx": "Parser", ".xls": "Parser", ".csv": "Parser", ".json": "Parser",
+        ".pdf": "Scanner", ".pptx": "Scanner", ".docx": "Scanner",
+        ".txt": "Scanner", ".md": "Scanner", ".sql": "Scanner", ".py": "Scanner",
+        ".jpg": "Vision", ".jpeg": "Vision", ".png": "Vision",
+        ".tiff": "Vision", ".tif": "Vision", ".bmp": "Vision", ".gif": "Vision", ".webp": "Vision",
+    }
+    agent_name = handler_map.get(ext, "Conductor")
+    _progress(agent_name, "Starting", f"processing {filename}")
+
     # Route to handler
     if ext in (".xlsx", ".xls"):
+        _progress("Parser", "Excel analysis", "detecting sheets and structure...")
         result = _handle_excel(file_path, filename)
+        _progress("Parser", "Excel analysis", f"done — {len(result.get('tables', []))} tables extracted")
     elif ext == ".pdf":
+        _progress("Scanner", "PDF extraction", "reading text, tables, detecting scanned pages...")
         result = _handle_pdf(file_path, filename)
+        pages = result.get("metadata", {}).get("total_pages", 0)
+        scanned = result.get("metadata", {}).get("scanned_pages", 0)
+        _progress("Scanner", "PDF extraction", f"done — {pages} pages, {scanned} scanned, {len(result.get('tables', []))} tables")
     elif ext == ".pptx":
+        _progress("Scanner", "PPTX extraction", "reading slides, tables, speaker notes...")
         result = _handle_pptx(file_path, filename)
+        slides = result.get("metadata", {}).get("slides", 0)
+        _progress("Scanner", "PPTX extraction", f"done — {slides} slides, {len(result.get('tables', []))} tables, {len(result.get('images', []))} images")
     elif ext == ".docx":
+        _progress("Scanner", "DOCX extraction", "reading paragraphs, tables, images...")
         result = _handle_docx(file_path, filename)
+        _progress("Scanner", "DOCX extraction", f"done — {len(result.get('text', '')):,} chars, {len(result.get('tables', []))} tables")
     elif ext in (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".webp"):
+        _progress("Vision", "Image processing", "OCR + visual description...")
         result = _handle_image(file_path, filename)
+        _progress("Vision", "Image processing", f"done — {len(result.get('text', '')):,} chars extracted")
     elif ext == ".csv":
+        _progress("Parser", "CSV parsing", "detecting encoding and delimiter...")
         result = _handle_csv(file_path, filename)
+        _progress("Parser", "CSV parsing", f"done — {len(result.get('tables', []))} tables")
     elif ext == ".json":
+        _progress("Parser", "JSON parsing", "reading structure...")
         result = _handle_json(file_path, filename)
+        _progress("Parser", "JSON parsing", f"done — {len(result.get('tables', []))} tables")
     elif ext in (".txt", ".md", ".sql", ".py"):
+        _progress("Scanner", "Text extraction", "reading content...")
         result = _handle_text(file_path, filename, raw_content)
+        _progress("Scanner", "Text extraction", f"done — {len(result.get('text', '')):,} chars")
     else:
         result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [f"Unsupported: {ext}"], "warnings": []}
 
     # Run vision on all collected images (scanned pages, charts, photos, DOCX images)
     if result.get("images"):
+        img_count = len(result["images"])
+        _progress("Vision", "Describing images", f"sending {img_count} images to Vision LLM...")
         image_text = _describe_images_with_vision(result["images"], filename)
         if image_text:
             result["text"] = (result.get("text", "") + f"\n\n--- IMAGE DESCRIPTIONS ---\n{image_text}").strip()
+        _progress("Vision", "Describing images", f"done — {img_count} images described")
 
     return result
 
@@ -4264,6 +4464,150 @@ def _run_pandasai_experiments(project_slug: str, table_name: str, col_analyses: 
             _log("· no successful experiments")
     except Exception as e:
         _log(f"⚠ experiments error: {str(e)[:100]}")
+
+
+def _langextract_facts(project_slug: str, all_text: str, _log=None):
+    """Extract grounded facts from document text using LangExtract.
+    Stores KPIs, metrics, decisions, risks, rules with source positions.
+    Used by Researcher agent for source-cited answers."""
+    if not _log:
+        _log = lambda m: None
+    if not all_text or len(all_text.strip()) < 100:
+        _log("· text too short for fact extraction — skipped")
+        return
+    try:
+        import langextract as lx
+    except ImportError:
+        _log("⚠ langextract not installed — skipped")
+        return
+
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key:
+        _log("⚠ no API key — fact extraction skipped")
+        return
+
+    try:
+        _log("extracting grounded facts with LangExtract...")
+
+        # Few-shot examples — define what to extract (works across all domains)
+        examples = [
+            lx.ExampleData(
+                text="Plant efficiency reached 87% in March 2025. Revenue was $4.2M, up 12% YoY. "
+                     "Board approved the $12M expansion on March 15. Defect rate must stay below 1%.",
+                extractions=[
+                    lx.Extraction(extraction_class="kpi", extraction_text="Plant efficiency: 87%",
+                                  attributes={"period": "March 2025"}),
+                    lx.Extraction(extraction_class="kpi", extraction_text="Revenue: $4.2M, up 12% YoY",
+                                  attributes={"trend": "up 12%"}),
+                    lx.Extraction(extraction_class="decision", extraction_text="Board approved $12M expansion",
+                                  attributes={"date": "March 15"}),
+                    lx.Extraction(extraction_class="business_rule", extraction_text="Defect rate must stay below 1%",
+                                  attributes={"threshold": "1%"}),
+                ],
+            ),
+        ]
+
+        # Run extraction — use Gemini Flash (cheap, fast)
+        # Truncate to ~8K chars to keep cost low
+        text_chunk = all_text[:8000]
+
+        annotated_docs = lx.extract(
+            text_chunk,
+            prompt_description=(
+                "Extract all KPIs, metrics, financial figures, decisions, business rules, "
+                "risks, targets, deadlines, and key relationships from this business document. "
+                "Include specific numbers, dates, percentages, and thresholds."
+            ),
+            examples=examples,
+            model_id=TRAINING_MODEL,
+            api_key=api_key,
+            max_workers=3,
+            extraction_passes=1,
+        )
+
+        # Process results — store as grounded memories
+        if not annotated_docs:
+            _log("· no facts extracted")
+            return
+
+        docs_list = annotated_docs if isinstance(annotated_docs, list) else [annotated_docs]
+        all_facts = []
+        for doc in docs_list:
+            for ext in (doc.extractions if hasattr(doc, 'extractions') else []):
+                fact_text = ext.extraction_text if hasattr(ext, 'extraction_text') else str(ext)
+                fact_class = ext.extraction_class if hasattr(ext, 'extraction_class') else "fact"
+                # Get source position for grounding
+                char_start = ext.char_interval.start_pos if hasattr(ext, 'char_interval') and ext.char_interval else None
+                char_end = ext.char_interval.end_pos if hasattr(ext, 'char_interval') and ext.char_interval else None
+                # Get grounding status
+                grounded = True
+                if hasattr(ext, 'alignment_status'):
+                    grounded = str(ext.alignment_status).upper() != "UNGROUNDED"
+                # Get attributes
+                attrs = {}
+                if hasattr(ext, 'attributes') and ext.attributes:
+                    attrs = ext.attributes
+
+                all_facts.append({
+                    "text": fact_text,
+                    "type": fact_class,
+                    "char_start": char_start,
+                    "char_end": char_end,
+                    "grounded": grounded,
+                    "attributes": attrs,
+                })
+
+        if not all_facts:
+            _log("· no facts found in extraction")
+            return
+
+        # Save grounded facts to dash_memories with source='langextract'
+        engine = create_engine(db_url)
+        saved = 0
+        with engine.connect() as conn:
+            for fact in all_facts[:30]:  # Cap at 30 facts per project
+                if not fact["text"] or len(fact["text"]) < 5:
+                    continue
+                # Build fact string with grounding info
+                grounding_tag = "✅" if fact["grounded"] else "⚠️"
+                type_tag = fact["type"].upper()
+                attr_str = ""
+                if fact["attributes"]:
+                    attr_parts = [f"{k}: {v}" for k, v in fact["attributes"].items() if isinstance(v, str)]
+                    if attr_parts:
+                        attr_str = f" ({', '.join(attr_parts[:3])})"
+                source_ref = ""
+                if fact["char_start"] is not None:
+                    source_ref = f" [chars {fact['char_start']}-{fact['char_end']}]"
+
+                memory_text = f"{grounding_tag} [{type_tag}] {fact['text']}{attr_str}{source_ref}"
+
+                try:
+                    conn.execute(text(
+                        "INSERT INTO public.dash_memories (project_slug, scope, fact, source) "
+                        "VALUES (:s, 'project', :f, 'langextract') ON CONFLICT DO NOTHING"
+                    ), {"s": project_slug, "f": memory_text})
+                    saved += 1
+                except Exception:
+                    pass
+
+            # Also save facts as structured JSON for Researcher
+            facts_dir = KNOWLEDGE_DIR / project_slug / "training"
+            facts_dir.mkdir(parents=True, exist_ok=True)
+            facts_file = facts_dir / "grounded_facts.json"
+            try:
+                with open(facts_file, "w") as f:
+                    json.dump(all_facts, f, indent=2, default=str)
+            except Exception:
+                pass
+
+            conn.commit()
+
+        _log(f"✓ {saved} grounded facts extracted ({sum(1 for f in all_facts if f['grounded'])} verified, "
+             f"{sum(1 for f in all_facts if not f['grounded'])} ungrounded)")
+
+    except Exception as e:
+        _log(f"⚠ LangExtract error: {str(e)[:100]}")
 
 
 def _post_upload_engineer(project_slug: str, tables_created: list[dict], user_id: int = 1):
@@ -5181,7 +5525,10 @@ def get_dashboard(request: Request):
 
 @router.post("/upload-doc")
 async def upload_document(request: Request, file: UploadFile, project: str | None = None):
-    """Upload a code/doc file to project or global knowledge base."""
+    """Upload a code/doc file to project or global knowledge base. Streams progress via SSE."""
+    from starlette.responses import StreamingResponse
+    import queue
+
     # Editor role required for doc uploads
     from app.auth import check_project_permission
     user = getattr(getattr(request, 'state', None), 'user', None)
@@ -5202,11 +5549,180 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large")
 
+    # Check if client wants streaming (Accept: text/event-stream)
+    accept = request.headers.get("accept", "")
+    wants_stream = "text/event-stream" in accept
+
+    # Progress queue for streaming
+    progress_q: queue.Queue = queue.Queue()
+
+    def _emit(agent: str, step: str, detail: str):
+        progress_q.put({"agent": agent, "step": step, "detail": detail})
+
     # Use Upload Conductor for all formats
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
 
+    if wants_stream:
+        # SSE streaming mode — run processing in thread, stream progress
+        import threading
+
+        final_result = {}
+
+        def _process():
+            nonlocal final_result
+            try:
+                # Verify temp file exists and has content
+                import os as _os
+                fsize = _os.path.getsize(tmp_path) if _os.path.exists(tmp_path) else 0
+                _emit("Conductor", "File received", f"{fsize:,} bytes, type: {ext}")
+
+                r = _conduct_upload(tmp_path, ext, project or "", file.filename, raw_content=content, _progress=_emit)
+
+                # Report any errors from handlers
+                for err in r.get("errors", []):
+                    _emit("Conductor", "Handler error", err[:200])
+                for warn in r.get("warnings", []):
+                    _emit("Conductor", "Info", warn[:200])
+
+                final_result["conductor"] = r
+                _emit("Conductor", "Processing complete", f"{len(r.get('text', '')):,} chars, {len(r.get('tables', []))} tables, {len(r.get('images', []))} images")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                final_result["error"] = str(e)
+                _emit("Conductor", "Error", f"{str(e)[:150]} | {tb.splitlines()[-2][:100] if len(tb.splitlines()) > 1 else ''}")
+            finally:
+                progress_q.put(None)  # Signal done
+
+        thread = threading.Thread(target=_process, daemon=True)
+        thread.start()
+
+        def event_generator():
+            while True:
+                try:
+                    msg = progress_q.get(timeout=300)
+                except queue.Empty:
+                    yield f"data: {json.dumps({'agent': 'Conductor', 'step': 'Timeout', 'detail': 'processing took too long'})}\n\n"
+                    break
+                if msg is None:
+                    break
+                yield f"data: {json.dumps(msg)}\n\n"
+
+            # Wait for thread to finish (Vision LLM can take minutes for large files)
+            thread.join(timeout=300)
+
+            # Process the rest (save to knowledge, tables, etc.) synchronously
+            conductor_result = final_result.get("conductor", {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []})
+            if final_result.get("error"):
+                yield f"data: {json.dumps({'agent': 'Conductor', 'step': 'Error', 'detail': final_result['error'][:200]})}\n\n"
+
+            text_content = conductor_result.get("text", "")
+            doc_tables = conductor_result.get("tables", [])
+            import os; os.unlink(tmp_path)
+
+            # Save text
+            _emit_direct = lambda a, s, d: None  # already streamed
+            if project:
+                docs_dir = KNOWLEDGE_DIR / project / "docs"
+            else:
+                docs_dir = KNOWLEDGE_DIR / "docs"
+            docs_dir.mkdir(parents=True, exist_ok=True)
+            with open(docs_dir / file.filename, "w") as f:
+                f.write(text_content)
+            yield f"data: {json.dumps({'agent': 'Inspector', 'step': 'Saving text', 'detail': f'{len(text_content):,} chars saved'})}\n\n"
+
+            # Save raw binary
+            if ext in (".pptx", ".docx", ".pdf", ".jpg", ".jpeg", ".png") and project:
+                docs_raw_dir = KNOWLEDGE_DIR / project / "docs_raw"
+                docs_raw_dir.mkdir(parents=True, exist_ok=True)
+                (docs_raw_dir / file.filename).write_bytes(content)
+
+            # Index to knowledge
+            yield f"data: {json.dumps({'agent': 'Inspector', 'step': 'Knowledge indexing', 'detail': 'indexing to PgVector...'})}\n\n"
+            try:
+                from agno.knowledge.reader.text_reader import TextReader
+                if project:
+                    from db.session import create_project_knowledge
+                    knowledge = create_project_knowledge(project)
+                else:
+                    from dash.settings import dash_knowledge
+                    knowledge = dash_knowledge
+                doc_name = Path(file.filename).stem
+                knowledge.insert(name=f"doc-{doc_name}", text_content=f"Document: {file.filename}\n\n{text_content[:10000]}", reader=TextReader(), skip_if_exists=False)
+                yield f"data: {json.dumps({'agent': 'Inspector', 'step': 'Knowledge indexing', 'detail': 'indexed to PgVector ✓'})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'agent': 'Inspector', 'step': 'Knowledge indexing', 'detail': f'failed: {str(e)[:80]}'})}\n\n"
+
+            # Save tables
+            tables_saved = 0
+            if doc_tables and project:
+                yield f"data: {json.dumps({'agent': 'Engineer', 'step': 'Tables → PostgreSQL', 'detail': f'saving {len(doc_tables)} tables...'})}\n\n"
+                try:
+                    from db import get_project_engine
+                    from db.session import create_project_schema
+                    schema = create_project_schema(project)
+                    engine = get_project_engine(project)
+                    for tbl_info in doc_tables:
+                        df = tbl_info["df"]
+                        if len(df) < 2 or len(df.columns) < 2:
+                            continue
+                        tbl_name = tbl_info.get("name", "")
+                        if not tbl_name:
+                            base_name = Path(file.filename).stem.lower()
+                            base_name = re.sub(r'[^a-z0-9_]', '_', base_name)[:30]
+                            tbl_name = f"{base_name}_{tbl_info.get('source', 'table')}"
+                        tbl_name = re.sub(r'[^a-z0-9_]', '_', tbl_name.lower())
+                        tbl_name = re.sub(r'_+', '_', tbl_name).strip('_')[:63]
+                        try:
+                            df.to_sql(tbl_name, engine, schema=schema, if_exists='replace', index=False)
+                            tables_saved += 1
+                            src_dir = KNOWLEDGE_DIR / project / "table_sources"
+                            src_dir.mkdir(parents=True, exist_ok=True)
+                            source_detail = tbl_info.get("source", "")
+                            _safe_write_json(src_dir / f"{tbl_name}.json", {"source_file": file.filename, "source_detail": source_detail, "description": ""})
+                            yield f"data: {json.dumps({'agent': 'Engineer', 'step': 'Table saved', 'detail': f'{tbl_name} ({len(df)} rows)'})}\n\n"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Engineer merge in background
+            if tables_saved > 0 and project:
+                doc_tables_info = [{"table": t.get("name", ""), "rows": len(t.get("df", [])), "cols": len(t.get("df", {}).columns) if hasattr(t.get("df"), "columns") else 0, "source": t.get("source", "")} for t in doc_tables if t.get("df") is not None and len(t.get("df", [])) >= 2]
+                if doc_tables_info:
+                    user_id_val = getattr(getattr(getattr(request, 'state', None), 'user', None), 'id', 1)
+                    _bg_executor.submit(_post_upload_engineer, project, doc_tables_info, user_id_val)
+
+            # Save extraction metadata for document info cards
+            if project:
+                try:
+                    meta_dir = KNOWLEDGE_DIR / project / "doc_meta"
+                    meta_dir.mkdir(parents=True, exist_ok=True)
+                    raw_file = KNOWLEDGE_DIR / project / "docs_raw" / file.filename
+                    file_size_bytes = raw_file.stat().st_size if raw_file.exists() else len(content)
+                    _safe_write_json(meta_dir / f"{file.filename}.json", {
+                        "text_chars": len(text_content),
+                        "tables_extracted": tables_saved,
+                        "images_described": len(conductor_result.get("images", [])),
+                        "slides": conductor_result.get("metadata", {}).get("slides", 0),
+                        "pages": conductor_result.get("metadata", {}).get("total_pages", 0),
+                        "scanned_pages": conductor_result.get("metadata", {}).get("scanned_pages", 0),
+                        "notes_count": conductor_result.get("metadata", {}).get("notes_count", 0),
+                        "file_size": file_size_bytes,
+                        "warnings": conductor_result.get("warnings", [])[:5],
+                        "errors": conductor_result.get("errors", [])[:5],
+                    })
+                except Exception:
+                    pass
+
+            # Final result event
+            yield f"data: {json.dumps({'agent': 'Conductor', 'step': 'Complete', 'detail': f'{len(text_content):,} chars, {tables_saved} tables', 'done': True, 'result': {'status': 'ok', 'filename': file.filename, 'type': ext, 'size': len(text_content), 'indexed': True, 'tables_saved': tables_saved}})}\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    # Non-streaming mode (fallback)
     conductor_result = _conduct_upload(tmp_path, ext, project or "", file.filename, raw_content=content)
     text_content = conductor_result.get("text", "")
     doc_tables = conductor_result.get("tables", [])
@@ -5300,7 +5816,84 @@ async def upload_document(request: Request, file: UploadFile, project: str | Non
             user_id_val = getattr(getattr(getattr(request, 'state', None), 'user', None), 'id', 1)
             _bg_executor.submit(_post_upload_engineer, project, doc_tables_info, user_id_val)
 
-    return {"status": "ok", "filename": file.filename, "type": ext, "size": len(text_content), "indexed": True, "tables_saved": tables_saved}
+    # Build processing report for frontend
+    processing_steps = []
+    if ext == ".pptx":
+        slides_count = conductor_result.get("metadata", {}).get("slides", 0)
+        notes_count = conductor_result.get("metadata", {}).get("notes_count", 0)
+        processing_steps.append({"agent": "Scanner", "step": "Text extraction", "detail": f"{len(text_content):,} chars from {slides_count} slides", "status": "done"})
+        if notes_count:
+            processing_steps.append({"agent": "Scanner", "step": "Speaker notes", "detail": f"{notes_count} slides with notes", "status": "done"})
+        if doc_tables:
+            processing_steps.append({"agent": "Scanner", "step": "Table extraction", "detail": f"{len(doc_tables)} tables found", "status": "done"})
+        img_count = len(conductor_result.get("images", []))
+        if img_count:
+            processing_steps.append({"agent": "Vision", "step": "Image description", "detail": f"{img_count} images described", "status": "done"})
+        processing_steps.append({"agent": "Inspector", "step": "Knowledge indexing", "detail": "indexed to PgVector", "status": "done"})
+    elif ext == ".pdf":
+        total_pages = conductor_result.get("metadata", {}).get("total_pages", 0)
+        scanned = conductor_result.get("metadata", {}).get("scanned_pages", 0)
+        processing_steps.append({"agent": "Scanner", "step": "Text extraction", "detail": f"{len(text_content):,} chars from {total_pages} pages", "status": "done"})
+        if scanned:
+            processing_steps.append({"agent": "Scanner", "step": "OCR (scanned pages)", "detail": f"{scanned} scanned pages processed", "status": "done"})
+        if doc_tables:
+            processing_steps.append({"agent": "Scanner", "step": "Table extraction", "detail": f"{len(doc_tables)} tables found", "status": "done"})
+        img_count = len(conductor_result.get("images", []))
+        if img_count:
+            processing_steps.append({"agent": "Vision", "step": "Image description", "detail": f"{img_count} images described", "status": "done"})
+        processing_steps.append({"agent": "Inspector", "step": "Knowledge indexing", "detail": "indexed to PgVector", "status": "done"})
+    elif ext == ".docx":
+        processing_steps.append({"agent": "Scanner", "step": "Text extraction", "detail": f"{len(text_content):,} chars", "status": "done"})
+        if doc_tables:
+            processing_steps.append({"agent": "Scanner", "step": "Table extraction", "detail": f"{len(doc_tables)} tables found", "status": "done"})
+        img_count = len(conductor_result.get("images", []))
+        if img_count:
+            processing_steps.append({"agent": "Vision", "step": "Image description", "detail": f"{img_count} images described", "status": "done"})
+        processing_steps.append({"agent": "Inspector", "step": "Knowledge indexing", "detail": "indexed to PgVector", "status": "done"})
+    elif ext in (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".webp"):
+        processing_steps.append({"agent": "Vision", "step": "OCR + description", "detail": f"{len(text_content):,} chars extracted", "status": "done"})
+        processing_steps.append({"agent": "Inspector", "step": "Knowledge indexing", "detail": "indexed to PgVector", "status": "done"})
+    else:
+        processing_steps.append({"agent": "Scanner", "step": "Text extraction", "detail": f"{len(text_content):,} chars", "status": "done"})
+        processing_steps.append({"agent": "Inspector", "step": "Knowledge indexing", "detail": "indexed to PgVector", "status": "done"})
+
+    if tables_saved:
+        processing_steps.append({"agent": "Engineer", "step": "Tables → PostgreSQL", "detail": f"{tables_saved} tables saved", "status": "done"})
+
+    # Add warnings/errors from conductor
+    for w in conductor_result.get("warnings", []):
+        processing_steps.append({"agent": "Conductor", "step": "Warning", "detail": w[:100], "status": "warn"})
+    for e in conductor_result.get("errors", []):
+        processing_steps.append({"agent": "Conductor", "step": "Error", "detail": e[:100], "status": "error"})
+
+    # Save extraction metadata for document info cards
+    if project:
+        try:
+            meta_dir = KNOWLEDGE_DIR / project / "doc_meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            raw_file = KNOWLEDGE_DIR / project / "docs_raw" / file.filename
+            file_size_bytes = raw_file.stat().st_size if raw_file.exists() else len(content)
+            _safe_write_json(meta_dir / f"{file.filename}.json", {
+                "text_chars": len(text_content),
+                "tables_extracted": tables_saved,
+                "images_described": len(conductor_result.get("images", [])),
+                "slides": conductor_result.get("metadata", {}).get("slides", 0),
+                "pages": conductor_result.get("metadata", {}).get("total_pages", 0),
+                "scanned_pages": conductor_result.get("metadata", {}).get("scanned_pages", 0),
+                "notes_count": conductor_result.get("metadata", {}).get("notes_count", 0),
+                "file_size": file_size_bytes,
+                "warnings": conductor_result.get("warnings", [])[:5],
+                "errors": conductor_result.get("errors", [])[:5],
+            })
+        except Exception:
+            pass
+
+    return {
+        "status": "ok", "filename": file.filename, "type": ext,
+        "size": len(text_content), "indexed": True, "tables_saved": tables_saved,
+        "processing_steps": processing_steps,
+        "agents_used": list(set(s["agent"] for s in processing_steps)),
+    }
 
 
 @router.post("/upload-agent")
@@ -5462,17 +6055,30 @@ STEPS:
 
 @router.get("/docs")
 def list_docs(request: Request, project: str | None = None):
-    """List uploaded documents (project-scoped or global)."""
+    """List uploaded documents (project-scoped or global) with extraction metadata."""
     if project:
         docs_dir = KNOWLEDGE_DIR / project / "docs"
     else:
         docs_dir = KNOWLEDGE_DIR / "docs"
     if not docs_dir.exists():
         return {"docs": []}
+    # Load extraction metadata if available
+    meta_dir = KNOWLEDGE_DIR / (project or "") / "doc_meta"
     docs = []
     for f in sorted(docs_dir.iterdir()):
         if f.is_file() and not f.name.startswith("."):
-            docs.append({"name": f.name, "size": f.stat().st_size, "type": f.suffix})
+            doc_info: dict = {"name": f.name, "size": f.stat().st_size, "type": f.suffix}
+            # Load saved extraction metadata
+            if meta_dir.exists():
+                meta_file = meta_dir / f"{f.name}.json"
+                if meta_file.exists():
+                    try:
+                        with open(meta_file) as mf:
+                            meta = json.load(mf)
+                        doc_info.update(meta)
+                    except Exception:
+                        pass
+            docs.append(doc_info)
     return {"docs": docs}
 
 
@@ -5740,24 +6346,46 @@ async def suggest_followups(slug: str, request: Request):
     if not api_key:
         return {"suggestions": []}
 
-    prompt = f"""Based on this data conversation, suggest 3 natural follow-up questions.
+    # Load knowledge graph entities for context-aware follow-ups
+    kg_context = ""
+    try:
+        from dash.tools.knowledge_graph import get_knowledge_graph_context
+        kg_context = get_knowledge_graph_context(slug, for_agent="leader")
+        if kg_context and len(kg_context) > 200:
+            kg_context = f"\n\nKNOWN ENTITIES & RELATIONSHIPS:\n{kg_context[:500]}"
+    except Exception:
+        pass
+
+    prompt = f"""Based on this data conversation, suggest 3 smart follow-up questions.
+
+The follow-ups should:
+- Dig DEEPER into the data (not repeat what was already shown)
+- Explore RELATED dimensions (if revenue was shown, ask about margin or by-store breakdown)
+- Ask WHY if only WHAT was shown
+- Suggest comparisons (vs last period, vs budget, vs other segments)
+- Reference specific entities/metrics from the answer
 
 Q: {question}
-A: {answer[:500]}
+A: {answer[:1500]}
+{kg_context}
 
-Return ONLY a JSON array of 3 short follow-up questions (no markdown):
+Return ONLY a JSON array of 3 short, specific follow-up questions:
 ["question 1", "question 2", "question 3"]"""
 
     try:
+        from dash.settings import LITE_MODEL
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 200, "temperature": 0.3},
+            json={"model": LITE_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 200, "temperature": 0.5},
             timeout=10,
         )
         result = resp.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        suggestions = json.loads(content.strip().strip("`").strip())
+        clean = content.strip().strip("`").strip()
+        if clean.lower().startswith("json"):
+            clean = clean[4:].strip()
+        suggestions = json.loads(clean)
         return {"suggestions": suggestions[:3] if isinstance(suggestions, list) else []}
     except Exception:
         return {"suggestions": []}
@@ -6465,6 +7093,20 @@ def retrain_project(slug: str, request: Request):
                         except Exception as e:
                             _dlog(f"⚠ synthesis error: {str(e)[:60]}")
 
+                    # Step 15: LangExtract — grounded fact extraction for Researcher
+                    _dlog("extracting grounded facts with LangExtract...")
+                    _langextract_facts(slug, all_text, _dlog)
+
+                    # Step 16: Cross-Source Knowledge Graph
+                    _update_step("knowledge_graph")
+                    _dlog("building cross-source knowledge graph...")
+                    try:
+                        from dash.tools.knowledge_graph import build_knowledge_graph
+                        kg_stats = build_knowledge_graph(slug)
+                        _dlog(f"✓ knowledge graph built ({kg_stats.get('triples', 0)} triples, {kg_stats.get('communities', 0)} communities)")
+                    except Exception as e:
+                        _dlog(f"⚠ knowledge graph skipped: {str(e)[:60]}")
+
                 _dlog("✓ doc-only training complete")
 
                 # Save training run with proper step tracking
@@ -6577,6 +7219,25 @@ def retrain_project(slug: str, request: Request):
                 import logging
                 logging.error(f"Retrain failed for {slug}/{tbl}: {e}")
                 _master_log(f"⚠ table {tbl} training failed: {str(e)[:80]}", tbl, tbl_idx)
+
+        # Cross-Source Knowledge Graph (runs even if all tables were skipped)
+        _master_log("building cross-source knowledge graph...", "", total_tables)
+        if master_run_id:
+            try:
+                with master_engine.connect() as conn:
+                    conn.execute(text("UPDATE public.dash_training_runs SET steps = :s WHERE id = :id"),
+                                {"s": f"knowledge_graph||{total_tables}|{total_tables}", "id": master_run_id})
+                    conn.commit()
+            except Exception:
+                pass
+        try:
+            from dash.tools.knowledge_graph import build_knowledge_graph
+            kg_stats = build_knowledge_graph(slug)
+            _master_log(f"✓ knowledge graph: {kg_stats.get('triples', 0)} triples, {kg_stats.get('entities', 0)} entities, {kg_stats.get('communities', 0)} communities", "", total_tables)
+        except Exception as e:
+            import logging
+            logging.error(f"Knowledge graph failed for {slug}: {e}")
+            _master_log(f"⚠ knowledge graph skipped: {str(e)[:80]}", "", total_tables)
 
         # Mark master run as done
         if master_run_id:

@@ -42,6 +42,10 @@ app/
 ├── export.py              # PDF + PPTX + conversation-to-report
 ├── schedules.py           # Scheduled recurring reports
 ├── learning.py            # Self-learning API (memories, feedback, annotations, evals with full grading pipeline, patterns, workflows, quality checks, NL→SQL rules, relationships)
+├── sharepoint.py          # SharePoint connector (Microsoft Entra ID OAuth2, Graph API, SSE sync)
+├── gdrive.py              # Google Drive connector (Google OAuth2, Drive API v3, SSE sync)
+├── connectors.py          # Database connectors (PostgreSQL, MySQL, Microsoft Fabric/SQL Server)
+├── brain.py               # Company Brain (central knowledge: formulas, glossary, aliases, patterns, org structure, thresholds, calendar)
 └── config.yaml            # Quick prompts
 
 dash/
@@ -52,7 +56,8 @@ dash/
 ├── agents/
 │   ├── analyst.py         # Analyst (read-only SQL, reasoning, self-correction loop)
 │   ├── engineer.py        # Engineer (views, computed data)
-│   └── researcher.py      # Document RAG specialist
+│   ├── researcher.py      # Document RAG specialist
+│   └── router.py          # Router Agent (smart project routing)
 ├── context/
 │   ├── semantic_model.py  # Table metadata (Codex-enriched: purpose, grain, PKs, FKs, usage patterns, freshness)
 │   └── business_rules.py  # Business rules + user rules
@@ -67,7 +72,12 @@ dash/
     ├── proactive_insights.py  # Anomaly detection after each chat (background)
     ├── query_plan_extractor.py # SQL plan extraction (tables, joins, filters)
     ├── meta_learning.py       # Self-correction strategy tracking (background)
-    └── auto_evolve.py         # Auto-evolving instructions (every 20 chats)
+    ├── auto_evolve.py         # Auto-evolving instructions (every 20 chats)
+    ├── knowledge_graph.py     # Cross-source SPO triple extraction + entity standardization + community detection
+    ├── visualizer.py          # Visualization Agent — auto-detect chart type + ECharts config generation (rules engine + LLM fallback, 8 chart types)
+    ├── analysis_types.py      # 11 analysis type tools (diagnostic, comparative, trend, predictive, prescriptive, anomaly, root cause, pareto, scenario, benchmark)
+    ├── context_loader.py      # Context Loader — on-demand deep context for Analyst (10 topics: formulas, aliases, thresholds, patterns, domain, quality, relationships, documents, corrections, org)
+    └── router_tools.py        # 4 router tools (catalog, detail, brain, session)
 
 frontend/src/routes/
 ├── +layout.svelte         # Root layout (nav, notifications, search, CLI footer terminal)
@@ -79,7 +89,7 @@ frontend/src/routes/
 ├── chat/+page.svelte      # Dash Agent (auto-routing, mode selector, workflow picker, response tabs)
 ├── project/[slug]/
 │   ├── +page.svelte       # Project chat (response tabs, workflow picker, learning approval, traces, STOP, save memory)
-│   ├── settings/+page.svelte # 13 tabs + CLI status bars
+│   ├── settings/+page.svelte # 15 tabs + CLI status bars
 │   └── dashboard/+page.svelte # Dashboard builder (PPTX export)
 └── command-center/+page.svelte # Super admin
 
@@ -92,7 +102,8 @@ frontend/src/lib/
 
 frontend/src/routes/
 ├── dashboard/+page.svelte # Global dashboard page (all projects)
-└── brain/+page.svelte     # Standalone brain test page
+├── brain/+page.svelte     # Company Brain admin page (7 tabs: GLOSSARY, FORMULAS, ALIASES, PATTERNS, ORG MAP, RULES, GRAPH, LOG)
+└── command-center/+page.svelte  # (duplicate removed below)
 ```
 
 ## Database Tables (35+)
@@ -102,10 +113,13 @@ frontend/src/routes/
 **Self-Learning:** dash_memories, dash_feedback, dash_annotations, dash_evals, dash_query_patterns, dash_workflows_db, dash_training_runs, dash_relationships
 **Self-Evolution:** dash_proactive_insights, dash_user_preferences, dash_query_plans, dash_evolved_instructions, dash_meta_learnings, dash_eval_history, dash_eval_runs
 **Data Persistence:** dash_table_metadata, dash_business_rules_db, dash_rules_db, dash_training_qa, dash_personas, dash_documents, dash_drift_alerts, dash_presentations
+**Connectors & Graph:** dash_data_sources, dash_knowledge_triples
+**Company Brain:** dash_company_brain, dash_brain_access_log
 
 ## Agent System
 
-**Team:** Leader → Analyst (SQL + forecasting) + Engineer (views + dashboards) + Researcher (document RAG)
+**28 Agents Total:** 4 core (Leader, Analyst, Engineer, Researcher) + 10 specialist (Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor) + 7 background (Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector) + 1 visualizer + 1 router (Router Agent — smart project routing with Brain lookup)
+**Team:** Leader → Analyst (SQL + forecasting, 30 tools) + Engineer (views + dashboards) + Researcher (document RAG)
 **Modes:** FAST (direct SQL) / DEEP (think + analyze, auto-selected based on query complexity)
 
 **Self-Correction Loop (Analyst):**
@@ -119,13 +133,20 @@ Attempt 3: Try completely different approach → Retry
   → Save learning about what went wrong
 ```
 
-**6 Context Layers (matches OpenAI architecture):**
+**13 Context Layers (matches OpenAI architecture):**
 1. Table Usage + proven query patterns (from `dash_query_patterns`)
 2. Human Annotations (from `dash_annotations`, override LLM descriptions)
 3. Codex-Enriched Knowledge (purpose, grain, PKs, FKs, usage patterns, alternate tables, freshness)
 4. Institutional Knowledge (PgVector hybrid search — semantic + keyword)
 5. Memory (3 scopes: personal/project/global from `dash_memories` + learning approval)
 6. Runtime Context (live `introspect_schema` + `SELECT DISTINCT` for value inspection)
+7. Grounded Facts (LangExtract: KPIs, metrics, decisions, risks with source character positions from `grounded_facts.json`)
+8. Table Usage + proven query patterns (from `dash_query_patterns`)
+9. Human Annotations (from `dash_annotations`, override LLM descriptions)
+10. Self-Correction Strategies (meta-learning success rates)
+11. Evolved Instructions (auto-generated, versioned)
+12. Knowledge Graph (entity→table map + aliases, entity→document map + causals, routing map)
+13. Company Brain (formulas, glossary, aliases, patterns, org structure, thresholds, calendar from `dash_company_brain`)
 
 **Codex-Enriched Knowledge Pipeline (on upload/retrain):**
 ```
@@ -183,14 +204,16 @@ Q&A Eval Pairs → Generation (LLM generates SQL from question)
    └── Negative Examples (common mistakes to avoid)
 10. AI Seed — bad feedback, insights, drift baseline, evolution
 11. Persona Enrich — re-generates persona with domain knowledge
+12. LangExtract — grounded fact extraction (KPIs, metrics, decisions, risks with source positions)
+13. Knowledge Graph — SPO triple extraction, entity standardization, cross-source inference
 → Training Run Tracking (success/fail/duration)
 ```
 
 **Doc-Only Training (PPTX/PDF/DOCX without data tables):**
-14 steps: knowledge index → memories → persona → workflows → evals →
+16 steps: knowledge index → memories → persona → workflows → evals →
 feedback → business rules → domain knowledge → proactive insights →
 negative examples → training Q&A → multi-doc synthesis →
-cross-document relationships → complete
+cross-document relationships → langextract → knowledge graph → complete
 
 All steps tracked in dash_training_runs for UI progress bar.
 
@@ -330,7 +353,7 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 67. **Dashboard Save/Discard** — Generated dashboards show PREVIEW badge with SAVE (green) + DISCARD (red) buttons. No auto-save. Closing panel without saving auto-discards.
 
-68. **Command Center 7 Tabs** — USERS (inline expand with deep insights), PROJECTS (all projects with brain health), LOGS (audit trail with filters), SCHEMAS (PostgreSQL schemas with table drill-down), CHAT LOGS (all sessions with filters), HEALTH (system status), STATS (platform metrics). All data loads on tab switch.
+68. **Command Center 8 Tabs** — USERS (inline expand with deep insights), PROJECTS (all projects with brain health), LOGS (audit trail with filters), SCHEMAS (PostgreSQL schemas with table drill-down), CHAT LOGS (all sessions with filters), HEALTH (system status), STATS (platform metrics), INTEGRATIONS (connector admin config). All data loads on tab switch.
 
 69. **Project Delete Cleanup** — Deleting a project now removes `knowledge/{slug}/` directory on disk via `shutil.rmtree`. Previously only cleaned DB.
 
@@ -344,18 +367,139 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 74. **Production Security Hardening** — scram-sha-256 (was md5), AGNO_DEBUG=False, PgBouncer health check, Caddy security headers (HSTS, X-Frame-Options, XSS, nosniff), Caddy 512M memory limit.
 
+75. **PyMuPDF4LLM Integration** — PDF text extraction now uses `pymupdf4llm.to_markdown()` for structured Markdown output (multi-column layouts, headings, inline tables preserved). Falls back to `fitz` (PyMuPDF) if unavailable. Added `pymupdf4llm` to `requirements.txt`.
+
+76. **LangExtract Integration** — Grounded fact extraction during training. Extracts KPIs, metrics, decisions, risks with source character positions. Stored in `dash_memories` (source='langextract') + `grounded_facts.json`. Researcher agent checks grounded facts first. Analyst instructions inject grounded facts. Added `langextract` to `requirements.txt`. Runs during TRAIN ALL (both data + doc training).
+
+77. **3-Model Architecture** — Replaced 2-model setup with task-optimized 3-model system: CHAT_MODEL (`google/gemini-3-flash-preview`) for chat agents, SQL, vision, Q&A, dashboard. DEEP_MODEL (`openai/gpt-5.4-mini`) for deep analysis, relationships, domain knowledge, auto-evolve. LITE_MODEL (`google/gemini-3.1-flash-lite-preview`) for scoring, routing, extraction, meta-learning. All configurable via env vars (`CHAT_MODEL`, `TRAINING_MODEL`, `DEEP_MODEL`, `LITE_MODEL`). 12 files updated, zero hardcoded model strings.
+
+78. **SSE Streaming Upload** — Document uploads (PPTX/PDF/DOCX) now stream real-time progress via Server-Sent Events. `POST /api/upload-doc` with `Accept: text/event-stream` header. Frontend shows live agent cards (Scanner ●, Vision ●, Inspector ○) + step-by-step log during upload.
+
+79. **Unified ALL_FILES Table** — DATASETS tab now shows documents + data tables in one table with columns: FILE, TYPE, SIZE, CONTENT, STATUS. Replaces separate DOCUMENTS and DATA TABLES sections.
+
+80. **Drop Zone Upload** — "DROP FILES HERE OR [SELECT FILES]" replaces old "↑ UPLOAD DATA" button in DATASETS tab.
+
+81. **Document Extraction Metadata** — Upload saves extraction metadata (slides, pages, text_chars, tables_extracted, images_described, notes_count, scanned_pages, warnings, errors) to `doc_meta/` directory as JSON per document. Shown in ALL_FILES table and CLI terminal.
+
+82. **Enhanced CLI Terminal** — DATASETS tab now logs per-file extraction details (slides, chars, tables, images, OCR, notes, training status) with tree structure.
+
+83. **Caddy Timeouts** — Added `request_body max_size 250MB`, read/write timeout 300s for large file uploads.
+
+84. **Vision Model Upgrade** — Vision calls now use Gemini 3 Flash (MMMU-Pro 81.2%) instead of Flash Lite (76.8%). `training_vision_call()` now respects per-task model override via TRAINING_CONFIGS.
+
+85. **GPT Reasoning Support** — `training_llm_call()` now sends `reasoning_effort` parameter for GPT models (was only sending for Gemini).
+
+86. **SharePoint Connector** — `app/sharepoint.py`. Microsoft Entra ID OAuth2 via MSAL. Graph API for browsing sites/drives/folders, downloading files. SSE streaming sync progress. Files processed through existing upload pipeline (`_conduct_upload`). Reuses `dash_data_sources` table. Token auto-refresh. Change detection (only downloads new/modified files). Env vars: `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, `MS_TENANT_ID`. Endpoints: auth-url, callback, sites, drives, browse, connect, sources, sync, admin/config. Auth callback path added to AuthMiddleware SKIP_PATHS.
+
+87. **Google Drive Connector** — `app/gdrive.py`. Google OAuth2 via google-auth-oauthlib. Drive API v3 for browsing folders, downloading files. Google Workspace export (Sheets→xlsx, Docs→docx, Slides→pptx). SSE streaming sync. Reuses `dash_data_sources` table (`source_type='gdrive'`). Env vars: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`. Same pattern as SharePoint connector.
+
+88. **Database Connectors** — `app/connectors.py`. Unified connector for PostgreSQL, MySQL, Microsoft Fabric (SQL Server TDS). Test connection → table discovery → selective table sync → project PostgreSQL schema. SSE streaming sync progress. Live query endpoint (`POST /api/connectors/query`) for Analyst remote SQL. Read-only enforcement, 30s timeout, 10K row limit. Passwords stored base64-encoded. NullPool on all remote engines. Reuses `dash_data_sources` table.
+
+89. **Project Settings SOURCES Tab** — 5 connector type cards (SharePoint, Google Drive, PostgreSQL, MySQL, Microsoft Fabric). Each has its own connection wizard. SharePoint: OAuth → site → drive → folder → sync. Google Drive: OAuth → browse folders → sync. Database: connection form → test → table picker → sync. Unified connected sources list with SYNC/DISCONNECT per source. SSE sync log display.
+
+90. **Command Center INTEGRATIONS Tab** — Admin configuration for all connectors. SharePoint: Azure App Registration setup (Client ID, Secret, Tenant ID) with SAVE button. Google Drive: Google OAuth setup (Client ID, Secret). Database Connectors: full connection wizard with project assignment dropdown + table picker. All connected sources tables. Coming Soon cards (Snowflake, BigQuery, OneDrive).
+
+91. **IMPORT FROM EXTERNAL SOURCE Button** — On DATASETS tab, replaces old "IMPORT FROM SHAREPOINT" button. Shows total connected sources count. Navigates to SOURCES tab.
+
+92. **PPTX Slide Rendering for Vision** — Image-only slides (text < 10 chars) composited into full-page images using python-pptx shape coordinates + Pillow canvas. Rendered slides sent to Vision LLM for chart/dashboard/screenshot analysis. `_render_pptx_slides()` function. Max 15 rendered slides per file. Tested on 49MB 57-slide PPTX: 8 image-only slides detected and rendered.
+
+93. **Cross-Source Knowledge Graph** — `dash/tools/knowledge_graph.py`. SPO (Subject-Predicate-Object) triple extraction from all sources. 8 functions: `build_knowledge_graph()`, `_extract_table_triples()`, `_extract_document_triples()`, `_extract_fact_triples()`, `_standardize_entities()`, `_infer_relationships()`, `_save_knowledge_graph()`, `get_knowledge_graph_context()`. Entity standardization via fuzzy matching + LLM ("GC" = "Gong Cha"). Transitive inference + cross-source verification. Community detection (BFS). Stored in `dash_knowledge_triples` table + JSON. Training step 13 (data) / step 16 (doc-only). Context injected into Analyst (entity→table map + aliases), Researcher (entity→document map + causals), Leader (routing map). Cost: ~$0.05 per training run.
+
+94. **Visualization Agent** — `dash/tools/visualizer.py`. Auto-detects best chart type from data shape (bar, line, pie, grouped_bar, scatter, kpi, histogram, heatmap). Rules engine (instant, $0) + LLM fallback. Generates complete ECharts config JSON. Registered as `auto_visualize` tool on Analyst (now 29 tools). Analyst instructed to always call after data queries.
+
+95. **11 Analysis Tools Connected to TYPE Dropdown** — Each analysis type in the TYPE dropdown (DESCRIPTIVE, DIAGNOSTIC, COMPARATIVE, TREND, PREDICTIVE, PRESCRIPTIVE, ANOMALY, ROOT CAUSE, PARETO, SCENARIO, BENCHMARK) now triggers the corresponding real tool (`diagnostic_analysis`, `comparator_analysis`, etc.) instead of just prompt text. "You MUST call X tool" instruction per type.
+
+96. **10 Specialist Agents Visible in AGENTS Tab** — Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor shown as specialist agents with trigger keywords and active/standby status.
+
+97. **Company Brain** — `app/brain.py` + `/ui/brain` page. Central company knowledge (formulas, glossary, aliases, patterns, org structure, thresholds, calendar) shared across ALL projects. Data leak validation blocks specific numbers. 7 tabs: GLOSSARY, FORMULAS, ALIASES, PATTERNS, ORG MAP, RULES, GRAPH, LOG. Knowledge graph visualization. Access log. Super admin only. Context Layer 13 injected into all agents. 51 seeded entries for CFC business.
+
+98. **Smart Multi-Agent Routing** — Leader auto-detects if question needs data (Analyst), context (Researcher), or BOTH. Keywords detection: data keywords → Analyst, context keywords → Researcher, both → asks both agents and merges. `[ROUTING:]` tag prepended to context.
+
+99. **Continuous KG Learning** — `extract_chat_triples()` runs after every chat. Extracts 3-10 SPO triples from Q&A and adds to knowledge graph. KG grows with every conversation automatically.
+
+100. **Auto-Memory Promotion** — `auto_promote_facts()` runs after every chat. Extracts factual observations and saves to `dash_memories` without user approval. Deduplication check. Source: 'auto_learned'.
+
+101. **Rich User Preference Tracking** — `track_user_preferences()` tracks analysis style (detail vs summary), favorite metrics, comparison preference, visual vs tabular preference. Merges into `dash_user_preferences` JSONB.
+
+102. **Episodic Memory** — `extract_episodic_memory()` detects user reactions (surprise, corrections, repeated interest, high-priority questions) and saves as timestamped events. Source: 'episodic'.
+
+103. **Multi-Signal Retrieval** — Researcher agent enhanced with multi-signal search instructions: semantic (PgVector), keyword matching (entity aliases), entity boost (KG context), cross-reference across documents.
+
+104. **Better Follow-up Suggestions** — `suggest-followups` endpoint now uses KG entities for context-aware suggestions. Answer truncation increased to 1500 chars. Uses LITE_MODEL for speed. Prompt instructs: dig deeper, explore related dimensions, ask WHY.
+
+105. **Chat Tab Redesign** — Merged INSIGHT+ANALYSIS into one ANALYSIS tab. DATA tab shows ALL tables with sub-tabs. QUERY tab shows separate cards per query with individual COPY buttons. GRAPH renamed to CHART. Added SOURCES tab. 5 tabs total: ANALYSIS, DATA, QUERY, CHART, SOURCES.
+
+106. **KPI Metric Cards** — Agent outputs `[KPI:value|label|change]` tags. Frontend renders as big number cards with delta coloring (green/red). 2-4 cards for FAST mode, 3-5 for DEEP mode.
+
+107. **Confidence Bar** — Agent outputs `[CONFIDENCE:HIGH]` tag. Frontend renders progress bar with color coding (green=HIGH, orange=MEDIUM, red=LOW).
+
+108. **Impact Summary** — Agent outputs `[IMPACT:percentage|recovered|total]` tag. Frontend renders bordered card with progress bar showing recovery potential.
+
+109. **Related Questions** — Agent outputs `[RELATED:question]` tags. Frontend renders as clickable suggestion buttons. KG-aware, data-specific.
+
+110. **Trend Arrows in Tables** — Agent adds TREND column to data tables showing ▲ +5%, ▼ -2%, ━ 0% vs previous period.
+
+111. **PPTX Slide Rendering** — Image-only slides (text < 10 chars) composited into full-page images for Vision analysis. `_render_pptx_slides()`. Tested on 49MB 57-slide PPTX.
+
+112. **Chat History Cleanup** — When loading past sessions, system prompt instructions stripped from user messages. Shows clean questions instead of raw `CRITICAL STYLE RULE...` text.
+
+113. **11 Background Agents** — After every chat: Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor, Auto-Memory Promoter, User Preference Tracker, Episodic Memory Extractor.
+
+114. **Context Loader Tool** — `dash/tools/context_loader.py`. On-demand deep context for Analyst. 10 topics: formulas, aliases, thresholds, patterns, domain, quality, relationships, documents, corrections, org. Agent calls `load_context(topic)` when summary isn't enough. Queries live data from Company Brain, Knowledge Graph, DB schema, memories. Registered as 30th tool on Analyst. Inspired by skill-loading pattern from workshop-agentic-search.
+
+115. **Slide Agent Design System Upgrade** — 8 design themes (Midnight Executive, Forest & Moss, Coral Energy, Ocean Gradient, Charcoal Minimal, Teal Trust, Berry & Cream, Cherry Bold) with color palettes, font pairings, layout rules. Theme auto-selected by topic. Visual QA via Vision LLM inspection. Style picker API endpoint. Inspired by Anthropic PPTX Skill. Full sentence slide titles, sandwich bg pattern, no repeated layouts.
+
+116. **Visualization Agent** — `dash/tools/visualizer.py`. Auto-detects best chart type from data shape. Rules engine (instant, $0) + LLM fallback. 8 chart types: bar, line, pie, grouped_bar, scatter, kpi, histogram, heatmap. Generates ECharts config JSON. Analyst instructed to always call after data queries.
+
+117. **Chat Response Enhancements** — KPI metric cards rendered from `[KPI:value|label|change]` tags. Confidence bar from `[CONFIDENCE:HIGH]`. Impact summary with progress bar from `[IMPACT:pct|recovered|total]`. Related questions from `[RELATED:question]` as clickable buttons. Trend arrows in tables (▲▼━). All rendered by frontend, generated by agent.
+
+118. **Chat Tab Redesign** — Merged INSIGHT+ANALYSIS into one ANALYSIS tab. DATA tab shows ALL tables with sub-tabs. QUERY tab shows separate cards per query. GRAPH renamed to CHART. Added SOURCES tab. 5 tabs: ANALYSIS, DATA, QUERY, CHART, SOURCES.
+
+119. **Smart Multi-Agent Routing** — Leader auto-routes to BOTH Analyst + Researcher when question needs data AND context. Keyword detection for data/context/both.
+
+120. **Continuous KG Learning** — `extract_chat_triples()` + `auto_promote_facts()` run after every chat. KG grows automatically. Facts saved without user approval.
+
+121. **Rich User Preferences + Episodic Memory** — Tracks analysis style, favorite metrics. Saves user reactions (surprises, corrections) as timestamped events.
+
+122. **Better Follow-ups** — KG-aware suggestions using entity context. Uses LITE_MODEL for speed.
+
+123. **PPTX Slide Rendering** — Image-only slides composited into full images for Vision analysis.
+
+124. **Smart Router Agent** — `dash/agents/router.py` + `dash/tools/router_tools.py`. 2-tier routing for Dash Agent: Tier 1 instant keyword scoring (agent name, table, column, persona, session continuity — 7 signals, $0). Tier 2 Router Agent with 4 tools for ambiguous cases (LITE_MODEL, < 1.5s, ~$0.001). Tools: `inspect_catalog()` (pre-built project catalog, 0ms), `inspect_project_detail(slug)` (Codex-enriched metadata), `search_brain(terms)` (Company Brain glossary/aliases/org lookup), `check_session_context()` (session continuity). Tie detection: if top 2 scores within 2 points, falls through to Router Agent. Brain-powered routing: "HACCP" → food safety → CFC project even when term isn't in any table name. Session slug saved after routing for continuity.
+
+125. **Improved Table Formatting** — `formatCell()` function in both chat pages. Renders `**bold**` as bold, `[UP:+3.7]`/`[DOWN:-2.0]`/`[FLAT:-0.3]` as colored badges (green/red/gray), trend arrows (▲/▼/━) auto-colored, high percentages green, low red. Headers strip markdown bold. Applied to DATA tab tables in both project chat and Dash Agent chat.
+
+126. **Improved Table CSS** — Larger padding (8px), bigger font (13px), outer 2px border, subtle row separators, alternating cream rows, warm hover highlight, sticky headers. Applied to both `.data-table` and `.prose-chat table` styles.
+
+127. **Rich SOURCES Tab** — Redesigned with 5 sections: metric cards grid (AGENT, MODE, QUERIES, RESULT TABLES, CONFIDENCE with progress bar, ANALYSIS type), data sources as dark code badges (real table names from SQL), result data summary (columns preview + row/col counts per table), execution log timeline (numbered steps with status dots + durations), SQL queries on dark background with individual COPY buttons. Both chat pages.
+
+128. **Inline Charts in ANALYSIS Tab** — Up to 3 auto-detected ECharts rendered inline within the ANALYSIS tab after the narrative text. Auto-detects chart type from data shape. Shows chart title from `[CHART:]` hint or column names, row count badge. Only tables with numeric data get charts. Both chat pages.
+
+129. **Chart Captions** — `generateChartCaption()` auto-generates human-readable explanations below each inline chart. No LLM, $0. Detects: highest/lowest values with labels, average when 3+ items, trend direction (increasing ▲ / decreasing ▼) when 4+ items. Both chat pages.
+
+130. **Multi-Chart CHART Tab** — CHART tab now supports multiple charts with sub-tabs (Chart 1, Chart 2, Chart 3) when response has multiple numeric tables. Each chart has its own type selector. Switching chart resets type to auto-detected. Both chat pages.
+
+131. **Tab Alignment Fix** — Response tabs (ANALYSIS, DATA, QUERY, CHART, SOURCES) now aligned on same baseline via `align-items: flex-end`. Consistent border handling, `inline-flex` for badge centering, explicit `border-bottom` on all tabs.
+
+132. **Dash Agent Chat Sync** — All features from project chat synced to Dash Agent chat: merged ANALYSIS tab (was separate INSIGHT+ANALYSIS), KPI metric cards, confidence bar, impact summary, related questions, clarifying questions, inline charts, formatCell, multi-table DATA with sub-tabs, SOURCES tab, card-style QUERY tab, CHART renamed from GRAPH. Both pages now 100% feature-parity.
+
 ## Self-Evolution Architecture
 
 ```
-After Every Chat (background, non-blocking):
-  ├── Quality Scoring (1-5) → dash_quality_scores
-  ├── Rule Suggestion → dash_suggested_rules
-  ├── Proactive Insights (anomaly detection) → dash_proactive_insights
-  ├── Query Plan Extraction (tables, joins, filters) → dash_query_plans
-  ├── Meta-Learning (self-correction tracking) → dash_meta_learnings
-  └── Auto-Evolve Check (every 20 chats) → dash_evolved_instructions
+After Every Chat (11 background agents, non-blocking):
+  ├── Judge — Quality Scoring (1-5) → dash_quality_scores
+  ├── Rule Suggester — Rule Suggestion → dash_suggested_rules
+  ├── Proactive Insights — Anomaly detection → dash_proactive_insights
+  ├── Query Plan Extractor — tables, joins, filters → dash_query_plans
+  ├── Meta Learner — Self-correction tracking → dash_meta_learnings
+  ├── Auto Evolver — Check every 20 chats → dash_evolved_instructions
+  ├── Chat Triple Extractor — 3-10 SPO triples from Q&A → dash_knowledge_triples
+  ├── Auto-Memory Promoter — Factual observations → dash_memories (source='auto_learned')
+  ├── User Preference Tracker — Style, metrics, visual prefs → dash_user_preferences
+  ├── Episodic Memory Extractor — Reactions, corrections → dash_memories (source='episodic')
+  └── Follow-up Suggester — KG-aware suggestions → frontend
 
-Context Injected into Analyst Prompt (10 sections):
+Context Injected into Analyst Prompt (13 sections):
   1. Proven Query Patterns (top 8 by usage)
   2. Approved Responses (last 5 thumbs-up)
   3. Avoid Patterns (last 3 thumbs-down)
@@ -366,6 +510,9 @@ Context Injected into Analyst Prompt (10 sections):
   8. Self-Correction Strategies (meta-learning success rates)
   9. Evolved Instructions (auto-generated, versioned)
   10. DB Rules (KPIs, calculations, metrics from dash_rules_db)
+  11. Grounded Facts (LangExtract: KPIs, metrics, decisions, risks with source positions)
+  12. Knowledge Graph (entity→table map + aliases for Analyst, entity→document map + causals for Researcher, routing map for Leader)
+  13. Company Brain (formulas, glossary, aliases, patterns, org structure, thresholds, calendar — shared across all projects)
 
 Persona Enrich:
   └── Re-generates persona incorporating domain knowledge (glossary, KPIs, calculations)
@@ -381,17 +528,26 @@ On-Demand Features:
 
 ## Upload System
 
-### Upload Agent Team (9 Agents)
+### Upload Agent Team (27 Agents Total)
 
-Two teams of agents work together. Chat Team handles user queries, Upload Team handles file processing:
+Three teams of agents work together. Chat Team handles user queries, Upload Team handles file processing, Background Team runs after every chat:
 
 ```
-CHAT TEAM (user-facing):
-  Leader → Analyst (SQL) + Engineer (schema) + Researcher (docs)
+CHAT TEAM (user-facing, 4 core + 10 specialist + 1 visualizer):
+  Leader → Analyst (SQL, 30 tools) + Engineer (schema) + Researcher (docs)
+  Specialist agents: Comparator, Diagnostician, Narrator, Validator, Planner,
+    Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor
+  Visualizer: auto_visualize tool on Analyst
 
-UPLOAD TEAM (file processing):
+UPLOAD TEAM (file processing, 5 agents):
   Conductor → Parser (data) + Scanner (docs) + Vision (images) + Inspector (quality)
   → Engineer (post-upload merge + views)
+
+BACKGROUND TEAM (after every chat, 7 agents):
+  Judge, Rule Suggester, Proactive Insights, Query Plan Extractor,
+  Meta Learner, Auto Evolver, Chat Triple Extractor
+  + 4 non-LLM: Auto-Memory Promoter, User Preference Tracker,
+    Episodic Memory Extractor, Follow-up Suggester
 ```
 
 **Upload Agents** (`dash/agents/`):
@@ -428,7 +584,7 @@ PHASE 4: ENGINEER RELATIONSHIPS
 ### Endpoints
 
 - `POST /api/upload` — Standard data file upload (CSV/Excel/JSON)
-- `POST /api/upload-doc` — Document upload (PDF/PPTX/DOCX/TXT/MD/SQL)
+- `POST /api/upload-doc` — Document upload (PDF/PPTX/DOCX/TXT/MD/SQL). Supports SSE streaming with `Accept: text/event-stream` header for real-time progress
 - `POST /api/upload-agent` — Agent-powered upload (full team: Conductor → Parser → Inspector → Engineer)
 
 ### Key Features
@@ -448,6 +604,7 @@ PHASE 4: ENGINEER RELATIONSHIPS
 - **Source tracking** — SOURCE column in DATASETS tab: file name, sheet/page/slide number, AI description
 - **Image cap: 30** per document, min size 3KB
 - **Diagram auto-detection** — PDF pages with short text labels (< 2000 chars, avg line < 30) rendered as full-page image for Vision to describe flowcharts, process diagrams, org charts
+- **PPTX slide rendering** — Image-only slides (text < 10 chars) composited into full-page images via python-pptx shape coords + Pillow canvas, sent to Vision LLM. Max 15 rendered slides per file
 - **Null normalization** — N/A, NULL, None, -, ?, ., —, – all converted to NaN in `_clean_dataframe()` for ALL file types
 - **CSV encoding detection** — chardet auto-detects Latin-1, Shift-JIS, Windows-1252 etc. Falls back to UTF-8
 - **PPTX speaker notes** — extracted from `slide.notes_slide` and appended to text
@@ -456,7 +613,7 @@ PHASE 4: ENGINEER RELATIONSHIPS
 - **Image format conversion** — TIFF, BMP, GIF, WEBP converted to PNG via Pillow before OCR/Vision
 - **Universal vision prompt** — one prompt handles all image types (text, charts, diagrams, photos)
 - **Stream upload** — 1MB chunks, max 200MB file size
-- **Models:** GPT-5.4-mini for Excel structure analysis, Gemini Flash Lite for training/vision. Per-task model override in TRAINING_CONFIGS
+- **Models:** 3-model architecture via env vars. CHAT_MODEL (Gemini 3 Flash) for chat agents/SQL/vision/Q&A/dashboard. DEEP_MODEL (GPT-5.4-mini) for deep analysis/relationships/domain knowledge/auto-evolve/Excel structure. LITE_MODEL (Gemini 3.1 Flash Lite) for scoring/routing/extraction/meta-learning. Per-task model override in TRAINING_CONFIGS. Zero hardcoded model strings across 12 files
 
 ### SQL Experiments (Training)
 
@@ -481,7 +638,7 @@ Training pipeline now verifies with real data (was 28% real, now 100%):
 
 ## Export System
 
-- **Slide Agent** (`/api/export/slides-agent`): 2 LLM calls (think + generate), McKinsey rules
+- **Slide Agent** (`/api/export/slides-agent`): 2 LLM calls (think + generate), McKinsey rules, 8 design themes (Midnight Executive, Forest & Moss, Coral Energy, Ocean Gradient, Charcoal Minimal, Teal Trust, Berry & Cream, Cherry Bold), Visual QA via Vision LLM, style picker API
 - **PPTX** (`/api/export/presentations/{id}/pptx`): Native PowerPoint charts, 7 layouts
 - **Excel** (`/api/export/excel-from-chat`): XlsxWriter, 4 sheets, native Excel charts
 - **HTML**: Self-contained slide deck with ECharts CDN
@@ -489,11 +646,14 @@ Training pipeline now verifies with real data (was 28% real, now 100%):
 
 ## Chat UI Features
 
-**Response Tabs** (per assistant message):
-- **Analysis** — markdown response + feedback + copy/save/CSV/PIN/PDF actions
-- **Data** — clean spreadsheet table with row numbers, column headers, hover highlights
-- **Query** — SQL queries in CLI terminal style with COPY SQL button
-- **Graph** — ECharts with type selector (BAR/LINE/PIE/SCATTER/AREA) + PIN to dashboard
+**Response Tabs** (per assistant message, 5 tabs):
+- **Analysis** — merged INSIGHT+ANALYSIS, markdown response + KPI cards + confidence bar + impact summary + feedback + copy/save/CSV/PIN/PDF actions
+- **Data** — ALL tables with sub-tabs, trend arrows (▲/▼/━), row numbers, column headers, hover highlights
+- **Query** — separate cards per query with individual COPY buttons, CLI terminal style
+- **Chart** — ECharts with auto-detected type (BAR/LINE/PIE/SCATTER/AREA/GROUPED_BAR/HISTOGRAM/HEATMAP) + PIN to dashboard
+- **Sources** — redesigned with 5 sections: metric cards (agent/mode/queries/tables/confidence), data source badges, result data summary, execution log timeline, SQL queries with COPY buttons
+
+**Inline Charts:** Up to 3 auto-detected ECharts rendered inline within ANALYSIS tab. Auto-generated captions ($0, no LLM). Multi-chart CHART tab with sub-tabs when multiple numeric tables.
 
 **Learning Approval Cards:**
 - Agent proposes learnings after each response
@@ -522,9 +682,9 @@ Training pipeline now verifies with real data (was 28% real, now 100%):
 - **Data Drift Detection** — alerts when new data doesn't match training patterns
 - **Full Eval Pipeline** — generate SQL + compare results + LLM grading with score + reasoning
 
-## Settings Tabs (13)
+## Settings Tabs (15)
 
-DATASETS · KNOWLEDGE · RULES · TRAINING · DOCS · QUERIES · LINEAGE · AGENTS (API-driven, 4 agents with status badges) · WORKFLOWS · SCHEDULES · EVALS · USERS · CONFIG
+DATASETS · SOURCES · KNOWLEDGE · RULES · TRAINING · DOCS · QUERIES · LINEAGE · AGENTS (API-driven, 27 agents: 4 core + 10 specialist + 7 background + 5 upload + 1 visualizer, with status badges, 30 tools on Analyst) · WORKFLOWS · SCHEDULES · EVALS · USERS · CONFIG · INTEGRATIONS (Command Center) · SOURCES (chat response tab)
 
 ## Commands
 
@@ -548,6 +708,15 @@ docker compose up -d --build
 | `DB_DATABASE` | No | `ai` | PostgreSQL database name |
 | `WORKERS` | No | `4` | Uvicorn workers (increase for more traffic) |
 | `KEYCLOAK_URL/REALM/CLIENT_ID/CLIENT_SECRET` | No | — | Keycloak SSO (optional) |
+| `CHAT_MODEL` | No | `google/gemini-3-flash-preview` | Model for chat agents, SQL, vision, Q&A, dashboard |
+| `DEEP_MODEL` | No | `openai/gpt-5.4-mini` | Model for deep analysis, relationships, domain knowledge, auto-evolve |
+| `LITE_MODEL` | No | `google/gemini-3.1-flash-lite-preview` | Model for scoring, routing, extraction, meta-learning |
+| `TRAINING_MODEL` | No | same as CHAT_MODEL | Legacy alias, overrides CHAT_MODEL for training |
+| `MS_CLIENT_ID` | No | — | Microsoft Entra ID app client ID (SharePoint connector) |
+| `MS_CLIENT_SECRET` | No | — | Microsoft Entra ID app client secret (SharePoint connector) |
+| `MS_TENANT_ID` | No | — | Microsoft Entra ID tenant ID (SharePoint connector) |
+| `GOOGLE_CLIENT_ID` | No | — | Google OAuth client ID (Google Drive connector) |
+| `GOOGLE_CLIENT_SECRET` | No | — | Google OAuth client secret (Google Drive connector) |
 | `SLACK_TOKEN` / `SLACK_SIGNING_SECRET` | No | — | Slack notifications (optional) |
 
 ## Production Security
@@ -588,6 +757,10 @@ docker compose up -d --build
 - PgBouncer health check with CLIENT_IDLE_TIMEOUT and QUERY_WAIT_TIMEOUT
 - Caddy 512M memory limit
 - PostgreSQL idle_in_transaction_session_timeout=60s and statement_timeout=120s
+
+## Key Dependencies (non-obvious)
+
+`pymupdf4llm` (PDF→Markdown), `langextract` (grounded facts), `msal` (Microsoft Entra ID / SharePoint OAuth), `google-auth` + `google-auth-oauthlib` + `google-api-python-client` (Google Drive OAuth + API), `pymysql` (MySQL connector), `python-pptx` + `Pillow` (PPTX slide rendering), `pdfplumber` (PDF table extraction), `chardet` (encoding detection), `xlsxwriter` (Excel export)
 
 ## Build & Deploy Troubleshooting
 

@@ -26,6 +26,8 @@
   let uploadResults = $state<any[]>([]);
   let uploadError = $state('');
   let uploadFileProgress = $state<{index: number, total: number, name: string, status: string}[]>([]);
+  let liveAgents = $state<Record<string, string>>({});
+  let liveSteps = $state<{agent: string, step: string, detail: string}[]>([]);
   let fileInputEl: HTMLInputElement;
 
   // Doc upload
@@ -58,6 +60,10 @@
 
   // Knowledge graph click detail
   let graphSelectedNode = $state<any>(null);
+
+  // Knowledge graph triples
+  let kgTriples = $state<any[]>([]);
+  let kgAliases = $state<Record<string, string[]>>({});
 
   // Dataset cards — expanded state + loaded data
   let expandedTables = $state<Record<string, boolean>>({});
@@ -141,6 +147,336 @@
     try { const r = await fetch(`/api/projects/${slug}/transfer-candidates`, { headers: _h() }); if (r.ok) { const d = await r.json(); transferCandidates = d.projects || []; } } catch {}
   }
 
+  // Sources — connector type picker
+  let sourceType = $state<'none' | 'sharepoint' | 'gdrive' | 'database'>('none');
+  let allSources = $state<any[]>([]); // combined from all connector types
+
+  // Google Drive Sources
+  let gdConfigured = $state(false);
+  let gdSources = $state<any[]>([]);
+  let gdStep = $state<'idle' | 'browse' | 'confirm'>('idle');
+  let gdFolders = $state<any[]>([]);
+  let gdFiles = $state<any[]>([]);
+  let gdTypeCounts = $state<Record<string, number>>({});
+  let gdSelectedFolder = $state<{id: string, name: string}>({ id: 'root', name: 'My Drive' });
+  let gdFolderPath = $state<{id: string, name: string}[]>([{ id: 'root', name: 'My Drive' }]);
+  let gdFileTypes = $state<string[]>(['xlsx', 'pdf', 'pptx', 'docx']);
+  let gdSyncLog = $state<{step: string, detail: string}[]>([]);
+  let gdSyncing = $state(false);
+  let gdLoading = $state(false);
+
+  async function loadGdStatus() {
+    try {
+      const r = await fetch('/api/gdrive/status', { headers: _h() });
+      if (r.ok) { const d = await r.json(); gdConfigured = d.configured; }
+    } catch {}
+  }
+  async function loadGdSources() {
+    try {
+      const r = await fetch(`/api/gdrive/sources?project=${slug}`, { headers: _h() });
+      if (r.ok) { const d = await r.json(); gdSources = d.sources || []; }
+    } catch {}
+  }
+  async function gdStartConnect() {
+    gdLoading = true;
+    try {
+      const r = await fetch('/api/gdrive/auth-url', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_slug: slug, redirect_uri: window.location.href })
+      });
+      if (r.ok) { const d = await r.json(); window.location.href = d.auth_url; }
+    } catch {} finally { gdLoading = false; }
+  }
+  async function gdBrowse(folderId: string = 'root', folderName: string = 'My Drive') {
+    gdLoading = true; gdStep = 'browse';
+    try {
+      const r = await fetch(`/api/gdrive/browse?project=${slug}&folder_id=${folderId}`, { headers: _h() });
+      if (r.ok) {
+        const d = await r.json();
+        gdFolders = d.folders || []; gdFiles = d.files || []; gdTypeCounts = d.type_counts || {};
+        gdSelectedFolder = { id: folderId, name: folderName };
+      }
+    } catch {} finally { gdLoading = false; }
+  }
+  function gdNavigateFolder(folderId: string, folderName: string) {
+    gdFolderPath = [...gdFolderPath, { id: folderId, name: folderName }];
+    gdBrowse(folderId, folderName);
+  }
+  function gdNavigateBreadcrumb(index: number) {
+    const target = gdFolderPath[index];
+    gdFolderPath = gdFolderPath.slice(0, index + 1);
+    gdBrowse(target.id, target.name);
+  }
+  async function gdFinalize() {
+    gdLoading = true;
+    try {
+      const r = await fetch('/api/gdrive/connect', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_slug: slug,
+          folder_id: gdSelectedFolder.id, folder_name: gdFolderPath.map((f: any) => f.name).join('/'),
+          file_types: gdFileTypes, sync_schedule: 'manual',
+        })
+      });
+      if (r.ok) { gdStep = 'idle'; await loadGdSources(); }
+    } catch {} finally { gdLoading = false; }
+  }
+  async function gdSync(sourceId: number) {
+    gdSyncing = true; gdSyncLog = [];
+    try {
+      const r = await fetch('/api/gdrive/sync', {
+        method: 'POST',
+        headers: { ..._h(), 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+        body: JSON.stringify({ source_id: sourceId })
+      });
+      if (r.ok && r.body) {
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try { gdSyncLog = [...gdSyncLog, JSON.parse(line.slice(6))]; } catch {}
+            }
+          }
+        }
+      }
+      await loadGdSources();
+    } catch {} finally { gdSyncing = false; }
+  }
+  async function gdDelete(sourceId: number) {
+    if (!confirm('Disconnect this Google Drive source?')) return;
+    try { await fetch(`/api/gdrive/sources/${sourceId}`, { method: 'DELETE', headers: _h() }); await loadGdSources(); } catch {}
+  }
+
+  // Database Connector Sources
+  let dbSources = $state<any[]>([]);
+  let dbStep = $state<'idle' | 'form' | 'tables' | 'syncing'>('idle');
+  let dbType = $state('postgresql');
+  let dbHost = $state('');
+  let dbPort = $state('5432');
+  let dbUser = $state('');
+  let dbPass = $state('');
+  let dbName = $state('');
+  let dbTesting = $state(false);
+  let dbTestResult = $state<any>(null);
+  let dbRemoteTables = $state<any[]>([]);
+  let dbSelectedTables = $state<string[]>([]);
+  let dbSyncLog = $state<{step: string, detail: string}[]>([]);
+  let dbSyncing = $state(false);
+  let dbLoading = $state(false);
+
+  async function loadDbSources() {
+    try {
+      const r = await fetch(`/api/connectors/sources?project=${slug}`, { headers: _h() });
+      if (r.ok) { const d = await r.json(); dbSources = d.sources || []; }
+    } catch {}
+  }
+  async function dbTestConnection() {
+    dbTesting = true; dbTestResult = null;
+    try {
+      const r = await fetch('/api/connectors/test', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: dbHost, port: parseInt(dbPort), username: dbUser, password: dbPass, database: dbName, db_type: dbType })
+      });
+      dbTestResult = await r.json();
+      if (dbTestResult.tables) { dbRemoteTables = dbTestResult.tables; dbStep = 'tables'; }
+    } catch { dbTestResult = { error: 'Connection failed' }; }
+    dbTesting = false;
+  }
+  async function dbConnect() {
+    dbLoading = true;
+    try {
+      const r = await fetch('/api/connectors/connect', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_slug: slug, host: dbHost, port: parseInt(dbPort), username: dbUser, password: dbPass,
+          database: dbName, db_type: dbType, selected_tables: dbSelectedTables, sync_schedule: 'manual',
+        })
+      });
+      if (r.ok) { dbStep = 'idle'; dbHost = ''; dbPort = '5432'; dbUser = ''; dbPass = ''; dbName = ''; dbSelectedTables = []; await loadDbSources(); }
+    } catch {} finally { dbLoading = false; }
+  }
+  async function dbSync(sourceId: number) {
+    dbSyncing = true; dbSyncLog = [];
+    try {
+      const r = await fetch('/api/connectors/sync', {
+        method: 'POST',
+        headers: { ..._h(), 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+        body: JSON.stringify({ source_id: sourceId })
+      });
+      if (r.ok && r.body) {
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try { dbSyncLog = [...dbSyncLog, JSON.parse(line.slice(6))]; } catch {}
+            }
+          }
+        }
+      }
+      await loadDbSources();
+    } catch {} finally { dbSyncing = false; }
+  }
+  async function dbDelete(sourceId: number) {
+    if (!confirm('Disconnect this database source?')) return;
+    try { await fetch(`/api/connectors/sources/${sourceId}`, { method: 'DELETE', headers: _h() }); await loadDbSources(); } catch {}
+  }
+
+  // SharePoint Sources
+  let spConfigured = $state(false);
+  let spSources = $state<any[]>([]);
+  let spStep = $state<'idle' | 'sites' | 'drives' | 'browse' | 'confirm' | 'syncing'>('idle');
+  let spSites = $state<any[]>([]);
+  let spDrives = $state<any[]>([]);
+  let spFolders = $state<any[]>([]);
+  let spFiles = $state<any[]>([]);
+  let spTypeCounts = $state<Record<string, number>>({});
+  let spSelectedSite = $state<any>(null);
+  let spSelectedDrive = $state<any>(null);
+  let spSelectedFolder = $state<{id: string, name: string}>({ id: 'root', name: 'Root' });
+  let spFolderPath = $state<{id: string, name: string}[]>([{ id: 'root', name: 'Root' }]);
+  let spFileTypes = $state<string[]>(['xlsx', 'pdf', 'pptx', 'docx']);
+  let spSyncSchedule = $state('manual');
+  let spSyncLog = $state<{step: string, detail: string}[]>([]);
+  let spSyncing = $state(false);
+  let spLoading = $state(false);
+  let spSourceId = $state(0);
+
+  async function loadSpStatus() {
+    try {
+      const r = await fetch('/api/sharepoint/status', { headers: _h() });
+      if (r.ok) { const d = await r.json(); spConfigured = d.configured; }
+    } catch {}
+  }
+  async function loadSpSources() {
+    try {
+      const r = await fetch(`/api/sharepoint/sources?project=${slug}`, { headers: _h() });
+      if (r.ok) { const d = await r.json(); spSources = d.sources || []; }
+    } catch {}
+  }
+  async function spStartConnect() {
+    spLoading = true;
+    try {
+      const r = await fetch('/api/sharepoint/auth-url', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_slug: slug, redirect_uri: window.location.href })
+      });
+      if (r.ok) {
+        const d = await r.json();
+        window.location.href = d.auth_url;
+      }
+    } catch {} finally { spLoading = false; }
+  }
+  async function spLoadSites() {
+    spLoading = true; spStep = 'sites';
+    try {
+      const r = await fetch(`/api/sharepoint/sites?project=${slug}`, { headers: _h() });
+      if (r.ok) { const d = await r.json(); spSites = d.sites || []; spSourceId = d.source_id || 0; }
+    } catch {} finally { spLoading = false; }
+  }
+  async function spLoadDrives(site: any) {
+    spSelectedSite = site; spLoading = true; spStep = 'drives';
+    try {
+      const r = await fetch(`/api/sharepoint/drives?project=${slug}&site_id=${site.id}`, { headers: _h() });
+      if (r.ok) { const d = await r.json(); spDrives = d.drives || []; }
+    } catch {} finally { spLoading = false; }
+  }
+  async function spBrowse(drive: any, folderId: string = 'root', folderName: string = 'Root') {
+    if (drive) spSelectedDrive = drive;
+    spLoading = true; spStep = 'browse';
+    try {
+      const r = await fetch(`/api/sharepoint/browse?project=${slug}&drive_id=${(spSelectedDrive as any).id}&folder_id=${folderId}`, { headers: _h() });
+      if (r.ok) {
+        const d = await r.json();
+        spFolders = d.folders || []; spFiles = d.files || []; spTypeCounts = d.type_counts || {};
+        spSelectedFolder = { id: folderId, name: folderName };
+        if (folderId === 'root') spFolderPath = [{ id: 'root', name: (spSelectedDrive as any).name || 'Root' }];
+      }
+    } catch {} finally { spLoading = false; }
+  }
+  function spNavigateFolder(folderId: string, folderName: string) {
+    spFolderPath = [...spFolderPath, { id: folderId, name: folderName }];
+    spBrowse(null, folderId, folderName);
+  }
+  function spNavigateBreadcrumb(index: number) {
+    const target = spFolderPath[index];
+    spFolderPath = spFolderPath.slice(0, index + 1);
+    spBrowse(null, target.id, target.name);
+  }
+  async function spFinalize() {
+    spLoading = true;
+    try {
+      const r = await fetch('/api/sharepoint/connect', {
+        method: 'POST', headers: { ..._h(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_slug: slug,
+          site_id: (spSelectedSite as any).id, site_name: (spSelectedSite as any).name,
+          drive_id: (spSelectedDrive as any).id,
+          folder_path: spFolderPath.map((f: any) => f.name).join('/'),
+          folder_id: spSelectedFolder.id,
+          file_types: spFileTypes, sync_schedule: spSyncSchedule,
+        })
+      });
+      if (r.ok) {
+        const d = await r.json();
+        spSourceId = d.source_id;
+        spStep = 'idle';
+        await loadSpSources();
+      }
+    } catch {} finally { spLoading = false; }
+  }
+  async function spSync(sourceId: number) {
+    spSyncing = true; spSyncLog = [];
+    try {
+      const r = await fetch('/api/sharepoint/sync', {
+        method: 'POST',
+        headers: { ..._h(), 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+        body: JSON.stringify({ source_id: sourceId })
+      });
+      if (r.ok && r.body) {
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const msg = JSON.parse(line.slice(6));
+                spSyncLog = [...spSyncLog, msg];
+              } catch {}
+            }
+          }
+        }
+      }
+      await loadSpSources();
+    } catch {} finally { spSyncing = false; }
+  }
+  async function spDelete(sourceId: number) {
+    if (!confirm('Disconnect this SharePoint source?')) return;
+    try {
+      await fetch(`/api/sharepoint/sources/${sourceId}`, { method: 'DELETE', headers: _h() });
+      await loadSpSources();
+    } catch {}
+  }
+
   // Rules
   let rules = $state<any[]>([]);
   let showAddRule = $state(false);
@@ -164,6 +500,7 @@
     { id: 'evals', label: 'EVALS' },
     { id: 'users', label: 'USERS' },
     { id: 'config', label: 'CONFIG' },
+    { id: 'sources', label: 'SOURCES' },
   ];
 
   function _h(): Record<string, string> {
@@ -239,11 +576,20 @@
   }
 
   onMount(async () => {
-    await Promise.all([loadDetail(), loadLineage(), loadTraining(), loadDocs(), loadKnowledgeFiles(), loadWorkflows(), loadRules(), loadSuggestedRules(), loadSchedules(), loadSharedUsers(), loadPersona(), loadBrainData(), loadTrainingRuns(), loadDriftAlerts(), loadRelationships(), loadInsights(), loadPreferences(), loadMetaLearnings(), loadConsolidationStatus(), loadEvolvedInstructions(), loadResourceRegistry(), loadEvolutionHistory(), loadQueryPlans(), loadEvalHistory(), loadTransferCandidates(), loadAgents(), loadAllUsers()]);
+    await Promise.all([loadDetail(), loadLineage(), loadTraining(), loadDocs(), loadKnowledgeFiles(), loadWorkflows(), loadRules(), loadSuggestedRules(), loadSchedules(), loadSharedUsers(), loadPersona(), loadBrainData(), loadTrainingRuns(), loadDriftAlerts(), loadRelationships(), loadInsights(), loadPreferences(), loadMetaLearnings(), loadConsolidationStatus(), loadEvolvedInstructions(), loadResourceRegistry(), loadEvolutionHistory(), loadQueryPlans(), loadEvalHistory(), loadTransferCandidates(), loadAgents(), loadAllUsers(), loadSpStatus(), loadSpSources(), loadGdStatus(), loadGdSources(), loadDbSources()]);
     loading = false;
     // Auto-load first table details
     if (detail?.tables?.length) {
       loadTableDetail(detail.tables[0].name);
+    }
+    // Handle OAuth callback redirects
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('sharepoint') === 'connected') {
+      activeTab = 'sources'; sourceType = 'sharepoint'; spLoadSites();
+      window.history.replaceState({}, '', window.location.pathname);
+    } else if (urlParams.get('gdrive') === 'connected') {
+      activeTab = 'sources'; sourceType = 'gdrive'; gdBrowse();
+      window.history.replaceState({}, '', window.location.pathname);
     }
   });
 
@@ -275,7 +621,9 @@
   async function loadPersona() { try { const r = await fetch(`/api/projects/${slug}/persona`, { headers: _h() }); if (r.ok) { const d = await r.json(); persona = d.persona; editPersonaText = persona?.persona_prompt || ''; } } catch {} }
   async function loadTrainingRuns() { try { const r = await fetch(`/api/projects/${slug}/training-runs`, { headers: _h() }); if (r.ok) { const d = await r.json(); trainingRuns = d.runs || []; } } catch {} }
   async function loadDriftAlerts() { try { const r = await fetch(`/api/projects/${slug}/drift-alerts`, { headers: _h() }); if (r.ok) { const d = await r.json(); driftAlerts = d.drift_alerts || []; } } catch {} }
-  async function loadRelationships() { try { const r = await fetch(`/api/projects/${slug}/relationships`, { headers: _h() }); if (r.ok) { const d = await r.json(); relationships = d.relationships || []; tableRelationships = d.relationships || []; } } catch {} }
+  async function loadRelationships() {
+    try { const r = await fetch(`/api/projects/${slug}/relationships`, { headers: _h() }); if (r.ok) { const d = await r.json(); relationships = d.relationships || []; tableRelationships = d.relationships || []; kgTriples = d.knowledge_graph || []; } } catch {}
+  }
 
   async function loadBrainData() {
     const h = _h();
@@ -660,7 +1008,7 @@
     const filesToUpload = selectedFiles.length > 0 ? selectedFiles : (selectedFile ? [selectedFile] : []);
     if (filesToUpload.length === 0 || uploading) return;
     uploading = true; uploadError = ''; uploadResult = null; uploadResults = [];
-    uploadSteps = [];
+    uploadSteps = []; liveAgents = {}; liveSteps = [];
 
     // Build per-file progress list
     uploadFileProgress = filesToUpload.map((f, i) => ({
@@ -688,41 +1036,104 @@
           : isDoc
           ? `/api/upload-doc?project=${slug}`
           : `/api/upload?project=${slug}&action=${uploadAction}`;
-        const res = await fetch(uploadUrl, { method: 'POST', body: fd, headers: _h() });
-        if (!res.ok) {
-          const e = await res.json().catch(() => ({ detail: 'Failed' }));
-          if (res.status === 409 && e.detail?.match && filesToUpload.length === 1) {
-            uploadMatch = e.detail.match;
-            uploadError = `Table "${e.detail.match?.table}" already exists (${e.detail.match?.overlap_pct}% match). Choose an action below.`;
+
+        // Use SSE streaming for doc uploads to show real-time progress
+        if (isDoc) {
+          const sseHeaders: Record<string, string> = { 'Accept': 'text/event-stream', ..._h() };
+          const res = await fetch(uploadUrl, { method: 'POST', body: fd, headers: sseHeaders });
+          if (!res.ok) {
+            const e = await res.json().catch(() => ({ detail: 'Failed' }));
+            const errMsg = typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail);
+            cLog(`${ts()} │  ✗ ${currentFile.name}: ${errMsg}`);
             uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'error' } : p);
-            uploading = false;
-            return;
+            continue;
           }
-          const errMsg = typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail);
-          cLog(`${ts()} │  ✗ ${currentFile.name}: ${errMsg}`);
-          uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'error' } : p);
-          continue;
-        }
-        const result = await res.json();
-        const detail = result?.agent ? `${result.tables_created || 0} tables (agent)` :
-                       result?.multi_sheet ? `${result.tables_created} tables, ${result.total_rows} rows` :
-                       result?.rows ? `${result.rows} rows` :
-                       result?.size ? `${result.size} chars indexed` :
-                       result?.tables_saved ? `${result.tables_saved} tables` : 'ok';
-        uploadResults = [...uploadResults, { file: currentFile.name, detail, ...result }];
-        uploadResult = result;
-        uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'done' } : p);
+          // Stream SSE events
+          const reader = res.body?.getReader();
+          const decoder = new TextDecoder();
+          let result: any = null;
+          let buffer = '';
+          if (reader) {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  try {
+                    const event = JSON.parse(line.slice(6));
+                    cLog(`${ts()} │  ${event.agent}: ${event.step} — ${event.detail}`);
+                    // Update live agent cards
+                    if (event.agent) {
+                      liveAgents = { ...liveAgents, [event.agent]: event.detail?.includes('done') ? 'done' : 'active' };
+                      liveSteps = [...liveSteps, { agent: event.agent, step: event.step, detail: event.detail }];
+                    }
+                    if (event.done && event.result) {
+                      result = event.result;
+                      // Mark all agents as done
+                      const doneAgents: Record<string, string> = {};
+                      for (const k of Object.keys(liveAgents)) doneAgents[k] = 'done';
+                      liveAgents = doneAgents;
+                    }
+                  } catch {}
+                }
+              }
+            }
+          }
+          if (!result) result = { status: 'ok', filename: currentFile.name, type: ext, size: 0, indexed: true, tables_saved: 0 };
+          const detail = result?.size ? `${result.size} chars indexed` : result?.tables_saved ? `${result.tables_saved} tables` : 'ok';
+          uploadResults = [...uploadResults, { file: currentFile.name, detail, ...result }];
+          uploadResult = result;
+          uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'done' } : p);
+        } else {
+          // Non-streaming upload for data files
+          const res = await fetch(uploadUrl, { method: 'POST', body: fd, headers: _h() });
+          if (!res.ok) {
+            const e = await res.json().catch(() => ({ detail: 'Failed' }));
+            if (res.status === 409 && e.detail?.match && filesToUpload.length === 1) {
+              uploadMatch = e.detail.match;
+              uploadError = `Table "${e.detail.match?.table}" already exists (${e.detail.match?.overlap_pct}% match). Choose an action below.`;
+              uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'error' } : p);
+              uploading = false;
+              return;
+            }
+            const errMsg = typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail);
+            cLog(`${ts()} │  ✗ ${currentFile.name}: ${errMsg}`);
+            uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'error' } : p);
+            continue;
+          }
+          const result = await res.json();
+          const detail = result?.agent ? `${result.tables_created || 0} tables (agent)` :
+                         result?.multi_sheet ? `${result.tables_created} tables, ${result.total_rows} rows` :
+                         result?.rows ? `${result.rows} rows` :
+                         result?.size ? `${result.size} chars indexed` :
+                         result?.tables_saved ? `${result.tables_saved} tables` : 'ok';
+          uploadResults = [...uploadResults, { file: currentFile.name, detail, ...result }];
+          uploadResult = result;
+          uploadFileProgress = uploadFileProgress.map((p, i) => i === fi ? { ...p, status: 'done' } : p);
 
-        // Log agent report to CLI
-        if (result?.agent && result?.agent_report) {
-          cLog(`${ts()} │  🤖 Agent processed: ${result.tables_created || 0} tables`);
-          const lines = result.agent_report.split('\n').filter((l: string) => l.trim()).slice(0, 8);
-          for (const line of lines) cLog(`${ts()} │  ${line.trim().substring(0, 80)}`);
+          // Log agent report to CLI
+          if (result?.agent && result?.agent_report) {
+            cLog(`${ts()} │  🤖 Agent processed: ${result.tables_created || 0} tables`);
+            const lines = result.agent_report.split('\n').filter((l: string) => l.trim()).slice(0, 8);
+            for (const line of lines) cLog(`${ts()} │  ${line.trim().substring(0, 80)}`);
+          }
+
+          // Log processing steps to CLI
+          if (result?.processing_steps?.length) {
+            if (result.agents_used?.length) cLog(`${ts()} │  agents: ${result.agents_used.join(' → ')}`);
+            for (const step of result.processing_steps) {
+              const icon = step.status === 'done' ? '✓' : step.status === 'warn' ? '⚠' : '✗';
+              cLog(`${ts()} │  ${icon} ${step.agent}: ${step.step} — ${step.detail}`);
+            }
+          }
         }
 
-        // Log to CLI
-        const smart = result?.smart;
-        if (smart) {
+        // Log to CLI (use uploadResult which is always in scope)
+        if (uploadResult?.smart) {
+          const smart = uploadResult.smart;
           if (smart.file_type) cLog(`${ts()} │  type: ${smart.file_type}`);
           if (smart.tables_created) cLog(`${ts()} │  ✓ ${smart.tables_created} tables created (multi-sheet)`);
           if (smart.rows_appended) cLog(`${ts()} │  ✓ ${smart.rows_appended} rows appended`);
@@ -730,8 +1141,6 @@
           if (smart.annotations) cLog(`${ts()} │  ✓ ${smart.annotations} annotations saved`);
           if (smart.rules) cLog(`${ts()} │  ✓ ${smart.rules} rules extracted`);
           if (smart.patterns_saved) cLog(`${ts()} │  ✓ ${smart.patterns_saved} SQL patterns saved`);
-        } else {
-          cLog(`${ts()} │  ✓ ${currentFile.name} → ${detail}`);
         }
       } catch (e: any) {
         cLog(`${ts()} │  ✗ ${currentFile.name}: ${e.message}`);
@@ -764,7 +1173,44 @@
     const ts = `${now.toLocaleDateString('en-US', { month: 'short', day: '2-digit' })} ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}`;
 
     const tabInfo: Record<string, () => string> = {
-      datasets: () => `  ${ts} │  ${detail?.tables?.length || 0} tables loaded · ${detail?.tables?.reduce((s: number, t: any) => s + (t.rows || 0), 0).toLocaleString()} total rows`,
+      datasets: () => {
+        const tblCount = detail?.tables?.length || 0;
+        const totalRows = detail?.tables?.reduce((s: number, t: any) => s + (t.rows || 0), 0) || 0;
+        const docCount = docs.length;
+        const totalChars = docs.reduce((s: number, d: any) => s + (d.text_chars || 0), 0);
+        const totalImages = docs.reduce((s: number, d: any) => s + (d.images_described || 0), 0);
+        const totalSlides = docs.reduce((s: number, d: any) => s + (d.slides || 0), 0);
+        const totalPages = docs.reduce((s: number, d: any) => s + (d.pages || 0), 0);
+        let parts = [`${tblCount} tables · ${totalRows.toLocaleString()} rows · ${docCount} docs`];
+        if (totalChars > 0) parts.push(`${totalChars.toLocaleString()} chars extracted`);
+        if (totalSlides > 0) parts.push(`${totalSlides} slides`);
+        if (totalPages > 0) parts.push(`${totalPages} pages`);
+        if (totalImages > 0) parts.push(`${totalImages} images described`);
+        // Log per-file details
+        setTimeout(() => {
+          for (const d of docs) {
+            let info = `  ${ts} │  ├─ ${d.name}`;
+            if (d.slides) info += ` · ${d.slides} slides`;
+            if (d.pages) info += ` · ${d.pages} pages`;
+            if (d.text_chars) info += ` · ${d.text_chars.toLocaleString()} chars`;
+            if (d.tables_extracted) info += ` · ${d.tables_extracted} tables`;
+            if (d.images_described) info += ` · ${d.images_described} images`;
+            if (d.scanned_pages) info += ` · ${d.scanned_pages} OCR`;
+            if (d.notes_count) info += ` · ${d.notes_count} notes`;
+            window.dispatchEvent(new CustomEvent('dash-cli-log', { detail: { text: info } }));
+          }
+          for (const t of (detail?.tables || [])) {
+            const trained = knowledgeFiles.some((f: any) => f.type === 'tables' && f.name === t.name + '.json');
+            window.dispatchEvent(new CustomEvent('dash-cli-log', { detail: { text: `  ${ts} │  ├─ ${t.name} · ${(t.rows || 0).toLocaleString()} rows · ${t.columns || 0} cols · ${trained ? 'TRAINED' : 'PENDING'}` } }));
+          }
+          if (docs.length === 0 && tblCount === 0) {
+            window.dispatchEvent(new CustomEvent('dash-cli-log', { detail: { text: `  ${ts} │  └─ no files uploaded yet — drop or select files to begin` } }));
+          } else {
+            window.dispatchEvent(new CustomEvent('dash-cli-log', { detail: { text: `  ${ts} │  └─ ${docCount + tblCount} total files · supported: csv, xlsx, json, pptx, pdf, docx, jpg, png, md, txt` } }));
+          }
+        }, 100);
+        return `  ${ts} │  ${parts.join(' · ')}`;
+      },
       knowledge: () => `  ${ts} │  ${detail?.knowledge_vectors || 0} vector embeddings · ${knowledgeFiles.length} metadata files`,
       rules: () => `  ${ts} │  ${rules.length} active rules · ${suggestedRules.length} pending suggestions`,
       training: () => `  ${ts} │  ${training?.learnings || 0} error learnings · ${training?.training_qa?.length || 0} Q&A pairs`,
@@ -1097,13 +1543,34 @@
       </div>
     </div>
 
-    <div class="flex items-center justify-between mb-4">
-      <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Datasets</div>
-      <div>
-        <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf,.jpg,.jpeg,.png" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
-        {#if canEdit}<button class="send-btn" onclick={() => fileInputEl?.click()} style="padding: 6px 14px; font-size: 10px; cursor: pointer;">↑ UPLOAD DATA</button>{/if}
+    <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf,.jpg,.jpeg,.png,.tiff,.bmp,.gif,.webp" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
+
+    <!-- Drop zone + Select button -->
+    {#if canEdit}
+      <div
+        style="border: 2px dashed var(--color-surface-dim); padding: 14px 20px; margin-bottom: 16px; display: flex; align-items: center; justify-content: center; gap: 12px; cursor: pointer; transition: border-color 0.2s;"
+        ondragover={(e) => { e.preventDefault(); e.currentTarget.style.borderColor = 'var(--color-primary)'; }}
+        ondragleave={(e) => { e.currentTarget.style.borderColor = 'var(--color-surface-dim)'; }}
+        ondrop={(e) => { e.preventDefault(); e.currentTarget.style.borderColor = 'var(--color-surface-dim)'; const files = e.dataTransfer?.files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }}
+        onclick={() => fileInputEl?.click()}
+        role="button"
+        tabindex="0"
+      >
+        <span style="font-size: 11px; color: var(--color-on-surface-dim);">DROP FILES HERE OR</span>
+        <span class="send-btn" style="padding: 4px 14px; font-size: 10px; pointer-events: none;">SELECT FILES</span>
       </div>
-    </div>
+      <!-- External sources import button -->
+      <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; margin-top: -8px;">
+        <button style="display: flex; align-items: center; gap: 6px; padding: 6px 14px; font-size: 10px; font-weight: 700; font-family: var(--font-family-display); border: 2px solid #0078d4; background: transparent; color: #0078d4; cursor: pointer; text-transform: uppercase;"
+          onclick={() => { activeTab = 'sources'; }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0078d4" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          IMPORT FROM EXTERNAL SOURCE
+        </button>
+        {#if spSources.length + gdSources.length + dbSources.length > 0}
+          <span style="font-size: 9px; color: var(--color-on-surface-dim);">{spSources.length + gdSources.length + dbSources.length} source{spSources.length + gdSources.length + dbSources.length > 1 ? 's' : ''} connected</span>
+        {/if}
+      </div>
+    {/if}
 
     <!-- Upload progress (shows after file selected) -->
     {#if showUpload && (selectedFile || selectedFiles.length > 0)}
@@ -1166,6 +1633,40 @@
                 {/if}
               </div>
             </div>
+            <!-- Live Agent Cards -->
+            {#if uploading && Object.keys(liveAgents).length > 0}
+              <div style="display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap;">
+                {#each ['Conductor', 'Scanner', 'Parser', 'Vision', 'Inspector', 'Engineer'] as agentName}
+                  {#if liveAgents[agentName]}
+                    {@const status = liveAgents[agentName]}
+                    {@const lastStep = liveSteps.filter(s => s.agent === agentName).at(-1)}
+                    <div style="flex: 1; min-width: 100px; padding: 6px 8px; border-radius: 4px; border: 1px solid {status === 'active' ? 'var(--color-primary)' : 'var(--color-surface)'}; background: {status === 'active' ? 'rgba(0,255,0,0.05)' : 'var(--color-surface-dim)'};">
+                      <div style="display: flex; align-items: center; gap: 4px; margin-bottom: 2px;">
+                        <span style="font-size: 10px; {status === 'active' ? 'animation: pulse 1s infinite;' : ''}">{status === 'done' ? '✓' : status === 'active' ? '●' : '○'}</span>
+                        <span style="font-size: 10px; font-weight: 900; color: {status === 'active' ? 'var(--color-primary)' : 'var(--color-on-surface-dim)'};">{agentName}</span>
+                      </div>
+                      {#if lastStep}
+                        <div style="font-size: 8px; color: var(--color-on-surface-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="{lastStep.detail}">{lastStep.detail?.substring(0, 40)}</div>
+                      {/if}
+                    </div>
+                  {/if}
+                {/each}
+              </div>
+            {/if}
+
+            <!-- Live processing steps -->
+            {#if uploading && liveSteps.length > 0}
+              <div style="margin-bottom: 8px; padding: 6px 8px; background: rgba(0,0,0,0.15); border-radius: 3px; max-height: 120px; overflow-y: auto;">
+                {#each liveSteps as ls}
+                  <div style="font-size: 9px; display: flex; gap: 6px; padding: 1px 0; color: var(--color-on-surface-dim);">
+                    <span style="flex-shrink: 0; width: 10px; color: {ls.detail?.includes('done') || ls.detail?.includes('✓') ? 'var(--color-primary)' : 'var(--color-warning)'};">{ls.detail?.includes('done') || ls.detail?.includes('✓') ? '✓' : '●'}</span>
+                    <span style="flex-shrink: 0; width: 55px; font-weight: 700; color: var(--color-primary); opacity: 0.7;">{ls.agent}</span>
+                    <span style="flex: 1; opacity: 0.8;">{ls.step} — {ls.detail}</span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+
             <!-- Per-file list -->
             <div style="max-height: 250px; overflow-y: auto;">
               {#each uploadFileProgress as fp, idx}
@@ -1190,6 +1691,27 @@
                     <span style="font-size: 9px; color: var(--color-warning); flex-shrink: 0;">processing...</span>
                   {/if}
                 </div>
+                <!-- Agent processing steps for completed files -->
+                {#if fp.status === 'done'}
+                  {@const fileResult = uploadResults.find(r => r.file === fp.name)}
+                  {#if fileResult?.processing_steps?.length}
+                    <div style="margin-left: 36px; margin-bottom: 6px; padding: 6px 8px; background: rgba(0,255,0,0.03); border-left: 2px solid var(--color-surface);">
+                      {#if fileResult.agents_used?.length}
+                        <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-bottom: 4px; font-weight: 700;">
+                          {fileResult.agents_used.length} agents: {fileResult.agents_used.join(' → ')}
+                        </div>
+                      {/if}
+                      {#each fileResult.processing_steps as step}
+                        <div style="font-size: 9px; display: flex; gap: 6px; padding: 1px 0; color: {step.status === 'error' ? 'var(--color-error)' : step.status === 'warn' ? 'var(--color-warning)' : 'var(--color-on-surface-dim)'};">
+                          <span style="flex-shrink: 0; width: 10px;">{step.status === 'done' ? '✓' : step.status === 'warn' ? '⚠' : step.status === 'error' ? '✗' : '○'}</span>
+                          <span style="flex-shrink: 0; width: 60px; font-weight: 700; color: var(--color-primary); opacity: 0.7;">{step.agent}</span>
+                          <span style="flex-shrink: 0; width: 120px;">{step.step}</span>
+                          <span style="flex: 1; opacity: 0.6;">{step.detail}</span>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                {/if}
               {/each}
             </div>
             <!-- Summary when done -->
@@ -1217,72 +1739,74 @@
       </div>
     {/if}
 
-    <!-- Documents list (non-data files) -->
-    {#if docs.length > 0}
+    <!-- Unified ALL FILES table -->
+    {#if docs.length > 0 || detail?.tables?.length > 0}
       <div style="margin-bottom: 16px;">
-        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; color: var(--color-on-surface-dim);">DOCUMENTS ({docs.length})</div>
-        {#each docs as d}
-          <div class="flex items-center justify-between" style="padding: 4px 0; border-bottom: 1px solid var(--color-surface-dim); font-size: 11px;">
-            <div class="flex items-center gap-2">
-              <span style="font-size: 7px; font-weight: 900; padding: 1px 4px; background: {['.pptx','.pdf','.docx'].includes(d.type) ? 'var(--color-warning)' : ['.sql','.py'].includes(d.type) ? '#6366f1' : '#888'}; color: white; text-transform: uppercase; min-width: 26px; text-align: center;">{d.type.replace('.','')}</span>
-              <span style="font-weight: 700;">{d.name}</span>
-            </div>
-            <div class="flex items-center gap-3">
-              <span style="font-size: 9px; color: var(--color-on-surface-dim);">{(d.size / 1024).toFixed(1)} KB</span>
-              <span style="font-size: 8px; font-weight: 900; color: var(--color-primary);">✓ INDEXED</span>
-              {#if canEdit}<button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={() => deleteDoc(d.name)}>DEL</button>{/if}
-            </div>
-          </div>
-        {/each}
-      </div>
-    {/if}
-
-    <!-- Data Tables Summary -->
-    {#if detail?.tables?.length > 0}
-      <div style="margin-bottom: 16px;">
-        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; color: var(--color-on-surface-dim);">DATA TABLES ({detail.tables.length})</div>
+        <div class="cli-terminal" style="padding: 6px 12px; margin-bottom: 0; border-bottom: none;">
+          <span style="font-size: 11px; font-weight: 900; letter-spacing: 0.08em;">ALL_FILES</span>
+        </div>
         <div style="overflow-x: auto;">
           <table class="data-table" style="font-size: 11px; width: 100%;">
             <thead>
               <tr>
-                <th style="text-align: left;">TABLE</th>
-                <th>ROWS</th>
-                <th>COLS</th>
-                <th>TRAINED</th>
-                <th>Q&A</th>
-                <th>HEALTH</th>
+                <th style="text-align: left;">FILE</th>
+                <th>TYPE</th>
+                <th>SIZE</th>
+                <th>CONTENT</th>
+                <th>STATUS</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
-              {#each detail.tables as t}
-                {@const isTrained = knowledgeFiles.some((f: any) => f.type === 'tables' && f.name === t.name + '.json')}
-                {@const qaCount = (training?.training_qa || []).filter((q: any) => q.source_table === t.name).length}
-                {@const health = t.health || (isTrained ? (qaCount > 0 ? 100 : 60) : 0)}
-                <tr style="cursor: pointer;" onclick={() => toggleTableExpand(t.name)}>
-                  <td style="font-weight: 900;">{t.name}</td>
-                  <td style="text-align: center;">{(t.rows || 0).toLocaleString()}</td>
-                  <td style="text-align: center;">{t.columns || '—'}</td>
-                  <td style="text-align: center;">
-                    {#if isTrained}<span style="color: var(--color-primary); font-weight: 900;">✓</span>{:else}<span style="color: var(--color-on-surface-dim);">○</span>{/if}
+              <!-- Documents -->
+              {#each docs as d}
+                <tr>
+                  <td style="font-weight: 900; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="{d.name}">{d.name}</td>
+                  <td style="text-align: center;"><span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: {['.pptx','.pdf','.docx'].includes(d.type) ? 'var(--color-warning)' : ['.sql','.py'].includes(d.type) ? '#6366f1' : '#888'}; color: white; text-transform: uppercase;">{d.type.replace('.','')}</span></td>
+                  <td style="text-align: center; font-size: 9px;">{d.file_size ? (d.file_size / 1024 / 1024).toFixed(1) + ' MB' : (d.size / 1024).toFixed(1) + ' KB'}</td>
+                  <td style="text-align: center; font-size: 9px;">
+                    {#if d.slides}<span style="font-weight: 700;">{d.slides}</span> slides{:else if d.pages}<span style="font-weight: 700;">{d.pages}</span> pages{:else if d.text_chars}<span style="font-weight: 700;">{d.text_chars.toLocaleString()}</span> chars{:else}—{/if}
+                    {#if d.tables_extracted > 0} · {d.tables_extracted} tbl{/if}
+                    {#if d.images_described > 0} · {d.images_described} img{/if}
                   </td>
-                  <td style="text-align: center;">{qaCount}</td>
+                  <td style="text-align: center;"><span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: var(--color-primary); color: white;">INDEXED</span></td>
                   <td style="text-align: center;">
-                    <div style="display: inline-flex; align-items: center; gap: 4px;">
-                      <div style="width: 40px; height: 5px; background: var(--color-surface-dim);">
-                        <div style="height: 100%; width: {health}%; background: {health >= 70 ? 'var(--color-primary)' : health >= 40 ? 'var(--color-warning)' : 'var(--color-error)'};"></div>
-                      </div>
-                      <span style="font-size: 9px;">{health}%</span>
-                    </div>
-                  </td>
-                  <td style="text-align: center;">
-                    {#if canEdit}<button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={(e) => { e.stopPropagation(); deleteTable(t.name); }}>DEL</button>{/if}
+                    {#if canEdit}<button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer;" onclick={() => deleteDoc(d.name)}>DEL</button>{/if}
                   </td>
                 </tr>
+              {/each}
+              <!-- Data Tables -->
+              {#each (detail?.tables || []) as t}
+                {#if true}
+                  {@const isTrained = knowledgeFiles.some((f: any) => f.type === 'tables' && f.name === t.name + '.json')}
+                  {@const qaCount = (training?.training_qa || []).filter((q: any) => q.source_table === t.name).length}
+                  {@const health = t.health || (isTrained ? (qaCount > 0 ? 100 : 60) : 0)}
+                  <tr style="cursor: pointer;" onclick={() => toggleTableExpand(t.name)}>
+                    <td style="font-weight: 900; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="{t.name}">{t.name}</td>
+                    <td style="text-align: center;"><span style="font-size: 7px; font-weight: 900; padding: 1px 5px; background: var(--color-primary); color: white;">TABLE</span></td>
+                    <td style="text-align: center; font-size: 9px;">{(t.rows || 0).toLocaleString()} rows</td>
+                    <td style="text-align: center; font-size: 9px;"><span style="font-weight: 700;">{t.columns || 0}</span> cols · {qaCount} Q&A</td>
+                    <td style="text-align: center;">
+                      <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: {isTrained ? 'var(--color-primary)' : 'var(--color-warning)'}; color: white;">{isTrained ? 'TRAINED' : 'PENDING'}</span>
+                    </td>
+                    <td style="text-align: center;">
+                      <div style="display: inline-flex; align-items: center; gap: 3px;">
+                        <div style="width: 30px; height: 4px; background: var(--color-surface-dim);">
+                          <div style="height: 100%; width: {health}%; background: {health >= 70 ? 'var(--color-primary)' : health >= 40 ? 'var(--color-warning)' : 'var(--color-error)'};"></div>
+                        </div>
+                        <span style="font-size: 8px;">{health}%</span>
+                        {#if canEdit}<button class="feedback-btn" style="font-size: 7px; color: var(--color-error); border-color: var(--color-error); padding: 1px 5px; cursor: pointer; margin-left: 4px;" onclick={(e) => { e.stopPropagation(); deleteTable(t.name); }}>DEL</button>{/if}
+                      </div>
+                    </td>
+                  </tr>
+                {/if}
               {/each}
             </tbody>
           </table>
         </div>
+        {#if docs.length === 0 && (!detail?.tables || detail.tables.length === 0)}
+          <div style="padding: 12px; font-size: 11px; color: var(--color-on-surface-dim); text-align: center;">DROP_OR_SELECT_FILES_TO_BEGIN</div>
+        {/if}
       </div>
     {/if}
 
@@ -2149,7 +2673,7 @@
       <div>
         <div style="font-size: 18px; font-weight: 900; text-transform: uppercase;">Knowledge Graph</div>
         <div style="font-size: 10px; color: var(--color-on-surface-dim); text-transform: uppercase; letter-spacing: 0.08em; margin-top: 2px;">
-          {detail?.tables?.length || 0} tables · {[...(lineage?.relationships || []), ...relationships].length} relationships · {brainMemories.length} memories · {rules.length} rules
+          {detail?.tables?.length || 0} tables · {[...(lineage?.relationships || []), ...relationships].length} relationships · {kgTriples.length} triples · {brainMemories.length} memories
         </div>
       </div>
     </div>
@@ -2164,6 +2688,7 @@
           relationships={allRels}
           memories={brainMemories}
           rules={rules}
+          triples={kgTriples}
           onNodeClick={(node) => { graphSelectedNode = node; }}
         />
       </div>
@@ -2199,6 +2724,29 @@
             <div style="font-size: 8px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: #555; margin-bottom: 4px;">COLUMN</div>
             <div style="font-size: 13px; font-weight: 700;">{graphSelectedNode.table}.{graphSelectedNode.name}</div>
             <div style="font-size: 11px; color: var(--color-on-surface-dim); margin-top: 4px;">Type: {graphSelectedNode.type} · Nullable: {graphSelectedNode.nullable ? 'Yes' : 'No'}</div>
+          {:else if graphSelectedNode.type === 'entity'}
+            <div style="font-size: 8px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: #ff9d00; margin-bottom: 4px;">ENTITY</div>
+            <div style="font-size: 16px; font-weight: 900;">{graphSelectedNode.name}</div>
+            <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-top: 4px;">Source: {graphSelectedNode.source_type} · Community: {graphSelectedNode.community ?? '?'}</div>
+            {#if kgTriples.length > 0}
+              <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; margin-top: 8px; margin-bottom: 4px;">RELATIONSHIPS</div>
+              {#each kgTriples.filter(t => t.subject === graphSelectedNode.name || t.object === graphSelectedNode.name).slice(0, 10) as t}
+                <div style="font-size: 10px; margin-bottom: 2px;">
+                  <span style="font-weight: 700;">{t.subject}</span>
+                  <span style="color: var(--color-on-surface-dim); font-style: italic;"> {t.predicate} </span>
+                  <span style="font-weight: 700;">{t.object}</span>
+                  <span style="font-size: 8px; color: #666; margin-left: 4px;">[{t.source_type}]</span>
+                </div>
+              {/each}
+            {/if}
+          {:else if graphSelectedNode.type === 'metric'}
+            <div style="font-size: 8px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: #e74c3c; margin-bottom: 4px;">METRIC</div>
+            <div style="font-size: 16px; font-weight: 900;">{graphSelectedNode.name}</div>
+            <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-top: 4px;">Source: {graphSelectedNode.source_type}</div>
+          {:else if graphSelectedNode.type === 'document'}
+            <div style="font-size: 8px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: #0078d4; margin-bottom: 4px;">DOCUMENT</div>
+            <div style="font-size: 16px; font-weight: 900;">{graphSelectedNode.name}</div>
+            <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-top: 4px;">Source: {graphSelectedNode.source_type}</div>
           {/if}
         </div>
       {/if}
@@ -2268,6 +2816,76 @@
       </div>
     {/if}
 
+    <!-- Knowledge Graph Triples (Cross-Source) -->
+    {#if kgTriples.length > 0}
+      <div style="font-size: 13px; font-weight: 900; text-transform: uppercase; margin-top: 20px; margin-bottom: 8px;">Cross-Source Knowledge Graph</div>
+      <div class="cli-terminal" style="margin-bottom: 12px; padding: 10px 14px;">
+        <div class="cli-line">
+          <span class="cli-prompt">$</span>
+          <span class="cli-command">dash knowledge-graph</span>
+          <span class="cli-output">--triples</span>
+        </div>
+        <div class="cli-line">
+          <span style="color: #555;">&gt;</span>
+          <span class="cli-dim">{kgTriples.filter(t => !t.inferred).length} extracted triples</span>
+        </div>
+        <div class="cli-line">
+          <span style="color: #555;">&gt;</span>
+          <span class="cli-dim">{kgTriples.filter(t => t.inferred).length} inferred relationships</span>
+        </div>
+        <div class="cli-line">
+          <span style="color: #555;">&gt;</span>
+          <span class="cli-dim">{new Set(kgTriples.map(t => t.community)).size} communities detected</span>
+        </div>
+        <div class="cli-line">
+          <span class="cli-check">&#10003;</span>
+          <span class="cli-command">{kgTriples.length} total triples across {new Set([...kgTriples.map(t => t.source_type)]).size} source types</span>
+        </div>
+      </div>
+
+      <!-- Source type filter -->
+      {@const sourceTypes = [...new Set(kgTriples.map(t => t.source_type))]}
+      <div style="display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap;">
+        {#each sourceTypes as st}
+          <span style="font-size: 9px; font-weight: 700; padding: 2px 8px; background: {st === 'table' ? '#336791' : st === 'document' ? '#0078d4' : st === 'fact' ? '#ff9d00' : '#888'}; color: white; text-transform: uppercase;">
+            {st} ({kgTriples.filter(t => t.source_type === st).length})
+          </span>
+        {/each}
+      </div>
+
+      <!-- Triples table -->
+      <div class="ink-border" style="overflow-x: auto; margin-bottom: 16px;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 11px; font-family: var(--font-family-display);">
+          <thead>
+            <tr style="border-bottom: 2px solid var(--color-on-surface); text-transform: uppercase; font-size: 9px; font-weight: 900; letter-spacing: 0.1em;">
+              <th style="text-align: left; padding: 8px 12px;">SUBJECT</th>
+              <th style="text-align: left; padding: 8px 12px;">PREDICATE</th>
+              <th style="text-align: left; padding: 8px 12px;">OBJECT</th>
+              <th style="text-align: left; padding: 8px 12px;">SOURCE</th>
+              <th style="text-align: left; padding: 8px 12px;">CONF</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each kgTriples.slice(0, 50) as triple}
+              <tr style="border-bottom: 1px solid var(--color-surface-dim); opacity: {triple.inferred ? 0.7 : 1};">
+                <td style="padding: 6px 12px; font-weight: 700;">{triple.subject}</td>
+                <td style="padding: 6px 12px; color: var(--color-on-surface-dim); font-style: italic;">{triple.predicate}</td>
+                <td style="padding: 6px 12px;">{triple.object}</td>
+                <td style="padding: 6px 12px;">
+                  <span style="font-size: 9px; font-weight: 700; padding: 1px 6px; background: {triple.source_type === 'table' ? '#336791' : triple.source_type === 'document' ? '#0078d4' : triple.source_type === 'fact' ? '#ff9d00' : '#888'}; color: white;">{triple.source_type?.toUpperCase()}</span>
+                  {#if triple.inferred}<span style="font-size: 8px; margin-left: 4px; color: var(--color-on-surface-dim);">inferred</span>{/if}
+                </td>
+                <td style="padding: 6px 12px; font-size: 10px; color: var(--color-on-surface-dim);">{triple.confidence ? Math.round(triple.confidence * 100) + '%' : ''}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+        {#if kgTriples.length > 50}
+          <div style="padding: 8px 12px; font-size: 10px; color: var(--color-on-surface-dim);">Showing 50 of {kgTriples.length} triples</div>
+        {/if}
+      </div>
+    {/if}
+
   <!-- ═══ AGENTS ═══ -->
   {:else if activeTab === 'agents'}
     <!-- CLI Status -->
@@ -2290,7 +2908,7 @@
         <span class="cli-dim" style="margin-left: 8px;">{project?.schema_name || slug}</span>
       </div>
       <div style="border-top: 1px solid #333; margin: 6px 0;"></div>
-      {#each agentsData?.agents || [{name:'Leader',role:'routes requests',status:'active'},{name:'Analyst',role:'SQL · reasoning',status:'active'},{name:'Engineer',role:'views · computed data',status:'active'},{name:'Researcher',role:'document RAG · vision',status:'active'}] as agent}
+      {#each (agentsData?.agents || []).filter((a: any) => a.type !== 'specialist') as agent}
         <div class="cli-line">
           <span style="color: #555;">&gt;</span>
           {#if agent.status === 'active'}
@@ -2300,11 +2918,31 @@
           {/if}
           <span class="cli-command">{agent.name}</span>
           <span class="cli-dim">{agent.role}</span>
+          {#if agent.tools}<span style="font-size: 8px; color: #00fc40; margin-left: 4px;">{agent.tools} tools</span>{/if}
           {#if agent.status === 'standby'}
             <span style="font-size: 8px; color: #888; margin-left: 4px;">(standby)</span>
           {/if}
         </div>
       {/each}
+      {#if (agentsData?.agents || []).some((a: any) => a.type === 'specialist')}
+        <div style="border-top: 1px solid #333; margin: 4px 0;"></div>
+        <div class="cli-line">
+          <span class="cli-info">SPECIALIST AGENTS</span>
+          <span class="cli-dim" style="margin-left: 8px;">(tools on Analyst, auto-triggered by question type)</span>
+        </div>
+        {#each (agentsData?.agents || []).filter((a: any) => a.type === 'specialist') as agent}
+          <div class="cli-line" style="padding-left: 16px;">
+            <span style="color: #555;">├──</span>
+            {#if agent.status === 'active'}
+              <span style="color: #ff9d00;">●</span>
+            {:else}
+              <span style="color: #555;">○</span>
+            {/if}
+            <span style="color: #ff9d00; font-weight: 700;">{agent.name}</span>
+            <span class="cli-dim" style="font-size: 9px;">{agent.role?.split('·')[0]?.trim()}</span>
+          </div>
+        {/each}
+      {/if}
       <div style="border-top: 1px solid #333; margin: 6px 0;"></div>
       <div class="cli-line">
         <span class="cli-info">REASONING</span>
@@ -2322,9 +2960,28 @@
       </div>
     </div>
 
-    <!-- Agent Brain — 9 Context Layers -->
+    <!-- Specialist Agent Cards -->
+    {#if (agentsData?.agents || []).some((a: any) => a.type === 'specialist')}
+      <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;">SPECIALIST AGENTS</div>
+      <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-bottom: 20px;">
+        {#each (agentsData?.agents || []).filter((a: any) => a.type === 'specialist') as agent}
+          <div class="ink-border" style="padding: 10px 12px; background: var(--color-surface-bright); border-left: 3px solid {agent.status === 'active' ? '#ff9d00' : '#555'};">
+            <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: {agent.status === 'active' ? '#ff9d00' : '#555'}; display: inline-block;"></span>
+              <span style="font-size: 11px; font-weight: 900;">{agent.name}</span>
+            </div>
+            <div style="font-size: 9px; color: var(--color-on-surface-dim); line-height: 1.4;">{agent.role}</div>
+            {#if agent.trigger}
+              <div style="font-size: 8px; color: #888; margin-top: 4px;">Triggers: <span style="color: #ff9d00;">{agent.trigger}</span></div>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
+
+    <!-- Agent Brain — 12 Context Layers -->
     <div style="margin-bottom: 20px;">
-      <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;">AGENT BRAIN — 9 CONTEXT LAYERS</div>
+      <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;">AGENT BRAIN — 12 CONTEXT LAYERS</div>
       <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;">
         <div class="ink-border" style="padding: 8px 10px; background: var(--color-surface-bright); text-align: center;">
           <div style="font-size: 8px; font-weight: 900; text-transform: uppercase; color: var(--color-on-surface-dim);">Proven Patterns</div>
@@ -3091,6 +3748,377 @@
           {#if importPreview.memories?.length}<div style="font-size: 10px; margin-bottom: 4px;"><strong>{importPreview.memories.length}</strong> memories</div>{/if}
           {#if importPreview.patterns?.length}<div style="font-size: 10px; margin-bottom: 4px;"><strong>{importPreview.patterns.length}</strong> query patterns</div>{/if}
           {#if importPreview.annotations?.length}<div style="font-size: 10px; margin-bottom: 4px;"><strong>{importPreview.annotations.length}</strong> annotations</div>{/if}
+        </div>
+      {/if}
+    {/if}
+
+  <!-- ═══ SOURCES ═══ -->
+  {:else if activeTab === 'sources'}
+    <div class="cli-terminal" style="margin-bottom: 16px; padding: 10px 14px;">
+      <div class="cli-line">
+        <span class="cli-prompt">$</span>
+        <span class="cli-command">dash sources</span>
+        <span class="cli-output">--project {slug}</span>
+        {#if spSources.length + gdSources.length + dbSources.length > 0}
+          <span class="cli-success" style="margin-left: auto;">{spSources.length + gdSources.length + dbSources.length} connected</span>
+        {:else}
+          <span class="cli-dim" style="margin-left: auto;">no sources</span>
+        {/if}
+      </div>
+    </div>
+
+    <!-- All connected sources -->
+    {#if spSources.length + gdSources.length + dbSources.length > 0}
+      <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">CONNECTED SOURCES</div>
+      {#each spSources as src}
+        <div class="ink-border" style="padding: 10px 14px; background: var(--color-surface-bright); margin-bottom: 6px; display: flex; align-items: center; gap: 10px;">
+          <div style="width: 28px; height: 28px; background: #0078d4; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 9px;">SP</div>
+          <div style="flex: 1;">
+            <div style="font-size: 11px; font-weight: 900;">{src.site_name || 'SharePoint'} <span style="font-size: 9px; color: var(--color-on-surface-dim);">{src.folder_path}</span></div>
+            <div style="font-size: 9px; color: var(--color-on-surface-dim);">{src.files_synced} files {#if src.last_sync_at}&middot; {src.last_sync_at.slice(0, 16)}{/if}</div>
+          </div>
+          <button class="send-btn" style="font-size: 8px; padding: 3px 8px;" disabled={spSyncing} onclick={() => spSync(src.id)}>{spSyncing ? '...' : 'SYNC'}</button>
+          <button style="background: none; border: 1px solid #e74c3c; color: #e74c3c; padding: 3px 6px; font-size: 8px; font-family: var(--font-family-display); cursor: pointer;" onclick={() => spDelete(src.id)}>X</button>
+        </div>
+      {/each}
+      {#each gdSources as src}
+        <div class="ink-border" style="padding: 10px 14px; background: var(--color-surface-bright); margin-bottom: 6px; display: flex; align-items: center; gap: 10px;">
+          <div style="width: 28px; height: 28px; background: #4285f4; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 9px;">GD</div>
+          <div style="flex: 1;">
+            <div style="font-size: 11px; font-weight: 900;">Google Drive <span style="font-size: 9px; color: var(--color-on-surface-dim);">{src.folder_path}</span></div>
+            <div style="font-size: 9px; color: var(--color-on-surface-dim);">{src.files_synced} files {#if src.last_sync_at}&middot; {src.last_sync_at.slice(0, 16)}{/if}</div>
+          </div>
+          <button class="send-btn" style="font-size: 8px; padding: 3px 8px;" disabled={gdSyncing} onclick={() => gdSync(src.id)}>{gdSyncing ? '...' : 'SYNC'}</button>
+          <button style="background: none; border: 1px solid #e74c3c; color: #e74c3c; padding: 3px 6px; font-size: 8px; font-family: var(--font-family-display); cursor: pointer;" onclick={() => gdDelete(src.id)}>X</button>
+        </div>
+      {/each}
+      {#each dbSources as src}
+        <div class="ink-border" style="padding: 10px 14px; background: var(--color-surface-bright); margin-bottom: 6px; display: flex; align-items: center; gap: 10px;">
+          <div style="width: 28px; height: 28px; background: {src.db_type === 'mysql' ? '#00758f' : src.db_type === 'fabric' ? '#0078d4' : '#336791'}; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 9px;">{src.db_type === 'mysql' ? 'MY' : src.db_type === 'fabric' ? 'FB' : 'PG'}</div>
+          <div style="flex: 1;">
+            <div style="font-size: 11px; font-weight: 900;">{src.db_type?.toUpperCase()} <span style="font-size: 9px; color: var(--color-on-surface-dim);">{src.host}:{src.port}/{src.database}</span></div>
+            <div style="font-size: 9px; color: var(--color-on-surface-dim);">{src.tables_synced || 0} tables {#if src.last_sync_at}&middot; {src.last_sync_at.slice(0, 16)}{/if}</div>
+          </div>
+          <button class="send-btn" style="font-size: 8px; padding: 3px 8px;" disabled={dbSyncing} onclick={() => dbSync(src.id)}>{dbSyncing ? '...' : 'SYNC'}</button>
+          <button style="background: none; border: 1px solid #e74c3c; color: #e74c3c; padding: 3px 6px; font-size: 8px; font-family: var(--font-family-display); cursor: pointer;" onclick={() => dbDelete(src.id)}>X</button>
+        </div>
+      {/each}
+
+      <!-- Sync logs -->
+      {#if spSyncLog.length + gdSyncLog.length + dbSyncLog.length > 0}
+        <div class="cli-terminal" style="margin-top: 8px; padding: 8px 12px; max-height: 200px; overflow-y: auto;">
+          {#each [...spSyncLog, ...gdSyncLog, ...dbSyncLog] as log}
+            <div class="cli-line"><span style="color: {log.step?.includes('Error') ? '#e74c3c' : log.step?.includes('Complete') ? '#00fc40' : '#888'};">[{log.step}]</span> <span class="cli-dim">{log.detail}</span></div>
+          {/each}
+        </div>
+      {/if}
+      <div style="margin-top: 12px; border-top: 1px solid var(--color-surface-dim); padding-top: 12px;"></div>
+    {/if}
+
+    <!-- Connector type picker -->
+    {#if sourceType === 'none'}
+      <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;">ADD DATA SOURCE</div>
+      <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px;">
+        <!-- SharePoint -->
+        <button class="ink-border" style="padding: 16px; background: var(--color-surface-bright); cursor: pointer; text-align: center; border-width: 2px; opacity: {spConfigured ? 1 : 0.5};"
+          onclick={() => { if (spConfigured) { sourceType = 'sharepoint'; spStartConnect(); } }}
+          disabled={!spConfigured}>
+          <div style="width: 36px; height: 36px; background: #0078d4; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 11px; margin: 0 auto 8px;">SP</div>
+          <div style="font-size: 12px; font-weight: 900;">SharePoint</div>
+          <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-top: 2px;">File sync (Excel, PDF, PPTX)</div>
+          {#if !spConfigured}<div style="font-size: 8px; color: #e74c3c; margin-top: 4px;">Admin setup required</div>{/if}
+        </button>
+        <!-- Google Drive -->
+        <button class="ink-border" style="padding: 16px; background: var(--color-surface-bright); cursor: pointer; text-align: center; border-width: 2px; opacity: {gdConfigured ? 1 : 0.5};"
+          onclick={() => { if (gdConfigured) { sourceType = 'gdrive'; gdStartConnect(); } }}
+          disabled={!gdConfigured}>
+          <div style="width: 36px; height: 36px; background: #4285f4; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 11px; margin: 0 auto 8px;">GD</div>
+          <div style="font-size: 12px; font-weight: 900;">Google Drive</div>
+          <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-top: 2px;">File sync (Sheets, Docs, Slides)</div>
+          {#if !gdConfigured}<div style="font-size: 8px; color: #e74c3c; margin-top: 4px;">Admin setup required</div>{/if}
+        </button>
+        <!-- PostgreSQL -->
+        <button class="ink-border" style="padding: 16px; background: var(--color-surface-bright); cursor: pointer; text-align: center; border-width: 2px;"
+          onclick={() => { sourceType = 'database'; dbType = 'postgresql'; dbPort = '5432'; dbStep = 'form'; }}>
+          <div style="width: 36px; height: 36px; background: #336791; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 11px; margin: 0 auto 8px;">PG</div>
+          <div style="font-size: 12px; font-weight: 900;">PostgreSQL</div>
+          <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-top: 2px;">Sync or live query</div>
+        </button>
+        <!-- MySQL -->
+        <button class="ink-border" style="padding: 16px; background: var(--color-surface-bright); cursor: pointer; text-align: center; border-width: 2px;"
+          onclick={() => { sourceType = 'database'; dbType = 'mysql'; dbPort = '3306'; dbStep = 'form'; }}>
+          <div style="width: 36px; height: 36px; background: #00758f; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 11px; margin: 0 auto 8px;">MY</div>
+          <div style="font-size: 12px; font-weight: 900;">MySQL</div>
+          <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-top: 2px;">Sync or live query</div>
+        </button>
+        <!-- Microsoft Fabric -->
+        <button class="ink-border" style="padding: 16px; background: var(--color-surface-bright); cursor: pointer; text-align: center; border-width: 2px;"
+          onclick={() => { sourceType = 'database'; dbType = 'fabric'; dbPort = '1433'; dbStep = 'form'; }}>
+          <div style="width: 36px; height: 36px; background: #0078d4; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 11px; margin: 0 auto 8px;">FB</div>
+          <div style="font-size: 12px; font-weight: 900;">Microsoft Fabric</div>
+          <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-top: 2px;">Live SQL query</div>
+        </button>
+      </div>
+
+    <!-- ── Database Connection Wizard ── -->
+    {:else if sourceType === 'database'}
+      {#if dbStep === 'form'}
+        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;">
+          CONNECT {dbType.toUpperCase()} DATABASE
+        </div>
+        <div class="ink-border" style="padding: 16px; background: var(--color-surface-bright); max-width: 450px;">
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <div>
+              <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">HOST</div>
+              <input type="text" bind:value={dbHost} placeholder={dbType === 'fabric' ? 'workspace.datawarehouse.fabric.microsoft.com' : 'db.company.com'} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+            </div>
+            <div style="display: flex; gap: 8px;">
+              <div style="flex: 1;">
+                <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">PORT</div>
+                <input type="text" bind:value={dbPort} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+              </div>
+              <div style="flex: 2;">
+                <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">DATABASE</div>
+                <input type="text" bind:value={dbName} placeholder="analytics" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px;">
+              <div style="flex: 1;">
+                <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">USERNAME</div>
+                <input type="text" bind:value={dbUser} placeholder="readonly" style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+              </div>
+              <div style="flex: 1;">
+                <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 2px;">PASSWORD</div>
+                <input type="password" bind:value={dbPass} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);" />
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px; margin-top: 4px;">
+              <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px;" onclick={() => { sourceType = 'none'; dbStep = 'idle'; }}>CANCEL</button>
+              <button class="send-btn" style="font-size: 10px; padding: 6px 16px;" disabled={dbTesting || !dbHost || !dbName || !dbUser} onclick={dbTestConnection}>
+                {dbTesting ? 'TESTING...' : 'TEST CONNECTION'}
+              </button>
+            </div>
+            {#if dbTestResult}
+              <div style="font-size: 10px; color: {dbTestResult.error ? '#e74c3c' : '#00fc40'}; font-weight: 700; margin-top: 4px;">
+                {dbTestResult.error || `Connected! ${dbTestResult.tables?.length || 0} tables found`}
+              </div>
+            {/if}
+          </div>
+        </div>
+
+      {:else if dbStep === 'tables'}
+        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;">SELECT TABLES TO SYNC</div>
+        <div style="margin-bottom: 8px;">
+          <label style="font-size: 10px; cursor: pointer;">
+            <input type="checkbox" checked={dbSelectedTables.length === dbRemoteTables.length}
+              onchange={() => { dbSelectedTables = dbSelectedTables.length === dbRemoteTables.length ? [] : [...dbRemoteTables]; }} />
+            Select All ({dbRemoteTables.length})
+          </label>
+        </div>
+        <div style="max-height: 300px; overflow-y: auto; border: 1px solid var(--color-surface-dim); padding: 8px;">
+          {#each dbRemoteTables as tbl}
+            <label style="display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 11px; cursor: pointer;">
+              <input type="checkbox" checked={dbSelectedTables.includes(tbl)}
+                onchange={() => {
+                  if (dbSelectedTables.includes(tbl)) dbSelectedTables = dbSelectedTables.filter(t => t !== tbl);
+                  else dbSelectedTables = [...dbSelectedTables, tbl];
+                }} />
+              {tbl}
+            </label>
+          {/each}
+        </div>
+        <div style="display: flex; gap: 8px; margin-top: 10px;">
+          <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px;" onclick={() => dbStep = 'form'}>BACK</button>
+          <button class="send-btn" style="font-size: 10px; padding: 6px 16px;" disabled={dbLoading || dbSelectedTables.length === 0} onclick={dbConnect}>
+            {dbLoading ? 'CONNECTING...' : `CONNECT & SYNC ${dbSelectedTables.length} TABLES`}
+          </button>
+        </div>
+      {/if}
+
+    <!-- ── Google Drive wizard (after OAuth redirect) ── -->
+    {:else if sourceType === 'gdrive'}
+      {#if gdStep === 'browse'}
+        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">SELECT GOOGLE DRIVE FOLDER</div>
+        <div style="display: flex; align-items: center; gap: 4px; margin-bottom: 8px; flex-wrap: wrap;">
+          {#each gdFolderPath as crumb, i}
+            {#if i > 0}<span style="color: var(--color-on-surface-dim);">/</span>{/if}
+            <button style="background: none; border: none; font-family: var(--font-family-display); font-size: 10px; font-weight: 700; cursor: pointer; color: {i === gdFolderPath.length - 1 ? 'var(--color-on-surface)' : '#4285f4'}; padding: 2px 4px;" onclick={() => gdNavigateBreadcrumb(i)}>{crumb.name}</button>
+          {/each}
+        </div>
+        {#if gdLoading}
+          <div style="font-size: 11px; color: var(--color-on-surface-dim);">Loading...</div>
+        {:else}
+          {#each gdFolders as folder}
+            <div style="display: flex; align-items: center; gap: 8px; padding: 5px 10px; cursor: pointer; border-bottom: 1px solid var(--color-surface-dim);" onclick={() => gdNavigateFolder(folder.id, folder.name)}>
+              <span>&#128193;</span> <span style="font-size: 11px; font-weight: 700;">{folder.name}</span> <span style="font-size: 10px; margin-left: auto;">&rarr;</span>
+            </div>
+          {/each}
+          {#each gdFiles.slice(0, 15) as file}
+            <div style="display: flex; align-items: center; gap: 8px; padding: 3px 10px; font-size: 10px; border-bottom: 1px solid var(--color-surface-dim); opacity: {file.supported ? 1 : 0.4};">
+              <span>{file.supported ? '&#9745;' : '&#9744;'}</span> <span style="flex: 1;">{file.name}</span> <span style="color: var(--color-on-surface-dim);">{(file.size / 1024).toFixed(0)}KB</span>
+            </div>
+          {/each}
+        {/if}
+        <div style="display: flex; gap: 8px; margin-top: 10px;">
+          <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px;" onclick={() => { sourceType = 'none'; gdStep = 'idle'; }}>CANCEL</button>
+          <button class="send-btn" style="font-size: 10px; padding: 6px 16px;" onclick={gdFinalize}>SELECT THIS FOLDER</button>
+        </div>
+      {:else}
+        <div style="font-size: 11px; color: var(--color-on-surface-dim);">Redirecting to Google sign-in...</div>
+      {/if}
+
+    <!-- ── SharePoint wizard (existing) ── -->
+    {:else if sourceType === 'sharepoint'}
+      <!-- Connect SharePoint -->
+      {#if spStep === 'idle'}
+        <button class="send-btn" style="padding: 10px 20px; font-size: 11px; display: flex; align-items: center; gap: 8px;" disabled={spLoading} onclick={spStartConnect}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          {spLoading ? 'CONNECTING...' : 'CONNECT SHAREPOINT'}
+        </button>
+        <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-top: 6px;">
+          Sign in with your Microsoft account to connect SharePoint files
+        </div>
+
+      <!-- Step 1: Pick Site -->
+      {:else if spStep === 'sites'}
+        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">SELECT SHAREPOINT SITE</div>
+        {#if spLoading}
+          <div style="font-size: 11px; color: var(--color-on-surface-dim);">Loading sites...</div>
+        {:else if spSites.length === 0}
+          <div style="font-size: 11px; color: var(--color-on-surface-dim);">No SharePoint sites found. Check your permissions.</div>
+        {:else}
+          {#each spSites as site}
+            <div class="ink-border" style="padding: 10px 14px; background: var(--color-surface-bright); margin-bottom: 6px; display: flex; align-items: center; gap: 10px; cursor: pointer;" onclick={() => spLoadDrives(site)}>
+              <div style="width: 32px; height: 32px; background: #0078d4; display: flex; align-items: center; justify-content: center; font-weight: 900; color: white; font-size: 12px;">SP</div>
+              <div style="flex: 1;">
+                <div style="font-size: 12px; font-weight: 900;">{site.name}</div>
+                <div style="font-size: 9px; color: var(--color-on-surface-dim);">{site.url}</div>
+              </div>
+              <span style="font-size: 12px;">&rarr;</span>
+            </div>
+          {/each}
+        {/if}
+        <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px; margin-top: 8px;" onclick={() => { spStep = 'idle'; sourceType = 'none'; }}>CANCEL</button>
+
+      <!-- Step 2: Pick Drive -->
+      {:else if spStep === 'drives'}
+        <div style="font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;">
+          {spSelectedSite?.name} &rarr; SELECT LIBRARY
+        </div>
+        {#if spLoading}
+          <div style="font-size: 11px; color: var(--color-on-surface-dim);">Loading libraries...</div>
+        {:else}
+          {#each spDrives as drive}
+            <div class="ink-border" style="padding: 10px 14px; background: var(--color-surface-bright); margin-bottom: 6px; display: flex; align-items: center; gap: 10px; cursor: pointer;" onclick={() => spBrowse(drive)}>
+              <div style="font-size: 16px;">&#128193;</div>
+              <div style="flex: 1;">
+                <div style="font-size: 12px; font-weight: 900;">{drive.name}</div>
+                <div style="font-size: 9px; color: var(--color-on-surface-dim);">{drive.type}</div>
+              </div>
+              <span style="font-size: 12px;">&rarr;</span>
+            </div>
+          {/each}
+        {/if}
+        <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px; margin-top: 8px;" onclick={() => spStep = 'sites'}>BACK</button>
+
+      <!-- Step 3: Browse Folders -->
+      {:else if spStep === 'browse'}
+        <!-- Breadcrumb -->
+        <div style="display: flex; align-items: center; gap: 4px; margin-bottom: 10px; flex-wrap: wrap;">
+          {#each spFolderPath as crumb, i}
+            {#if i > 0}<span style="color: var(--color-on-surface-dim);">/</span>{/if}
+            <button style="background: none; border: none; font-family: var(--font-family-display); font-size: 10px; font-weight: 700; cursor: pointer; color: {i === spFolderPath.length - 1 ? 'var(--color-on-surface)' : '#0078d4'}; padding: 2px 4px;" onclick={() => spNavigateBreadcrumb(i)}>{crumb.name}</button>
+          {/each}
+        </div>
+
+        {#if spLoading}
+          <div style="font-size: 11px; color: var(--color-on-surface-dim);">Loading...</div>
+        {:else}
+          <!-- Folders -->
+          {#each spFolders as folder}
+            <div style="display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; border-bottom: 1px solid var(--color-surface-dim);" onclick={() => spNavigateFolder(folder.id, folder.name)}>
+              <span style="font-size: 14px;">&#128193;</span>
+              <span style="font-size: 11px; font-weight: 700;">{folder.name}</span>
+              <span style="font-size: 9px; color: var(--color-on-surface-dim); margin-left: auto;">{folder.child_count} items</span>
+              <span style="font-size: 10px;">&rarr;</span>
+            </div>
+          {/each}
+
+          <!-- Files preview -->
+          {#if spFiles.length > 0}
+            <div style="margin-top: 8px; font-size: 9px; font-weight: 700; text-transform: uppercase; color: var(--color-on-surface-dim); margin-bottom: 4px;">FILES IN THIS FOLDER</div>
+            {#each spFiles.slice(0, 20) as file}
+              <div style="display: flex; align-items: center; gap: 8px; padding: 4px 10px; font-size: 10px; border-bottom: 1px solid var(--color-surface-dim); opacity: {file.supported ? 1 : 0.4};">
+                <span>{file.supported ? '&#9745;' : '&#9744;'}</span>
+                <span style="flex: 1;">{file.name}</span>
+                <span style="color: var(--color-on-surface-dim);">{file.ext}</span>
+                <span style="color: var(--color-on-surface-dim);">{(file.size / 1024).toFixed(0)}KB</span>
+              </div>
+            {/each}
+            {#if spFiles.length > 20}
+              <div style="font-size: 9px; color: var(--color-on-surface-dim); padding: 4px 10px;">...and {spFiles.length - 20} more files</div>
+            {/if}
+          {/if}
+
+          <!-- Type summary -->
+          {#if Object.keys(spTypeCounts).length > 0}
+            <div class="ink-border" style="margin-top: 10px; padding: 8px 12px; background: var(--color-surface-bright);">
+              <div style="font-size: 9px; font-weight: 700; margin-bottom: 4px;">SUPPORTED FILES</div>
+              <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                {#each Object.entries(spTypeCounts) as [ext, count]}
+                  <div style="font-size: 11px;"><strong>{count}</strong> <span style="color: var(--color-on-surface-dim);">.{ext}</span></div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        {/if}
+
+        <div style="display: flex; gap: 8px; margin-top: 12px;">
+          <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px;" onclick={() => spStep = 'drives'}>BACK</button>
+          <button class="send-btn" style="font-size: 10px; padding: 6px 16px;" onclick={() => spStep = 'confirm'}>SELECT THIS FOLDER</button>
+        </div>
+
+      <!-- Step 4: Confirm -->
+      {:else if spStep === 'confirm'}
+        <div class="ink-border" style="padding: 16px; background: var(--color-surface-bright);">
+          <div style="font-size: 14px; font-weight: 900; margin-bottom: 12px;">CONFIRM CONNECTION</div>
+
+          <div style="display: grid; grid-template-columns: 100px 1fr; gap: 6px; font-size: 11px;">
+            <span style="font-weight: 700;">SITE</span><span>{spSelectedSite?.name}</span>
+            <span style="font-weight: 700;">LIBRARY</span><span>{spSelectedDrive?.name}</span>
+            <span style="font-weight: 700;">FOLDER</span><span>{spFolderPath.map((f: any) => f.name).join(' / ')}</span>
+          </div>
+
+          <div style="margin-top: 12px;">
+            <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 4px;">FILE TYPES TO SYNC</div>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+              {#each ['xlsx', 'csv', 'pdf', 'pptx', 'docx', 'txt', 'jpg', 'png'] as ext}
+                <label style="display: flex; align-items: center; gap: 3px; font-size: 10px; cursor: pointer;">
+                  <input type="checkbox" checked={spFileTypes.includes(ext)} onchange={() => {
+                    if (spFileTypes.includes(ext)) spFileTypes = spFileTypes.filter((t: string) => t !== ext);
+                    else spFileTypes = [...spFileTypes, ext];
+                  }} />
+                  .{ext}
+                </label>
+              {/each}
+            </div>
+          </div>
+
+          <div style="margin-top: 12px;">
+            <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 4px;">AUTO-SYNC</div>
+            <div style="display: flex; gap: 6px;">
+              {#each [['manual', 'Manual'], ['daily', 'Daily'], ['hourly', 'Hourly']] as [val, label]}
+                <button style="padding: 4px 10px; font-size: 10px; font-weight: 700; border: 2px solid var(--color-on-surface); background: {spSyncSchedule === val ? 'var(--color-on-surface)' : 'var(--color-surface)'}; color: {spSyncSchedule === val ? 'var(--color-surface)' : 'var(--color-on-surface)'}; cursor: pointer; font-family: var(--font-family-display);" onclick={() => spSyncSchedule = val}>{label}</button>
+              {/each}
+            </div>
+          </div>
+
+          <div style="display: flex; gap: 8px; margin-top: 16px;">
+            <button class="feedback-btn" style="font-size: 9px; padding: 4px 10px;" onclick={() => spStep = 'browse'}>BACK</button>
+            <button class="send-btn" style="font-size: 11px; padding: 6px 20px;" disabled={spLoading} onclick={spFinalize}>
+              {spLoading ? 'CONNECTING...' : 'CONNECT & SYNC'}
+            </button>
+          </div>
         </div>
       {/if}
     {/if}

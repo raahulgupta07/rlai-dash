@@ -519,6 +519,10 @@
             PRESENTATIONS
           </button>
           {#if isSuper}
+            <button onclick={() => window.location.href = '/ui/brain'} class="nav-btn" class:nav-btn-active={page.url.pathname.includes('/brain')} style="cursor: pointer;">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a8 8 0 0 1 0 16"/><path d="M12 2a8 8 0 0 0 0 16"/><path d="M2 12h20"/></svg>
+              BRAIN
+            </button>
             <button onclick={() => window.location.href = '/ui/command-center'} class="nav-btn" class:nav-btn-active={isDashboard} style="cursor: pointer;">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
               COMMAND CENTER

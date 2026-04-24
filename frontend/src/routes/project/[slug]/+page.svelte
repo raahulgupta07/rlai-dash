@@ -36,7 +36,8 @@
     chartType?: ChartType;
     qualityScore?: number;
     showTrace?: boolean;
-    activeTab?: 'insight' | 'analysis' | 'data' | 'query' | 'graph';
+    activeTab?: 'analysis' | 'data' | 'query' | 'chart' | 'sources';
+    dataTableIndex?: number;
     reasoningUsed?: string;
     analysisUsed?: string;
     proposedLearnings?: string[];
@@ -96,6 +97,105 @@
     insights = insights.filter(i => i.id !== id);
   }
 
+  function cleanUserMessage(raw: string): string {
+    if (!raw) return raw;
+    // Only clean if it's clearly a system prompt (starts with CRITICAL or contains it)
+    if (!raw.includes('CRITICAL STYLE RULE')) return raw;
+    // The real question is at the very end — find it
+    // Pattern: everything after the last "]" that's not a tag
+    const parts = raw.split(/\[RELATED:[^\]]*\]/g);
+    const lastPart = parts[parts.length - 1]?.trim();
+    if (lastPart && lastPart.length > 3 && lastPart.length < 200) return lastPart;
+    // Fallback: show raw (better than empty)
+    return raw;
+  }
+
+  /** Generate a human-readable caption for a chart from table data */
+  function generateChartCaption(tbl: {headers: string[]; rows: string[][]}): string {
+    if (!tbl.headers.length || !tbl.rows.length) return '';
+    const label = tbl.headers[0] || 'Category';
+    // Find first numeric column
+    let numIdx = -1;
+    let numHeader = '';
+    for (let c = 1; c < tbl.headers.length; c++) {
+      const vals = tbl.rows.map(r => parseFloat((r[c] || '').replace(/[$,%,]/g, '')));
+      if (vals.filter(v => !isNaN(v)).length >= tbl.rows.length * 0.5) {
+        numIdx = c;
+        numHeader = tbl.headers[c];
+        break;
+      }
+    }
+    if (numIdx < 0) return `${tbl.rows.length} items by ${label}.`;
+
+    const values = tbl.rows.map(r => ({
+      label: (r[0] || '').replace(/\*\*/g, ''),
+      val: parseFloat((r[numIdx] || '').replace(/[$,%,]/g, ''))
+    })).filter(v => !isNaN(v.val));
+    if (values.length === 0) return '';
+
+    const sorted = [...values].sort((a, b) => b.val - a.val);
+    const top = sorted[0];
+    const bottom = sorted[sorted.length - 1];
+    const total = values.reduce((s, v) => s + v.val, 0);
+    const avg = total / values.length;
+
+    const fmt = (n: number) => n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(1) + 'K' : n % 1 === 0 ? n.toLocaleString() : n.toFixed(1);
+
+    let caption = `Highest ${numHeader}: ${top.label} (${fmt(top.val)})`;
+    if (sorted.length > 1 && top.label !== bottom.label) {
+      caption += `. Lowest: ${bottom.label} (${fmt(bottom.val)})`;
+    }
+    if (sorted.length >= 3) {
+      caption += `. Average: ${fmt(avg)}`;
+    }
+    // Check if values are mostly increasing/decreasing (time series)
+    if (values.length >= 4) {
+      let ups = 0, downs = 0;
+      for (let i = 1; i < values.length; i++) {
+        if (values[i].val > values[i-1].val) ups++;
+        else if (values[i].val < values[i-1].val) downs++;
+      }
+      if (ups > values.length * 0.7) caption += '. Trend: increasing ▲';
+      else if (downs > values.length * 0.7) caption += '. Trend: decreasing ▼';
+    }
+    return caption + '.';
+  }
+
+  /** Format a table cell: render markdown bold, [UP/DOWN/FLAT] badges, trend arrows, percentages */
+  function formatCell(cell: string): string {
+    if (!cell || typeof cell !== 'string') return cell || '';
+    let s = cell.trim();
+
+    // [UP:+3.7] / [DOWN:-2.0] / [FLAT:-0.3] → colored badge
+    const dirMatch = s.match(/^\[?(UP|DOWN|FLAT):?\s*([+-]?[\d.]+)\]?$/i);
+    if (dirMatch) {
+      const dir = dirMatch[1].toUpperCase();
+      const val = dirMatch[2];
+      if (dir === 'UP') return `<span style="color:#16a34a;font-weight:700;">▲ +${val.replace(/^\+/,'')}</span>`;
+      if (dir === 'DOWN') return `<span style="color:#dc2626;font-weight:700;">▼ ${val.startsWith('-') ? val : '-' + val}</span>`;
+      return `<span style="color:#a3a3a3;font-weight:700;">━ ${val}</span>`;
+    }
+
+    // Trend arrows: ▲ / ▼ / ━ or ↑ / ↓ / → with optional number
+    if (/^[▲↑]/.test(s)) return `<span style="color:#16a34a;font-weight:700;">${s}</span>`;
+    if (/^[▼↓]/.test(s)) return `<span style="color:#dc2626;font-weight:700;">${s}</span>`;
+    if (/^[━→]/.test(s)) return `<span style="color:#a3a3a3;font-weight:700;">${s}</span>`;
+
+    // **bold** markdown → <strong>
+    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+    // Percentage coloring: positive green, negative red
+    const pctMatch = s.match(/^([+-]?\d+\.?\d*)%$/);
+    if (pctMatch) {
+      const v = parseFloat(pctMatch[1]);
+      if (v > 50) return `<span style="color:#16a34a;font-weight:600;">${s}</span>`;
+      if (v < 20) return `<span style="color:#dc2626;font-weight:600;">${s}</span>`;
+    }
+
+    // Large numbers: right-align hint (handled via CSS)
+    return s;
+  }
+
   function trackPreference(action: string, value: string) {
     fetch(`/api/projects/${projectSlug}/track-preference`, {
       method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' },
@@ -147,11 +247,13 @@
         const loaded = data.messages || [];
         messages = loaded.map((m: any) => ({
           role: m.role,
-          content: m.content,
+          content: m.role === 'user' ? cleanUserMessage(m.content || '') : (m.content || ''),
+          rawContent: m.role === 'user' ? (m.content || '') : undefined,
           timestamp: '',
           status: m.role === 'assistant' ? 'done' : undefined,
           toolCalls: [],
           workflowExpanded: false,
+          showPrompt: false,
         }));
         scrollToBottom();
       }
@@ -343,7 +445,7 @@
               status: m.role === 'assistant' ? 'done' : undefined,
               toolCalls: [],
               workflowExpanded: false,
-              activeTab: 'insight',
+              activeTab: 'analysis',
             }));
           }
         }
@@ -876,11 +978,11 @@
           </div>${actionLine}
           <script>echarts.init(document.getElementById('${chartId}')).setOption(${chartOpt});<\/script>`;
       } else if (s.table) {
-        const headers = (s.table.headers||[]).map((h: string) => `<th style="padding:8px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#666;border-bottom:2px solid #1a1a1a;">${h}</th>`).join('');
-        const rows = (s.table.rows||[]).slice(0,12).map((r: string[], ri: number) => `<tr style="background:${ri%2===0?'#fafaf8':'#fff'};">${r.map((c: string) => `<td style="padding:7px 12px;font-size:12px;border-bottom:1px solid #eee;">${c}</td>`).join('')}</tr>`).join('');
+        const headers = (s.table.headers||[]).map((h: string) => `<th style="padding:9px 14px;text-align:left;font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:0.08em;color:#fff;background:#1a1a1a;border-right:1px solid rgba(255,255,255,0.12);">${h.replace(/\*\*/g,'')}</th>`).join('');
+        const rows = (s.table.rows||[]).slice(0,12).map((r: string[], ri: number) => `<tr style="background:${ri%2===0?'#fafaf8':'#fff'};">${r.map((c: string) => `<td style="padding:8px 14px;font-size:13px;border-bottom:1px solid #e5e5e0;line-height:1.5;">${formatCell(c)}</td>`).join('')}</tr>`).join('');
         content = `<div style="font-size:22px;font-weight:800;margin-bottom:20px;">${sTitle}</div>
           <div style="width:100%;height:2px;background:#1a1a1a;margin-bottom:20px;"></div>
-          <table style="width:100%;border-collapse:collapse;"><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table>${bullets}${actionLine}`;
+          <table style="width:100%;border-collapse:collapse;border:2px solid #1a1a1a;"><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table>${bullets}${actionLine}`;
       } else if (layout === 'recommendations') {
         const cards = (s.bullets||[]).map((b: string, bi: number) => `<div style="padding:16px;border:2px solid #e0e0d8;background:#fff;"><div style="font-size:10px;font-weight:900;color:#D24726;text-transform:uppercase;margin-bottom:6px;">PRIORITY ${bi+1}</div><div style="font-size:14px;color:#333;">${b}</div></div>`).join('');
         content = `<div style="font-size:22px;font-weight:800;margin-bottom:20px;">${sTitle}</div>
@@ -1227,7 +1329,7 @@
             {#if msg.role === 'user'}
               <div class="animate-fade-up">
                 <div class="flex items-start justify-end gap-3">
-                  <div class="bubble-user">{msg.content}</div>
+                  <div class="bubble-user">{cleanUserMessage(msg.content)}</div>
                   <div class="avatar-user">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
                   </div>
@@ -1296,15 +1398,18 @@
                         {/if}
                       </button>
                     {:else}
-                      <!-- Expanded / streaming CLI terminal -->
+                      <!-- CLI terminal — always shows agent activity -->
                       <div class="cli-terminal" onclick={() => msg.status === 'done' && toggleWorkflow(i)} style="{msg.status === 'done' ? 'cursor: pointer;' : ''}">
                         <div class="cli-line">
                           <span class="cli-prompt">$</span>
                           <span class="cli-command">dash exec</span>
                           <span class="cli-output">--agent {projectInfo?.agent_name || 'agent'}</span>
+                          {#if msg.status === 'done' && msg.toolCalls?.length}
+                            <span class="cli-success" style="margin-left: auto;">&#10003; {msg.toolCalls.length} steps {getTotalDuration(msg.toolCalls) ? '· ' + getTotalDuration(msg.toolCalls) : ''}</span>
+                          {/if}
                         </div>
 
-                        <!-- Tool calls -->
+                        <!-- Tool calls — ALWAYS visible (not just when expanded) -->
                         {#if msg.toolCalls && msg.toolCalls.length > 0}
                           {#each msg.toolCalls as tool}
                             <div class="cli-line">
@@ -1315,6 +1420,9 @@
                                 <span class="cli-spinner"><span></span><span></span><span></span></span>
                               {/if}
                               <span class="cli-command">{tool.name}</span>
+                              {#if tool.args}
+                                <span class="cli-dim" style="font-size: 9px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{typeof tool.args === 'string' ? tool.args.slice(0, 60) : ''}</span>
+                              {/if}
                               {#if tool.duration}
                                 <span class="cli-duration">{tool.duration}</span>
                               {/if}
@@ -1328,19 +1436,70 @@
                           </div>
                         {/if}
 
-                        <!-- Done / cursor -->
-                        {#if msg.status === 'done' && msg.toolCalls && msg.toolCalls.length > 0}
-                          <div class="cli-line" style="margin-top: 4px;">
-                            <span class="cli-prompt">$</span>
-                            <span class="cli-success">done</span>
-                            <span class="cli-dim">· {msg.toolCalls.length} steps {getTotalDuration(msg.toolCalls) ? '· ' + getTotalDuration(msg.toolCalls) : ''}{msg.qualityScore ? ' · ' + renderStars(msg.qualityScore) : ''}</span>
+                        <!-- Analysis details (shown when done) -->
+                        {#if msg.status === 'done' && msg.content}
+                          <div style="border-top: 1px solid #333; margin-top: 4px; padding-top: 4px;">
+                            {#if msg.content.match(/\[MODE:(\w+)\]/)}
+                              <div class="cli-line">
+                                <span style="color: #555;">──</span>
+                                <span class="cli-dim">mode:</span>
+                                <span style="color: #00fc40; font-weight: 700;">{(msg.content.match(/\[MODE:(\w+)\]/) || ['','auto'])[1].toUpperCase()}</span>
+                              </div>
+                            {/if}
+                            {#if msg.content.match(/\[ANALYSIS:([^\]]+)\]/)}
+                              <div class="cli-line">
+                                <span style="color: #555;">──</span>
+                                <span class="cli-dim">analysis:</span>
+                                <span style="color: #ff9d00; font-weight: 700;">{(msg.content.match(/\[ANALYSIS:([^\]]+)\]/) || ['',''])[1].toUpperCase()}</span>
+                              </div>
+                            {/if}
+                            {#if msg.content.match(/\[CONFIDENCE:(\w[\w\s]*)\]/)}
+                              <div class="cli-line">
+                                <span style="color: #555;">──</span>
+                                <span class="cli-dim">confidence:</span>
+                                <span style="color: {(msg.content.match(/\[CONFIDENCE:(\w[\w\s]*)\]/) || ['',''])[1].includes('HIGH') ? '#00fc40' : '#ff9d00'}; font-weight: 700;">{(msg.content.match(/\[CONFIDENCE:(\w[\w\s]*)\]/) || ['',''])[1]}</span>
+                              </div>
+                            {/if}
+                            {#if msg.content.match(/Tables:\s*(.+)/)}
+                              <div class="cli-line">
+                                <span style="color: #555;">──</span>
+                                <span class="cli-dim">sources:</span>
+                                <span class="cli-command" style="font-size: 9px;">{(msg.content.match(/Tables:\s*(.+)/) || ['',''])[1].replace(/\[|\]/g, '').slice(0, 80)}</span>
+                              </div>
+                            {/if}
                           </div>
-                        {:else if msg.status === 'streaming'}
+                        {/if}
+
+                        <!-- Streaming cursor -->
+                        {#if msg.status === 'streaming'}
                           <div class="cli-line" style="margin-top: 2px;">
                             <span class="cli-cursor"></span>
                           </div>
                         {/if}
                       </div>
+                    {/if}
+
+                    <!-- System Prompt Viewer (collapsible) -->
+                    {#if msg.status === 'done'}
+                      {#if messages[i - 1]?.role === 'user' && messages[i - 1]?.rawContent && messages[i - 1].rawContent.includes('CRITICAL STYLE RULE')}
+                        <button style="width: 100%; text-align: left; background: none; border: 1px solid #333; padding: 4px 12px; margin-bottom: 4px; cursor: pointer; font-family: var(--font-family-display); font-size: 9px; color: #666;"
+                          onclick={() => { const prev = messages[i - 1]; messages = [...messages.slice(0, i - 1), { ...prev, showPrompt: !prev.showPrompt }, ...messages.slice(i)]; }}>
+                          <span>{messages[i - 1].showPrompt ? '▾' : '▸'}</span>
+                          <span style="margin-left: 4px;">SYSTEM PROMPT</span>
+                        </button>
+                        {#if messages[i - 1].showPrompt}
+                          <div style="background: #111; border: 1px solid #333; padding: 10px 14px; margin-bottom: 8px; font-family: var(--font-family-display); font-size: 9px; color: #888; max-height: 300px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5;">
+                            <div style="color: #555; font-weight: 700; margin-bottom: 6px;">INSTRUCTIONS SENT TO LLM:</div>
+                            <div style="color: #777;">{(messages[i - 1].rawContent || '').split(/Question:\s*/)[0]?.trim() || ''}</div>
+                            {#if (messages[i - 1].rawContent || '').includes('Question:')}
+                              <div style="border-top: 1px solid #333; margin-top: 8px; padding-top: 6px;">
+                                <span style="color: #00fc40; font-weight: 700;">QUESTION: </span>
+                                <span style="color: #e0e0e0;">{(messages[i - 1].rawContent || '').split(/Question:\s*/).pop()?.trim() || ''}</span>
+                              </div>
+                            {/if}
+                          </div>
+                        {/if}
+                      {/if}
                     {/if}
 
                     <!-- Response Tabs: Analysis / Data / Query / Graph -->
@@ -1350,27 +1509,32 @@
                       {@const hasChartData = hasTables && hasNumericData(tables[0])}
                       {@const hasQueries = msg.sqlQueries && msg.sqlQueries.length > 0}
                       {@const chartHint = parseChartHint(msg.content)}
-                      {@const currentTab = msg.activeTab || 'insight'}
+                      {@const currentTab = msg.activeTab || 'analysis'}
 
+                      {@const totalTableRows = tables.reduce((sum: number, t: any) => sum + (t.rows?.length || 0), 0)}
                       <div class="response-tabs">
-                        <button class="response-tab" class:response-tab-active={currentTab === 'insight'} onclick={() => { trackPreference('tab_click', 'insight'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'insight' }, ...messages.slice(i + 1)]; }}>Insight</button>
                         <button class="response-tab" class:response-tab-active={currentTab === 'analysis'} onclick={() => { trackPreference('tab_click', 'analysis'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'analysis' }, ...messages.slice(i + 1)]; }}>Analysis</button>
-                        <button class="response-tab" class:response-tab-active={currentTab === 'data'} class:response-tab-dim={!hasTables} onclick={() => { if (hasTables) { trackPreference('tab_click', 'data'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'data' }, ...messages.slice(i + 1)]; } }}>Data{#if hasTables}<span class="tab-badge">{tables[0].rows.length}</span>{/if}</button>
+                        <button class="response-tab" class:response-tab-active={currentTab === 'data'} class:response-tab-dim={!hasTables} onclick={() => { if (hasTables) { trackPreference('tab_click', 'data'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'data' }, ...messages.slice(i + 1)]; } }}>Data{#if hasTables}<span class="tab-badge">{totalTableRows}</span>{/if}</button>
                         <button class="response-tab" class:response-tab-active={currentTab === 'query'} class:response-tab-dim={!hasQueries} onclick={() => { if (hasQueries) { trackPreference('tab_click', 'query'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'query' }, ...messages.slice(i + 1)]; } }}>Query{#if hasQueries}<span class="tab-badge">{msg.sqlQueries?.length}</span>{/if}</button>
-                        <button class="response-tab" class:response-tab-active={currentTab === 'graph'} class:response-tab-dim={!hasChartData} onclick={() => { if (hasChartData) { trackPreference('tab_click', 'graph'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'graph', chartType: msg.chartType || chartHint?.type || detectChartType(tables[0]) }, ...messages.slice(i + 1)]; } }}>Graph</button>
+                        <button class="response-tab" class:response-tab-active={currentTab === 'chart'} class:response-tab-dim={!hasChartData} onclick={() => { if (hasChartData) { trackPreference('tab_click', 'chart'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'chart', chartType: msg.chartType || chartHint?.type || detectChartType(tables[0]) }, ...messages.slice(i + 1)]; } }}>Chart</button>
+                        <button class="response-tab" class:response-tab-active={currentTab === 'sources'} onclick={() => { trackPreference('tab_click', 'sources'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'sources' }, ...messages.slice(i + 1)]; }}>Sources</button>
                       </div>
 
-                      <!-- TAB: Insight -->
-                      {#if currentTab === 'insight'}
+                      <!-- TAB: Analysis (merged Insight + Analysis) -->
+                      {#if currentTab === 'analysis'}
                         {@const insightAnalysisMatch = msg.content.match(/\[ANALYSIS:([^\]]+)\]/)}
                         {@const insightAnalysisTypes = insightAnalysisMatch ? insightAnalysisMatch[1].split(',').map((t: string) => t.trim()) : []}
                         {@const modeMatch = msg.content.match(/\[MODE:(\w+)\]/)}
-                        {@const actualMode = modeMatch ? modeMatch[1] : msg.reasoningUsed || 'auto'}
-                        {@const insightContent = msg.content
+                        {@const actualMode = modeMatch ? modeMatch[1] : (msg.reasoningUsed && msg.reasoningUsed !== 'auto') ? msg.reasoningUsed : (msg.content.length > 800 ? 'deep' : 'fast')}
+                        {@const analysisContent = msg.content
                           .replace(/\[ANALYSIS:[^\]]+\]/g, '')
                           .replace(/\[MODE:\w+\]/g, '')
                           .replace(/\[CHART:[^\]]+\]/g, '')
                           .replace(/\[DASHBOARD:\d+\]/g, '')
+                          .replace(/\[KPI:[^\]]+\]/g, '')
+                          .replace(/\[CONFIDENCE:[^\]]+\]/g, '')
+                          .replace(/\[IMPACT:[^\]]+\]/g, '')
+                          .replace(/\[RELATED:[^\]]+\]/g, '')
                           .replace(/---\s*\n\s*SOURCES:[\s\S]*$/, '')
                           .replace(/```sql[\s\S]*?```/g, '')
                           .trim()}
@@ -1383,77 +1547,92 @@
                               {/each}
                           {/if}
                           </div>
+                          <!-- KPI Metric Cards -->
+                          {#if msg.content}
+                            {@const kpiMatches = msg.content.match(/\[KPI:([^\]]+)\]/g) || []}
+                            {#if kpiMatches.length > 0}
+                              <div style="display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap;">
+                                {#each kpiMatches as kpi}
+                                  {@const parts = kpi.replace('[KPI:', '').replace(']', '').split('|')}
+                                  <div style="flex: 1; min-width: 100px; max-width: 160px; border: 2px solid var(--color-on-surface); padding: 10px; text-align: center; background: var(--color-surface-bright);">
+                                    <div style="font-size: 22px; font-weight: 900; color: var(--color-on-surface);">{parts[0]}</div>
+                                    <div style="font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim); font-weight: 700; margin-top: 2px;">{parts[1] || ''}</div>
+                                    {#if parts[2]}
+                                      <div style="font-size: 10px; margin-top: 4px; color: {parts[2]?.includes('-') ? '#e74c3c' : parts[2]?.includes('+') ? '#00fc40' : '#ff9d00'}; font-weight: 700;">{parts[2]}</div>
+                                    {/if}
+                                  </div>
+                                {/each}
+                              </div>
+                            {/if}
+                          {/if}
+                          <!-- Confidence Bar -->
+                          {#if msg.content}
+                            {@const confMatch = msg.content.match(/\[CONFIDENCE:(\w+(?:\s+\w+)?)\]/)}
+                            {#if confMatch}
+                              {@const confLevel = confMatch[1]}
+                              {@const confWidth = confLevel === 'VERY HIGH' ? 100 : confLevel === 'HIGH' ? 80 : confLevel === 'MEDIUM' ? 50 : 30}
+                              <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+                                <span style="font-size: 8px; font-weight: 700; text-transform: uppercase; color: var(--color-on-surface-dim);">CONFIDENCE</span>
+                                <div style="flex: 1; max-width: 120px; height: 6px; background: var(--color-surface-dim); border: 1px solid #555;">
+                                  <div style="width: {confWidth}%; height: 100%; background: {confWidth >= 80 ? '#00fc40' : confWidth >= 50 ? '#ff9d00' : '#e74c3c'};"></div>
+                                </div>
+                                <span style="font-size: 8px; font-weight: 700; color: {confWidth >= 80 ? '#00fc40' : confWidth >= 50 ? '#ff9d00' : '#e74c3c'};">{confLevel}</span>
+                              </div>
+                            {/if}
+                          {/if}
                           <div class="prose-chat">
-                            {@html markdownToHtml(insightContent)
-                              .replace(/\[UP:([^\]]+)\]/g, '<span style="color: #007518; font-weight: 900;">▲ $1</span>')
-                              .replace(/\[DOWN:([^\]]+)\]/g, '<span style="color: #be2d06; font-weight: 900;">▼ $1</span>')
-                              .replace(/\[FLAT:([^\]]+)\]/g, '<span style="color: #ff9d00; font-weight: 900;">● $1</span>')
-                              .replace(/\[RISK:HIGH\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#be2d06;color:white;">⚠ HIGH</span>')
-                              .replace(/\[RISK:MEDIUM\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#ff9d00;color:#383832;">⚠ MEDIUM</span>')
-                              .replace(/\[RISK:LOW\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#007518;color:white;">✓ LOW</span>')
+                            {@html markdownToHtml(analysisContent)
+                              .replace(/\[UP:([^\]]+)\]/g, '<span style="color: #007518; font-weight: 900;">&#9650; $1</span>')
+                              .replace(/\[DOWN:([^\]]+)\]/g, '<span style="color: #be2d06; font-weight: 900;">&#9660; $1</span>')
+                              .replace(/\[FLAT:([^\]]+)\]/g, '<span style="color: #ff9d00; font-weight: 900;">&#9679; $1</span>')
+                              .replace(/\[RISK:HIGH\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#be2d06;color:white;">&#9888; HIGH</span>')
+                              .replace(/\[RISK:MEDIUM\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#ff9d00;color:#383832;">&#9888; MEDIUM</span>')
+                              .replace(/\[RISK:LOW\]/g, '<span style="font-size:8px;font-weight:900;padding:1px 6px;background:#007518;color:white;">&#10003; LOW</span>')
                             }
                           </div>
 
-                          <!-- Feedback bar -->
-                          <div class="flex items-center justify-between" style="margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--color-on-surface); opacity: 0.6;">
-                            <div class="flex items-center gap-2" style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
-                              HELPFUL?
-                              <button class="feedback-btn" title="Helpful" onclick={async () => {
-                                const q = i > 0 ? messages[i-1]?.content : '';
-                                await fetch(`/api/projects/${projectSlug}/feedback`, { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, answer: msg.content, rating: 'up' }) });
-                                if (msg.sqlQueries?.length) { for (const sql of msg.sqlQueries) { await fetch(`/api/projects/${projectSlug}/save-query-pattern`, { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, sql }) }); } }
-                              }}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg></button>
-                              <button class="feedback-btn" title="Not helpful" onclick={async () => {
-                                const q = i > 0 ? messages[i-1]?.content : '';
-                                await fetch(`/api/projects/${projectSlug}/feedback`, { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, answer: msg.content, rating: 'down' }) });
-                              }}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/></svg></button>
-                            </div>
-                            <div class="flex items-center gap-2">
-                              <button class="feedback-btn flex items-center gap-1" onclick={() => copyMessage(i)} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="0"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                                {copiedIndex === i ? 'COPIED' : 'COPY'}
-                              </button>
-                              <button class="feedback-btn flex items-center gap-1" onclick={() => {
-                                const fact = prompt('Save a fact the agent should remember:', '');
-                                if (fact) { fetch(`/api/projects/${projectSlug}/memories`, { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ fact, scope: 'project' }) }); }
-                              }} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v10M12 12l4-4M12 12l-4-4M5 17h14M5 21h14"/></svg>
-                                SAVE
-                              </button>
-                              {#if hasTables}
-                                <button class="feedback-btn flex items-center gap-1" onclick={() => {
-                                  const csv = tableToCsv(tables[0]);
-                                  const blob = new Blob([csv], { type: 'text/csv' });
-                                  const url = URL.createObjectURL(blob);
-                                  const a = document.createElement('a'); a.href = url; a.download = `dash-export-${Date.now()}.csv`; a.click(); URL.revokeObjectURL(url);
-                                }} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
-                                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                                  CSV
-                                </button>
-                              {/if}
-                              <button class="feedback-btn flex items-center gap-1" onclick={() => openPinModal(i, tables, msg.content)} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v10M12 12l4-4M12 12l-4-4M5 17h14M5 21h14"/></svg>
-                                {pinned[i] ? 'PINNED' : 'PIN'}
-                              </button>
-                              <button class="feedback-btn flex items-center gap-1" onclick={async () => {
-                                try {
-                                  const res = await fetch('/api/export/pdf', { method: 'POST', headers: { ..._headers(), 'Content-Type': 'application/json' }, body: JSON.stringify({ content: msg.content, title: projectInfo?.agent_name || 'Report' }) });
-                                  if (res.ok) { const blob = await res.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `dash-report-${Date.now()}.pdf`; a.click(); URL.revokeObjectURL(url); }
-                                } catch {}
-                              }} style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
-                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                                PDF
-                              </button>
-                            </div>
-                          </div>
-                        </div>
+                          <!-- Inline Charts (story view) -->
+                          {#if hasTables && tables.length > 0}
+                            {@const chartHint = parseChartHint(msg.content)}
+                            {@const inlineCharts = tables.filter((t: any) => hasNumericData(t)).slice(0, 3)}
+                            {#if inlineCharts.length > 0}
+                              <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 10px;">
+                                {#each inlineCharts as tbl, ci}
+                                  <div style="border: 2px solid var(--color-on-surface); background: var(--color-surface-bright);">
+                                    <div style="padding: 6px 12px; background: var(--color-on-surface); color: var(--color-surface); font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; display: flex; justify-content: space-between; align-items: center;">
+                                      <span>{chartHint?.title || tbl.headers.slice(0, 3).join(' vs ')}</span>
+                                      <span style="color: #00fc40; font-size: 8px;">{tbl.rows.length} ROWS</span>
+                                    </div>
+                                    <div style="padding: 8px;">
+                                      <EChartView headers={tbl.headers} rows={tbl.rows} chartType={chartHint?.type || detectChartType(tbl)} />
+                                    </div>
+                                    {#if generateChartCaption(tbl)}
+                                      <div style="padding: 6px 12px; font-size: 11px; color: var(--color-on-surface-dim); border-top: 1px solid #e5e5e0; line-height: 1.5;">
+                                        {generateChartCaption(tbl)}
+                                      </div>
+                                    {/if}
+                                  </div>
+                                {/each}
+                              </div>
+                            {/if}
+                          {/if}
 
-                      <!-- TAB: Analysis -->
-                      {:else if currentTab === 'analysis'}
-                        <div class="bubble-assistant">
-                          <div class="prose-chat">
-                            {@html markdownToHtml(msg.content.replace(/\[DASHBOARD:\d+\]/g, '').replace(/\[CHART:[^\]]+\]/g, '').replace(/\[ANALYSIS:[^\]]+\]/g, '').replace(/\[MODE:\w+\]/g, '').replace(/\[(UP|DOWN|FLAT|RISK):[^\]]*\]/g, ''))}
-                          </div>
+                          <!-- Impact Summary -->
+                          {#if msg.content}
+                            {@const impactMatch = msg.content.match(/\[IMPACT:([^\]]+)\]/)}
+                            {#if impactMatch}
+                              {@const impParts = impactMatch[1].split('|')}
+                              <div class="ink-border" style="padding: 12px 16px; margin-top: 12px; background: var(--color-surface-bright);">
+                                <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; color: var(--color-on-surface-dim); margin-bottom: 6px;">IMPACT SUMMARY</div>
+                                <div style="font-size: 12px; color: var(--color-on-surface); margin-bottom: 8px;">
+                                  If addressed: could recover <strong style="color: #007518; font-size: 14px;">{impParts[1] || '?'}</strong> out of <strong>{impParts[2] || '?'}</strong> <span style="color: var(--color-on-surface-dim);">({impParts[0] || '?'})</span>
+                                </div>
+                                <div style="height: 10px; background: var(--color-surface-dim); border: 2px solid var(--color-on-surface);">
+                                  <div style="width: {parseInt(impParts[0]) || 0}%; height: 100%; background: #00fc40;"></div>
+                                </div>
+                              </div>
+                            {/if}
+                          {/if}
 
                           <!-- Clarifying Questions -->
                           {#if parseClarify(msg.content)}
@@ -1465,6 +1644,23 @@
                             </div>
                           {/if}
 
+                          <!-- Related Questions -->
+                          {#if msg.content}
+                            {@const relatedMatches = msg.content.match(/\[RELATED:([^\]]+)\]/g) || []}
+                            {#if relatedMatches.length > 0}
+                              <div style="margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--color-surface-dim);">
+                                <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; color: var(--color-on-surface-dim); margin-bottom: 6px;">RELATED QUESTIONS</div>
+                                <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+                                  {#each relatedMatches as rq}
+                                    <button class="suggestion-btn" onclick={() => send(rq.replace('[RELATED:', '').replace(']', ''))} disabled={isStreaming}>
+                                      {rq.replace('[RELATED:', '').replace(']', '')}
+                                    </button>
+                                  {/each}
+                                </div>
+                              </div>
+                            {/if}
+                          {/if}
+
                           <!-- Feedback bar -->
                           <div class="flex items-center justify-between" style="margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--color-on-surface); opacity: 0.6;">
                             <div class="flex items-center gap-2" style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;">
@@ -1519,28 +1715,40 @@
                           </div>
                         </div>
 
-                      <!-- TAB: Data -->
+                      <!-- TAB: Data (all tables with sub-tabs) -->
                       {:else if currentTab === 'data' && hasTables}
+                        {@const dataIdx = msg.dataTableIndex || 0}
+                        {@const activeTable = tables[dataIdx] || tables[0]}
                         <div class="bubble-assistant">
+                          {#if tables.length > 1}
+                            <div style="display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap;">
+                              {#each tables as _t, ti}
+                                <button
+                                  style="font-size: 9px; font-weight: 900; padding: 3px 10px; text-transform: uppercase; letter-spacing: 0.05em; border: 2px solid {dataIdx === ti ? 'var(--color-on-surface)' : 'var(--color-on-surface-dim)'}; background: {dataIdx === ti ? 'var(--color-on-surface)' : 'transparent'}; color: {dataIdx === ti ? 'var(--color-surface)' : 'var(--color-on-surface-dim)'}; cursor: pointer;"
+                                  onclick={() => { messages = [...messages.slice(0, i), { ...msg, dataTableIndex: ti }, ...messages.slice(i + 1)]; }}
+                                >Table {ti + 1}</button>
+                              {/each}
+                            </div>
+                          {/if}
                           <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; color: var(--color-on-surface-dim);">
-                            {tables[0].rows.length} ROWS &middot; {tables[0].headers.length} COLUMNS
+                            {activeTable.rows.length} ROWS &middot; {activeTable.headers.length} COLUMNS{#if tables.length > 1} &middot; TABLE {dataIdx + 1} OF {tables.length}{/if}
                           </div>
                           <div style="overflow-x: auto;">
                             <table class="data-table">
                               <thead>
                                 <tr>
                                   <th style="width: 36px; text-align: center; color: var(--color-on-surface-dim);">#</th>
-                                  {#each tables[0].headers as h}
-                                    <th>{h}</th>
+                                  {#each activeTable.headers as h}
+                                    <th>{h.replace(/\*\*/g, '')}</th>
                                   {/each}
                                 </tr>
                               </thead>
                               <tbody>
-                                {#each tables[0].rows as row, ri}
+                                {#each activeTable.rows as row, ri}
                                   <tr>
                                     <td style="text-align: center; color: var(--color-on-surface-dim); font-size: 10px;">{ri + 1}</td>
                                     {#each row as cell}
-                                      <td>{cell}</td>
+                                      <td>{@html formatCell(cell)}</td>
                                     {/each}
                                   </tr>
                                 {/each}
@@ -1549,67 +1757,199 @@
                           </div>
                           <div class="flex gap-2 mt-3">
                             <button class="feedback-btn flex items-center gap-1" onclick={() => {
-                              const csv = tableToCsv(tables[0]);
+                              const csv = tableToCsv(activeTable);
                               const blob = new Blob([csv], { type: 'text/csv' });
-                              const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `dash-export-${Date.now()}.csv`; a.click(); URL.revokeObjectURL(url);
+                              const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `dash-export-table${dataIdx + 1}-${Date.now()}.csv`; a.click(); URL.revokeObjectURL(url);
                             }} style="font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;">DOWNLOAD CSV</button>
                             <button class="feedback-btn flex items-center gap-1" onclick={() => openPinModal(i, tables, msg.content)} style="font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;">{pinned[i] ? 'PINNED' : 'PIN TO DASHBOARD'}</button>
                           </div>
                         </div>
 
-                      <!-- TAB: Query -->
+                      <!-- TAB: Query (separate cards per query) -->
                       {:else if currentTab === 'query' && hasQueries}
-                        <div class="cli-terminal" style="padding: 14px;">
-                          <div class="cli-line" style="margin-bottom: 10px;">
-                            <span class="cli-prompt">$</span>
-                            <span class="cli-command">cat query.sql</span>
-                            <span class="cli-dim" style="margin-left: auto;">{msg.sqlQueries?.length} {(msg.sqlQueries?.length || 0) === 1 ? 'query' : 'queries'}</span>
-                          </div>
+                        <div style="display: flex; flex-direction: column; gap: 10px;">
                           {#each msg.sqlQueries || [] as sql, si}
-                            {#if si > 0}<div style="border-top: 1px solid #333; margin: 12px 0;"></div>{/if}
-                            <div class="cli-line" style="margin-bottom: 4px;">
-                              <span class="cli-dim">-- query {si + 1}</span>
+                            <div class="ink-border" style="background: #1a1a1a; padding: 14px; border-color: #333;">
+                              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <span style="font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: #00fc40;">Query {si + 1}</span>
+                                <button class="feedback-btn" onclick={() => { navigator.clipboard.writeText(sql); }} style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 3px 8px; color: #00fc40; border: 1px solid #333;">COPY</button>
+                              </div>
+                              <pre style="margin: 0; font-family: 'Space Grotesk', monospace; font-size: 12px; color: #e0e0e0; white-space: pre-wrap; word-break: break-all; line-height: 1.5; background: #111; padding: 10px; border: 1px solid #282828;"><code>{sql}</code></pre>
                             </div>
-                            <pre style="margin: 0; font-family: 'Space Grotesk', monospace; font-size: 12px; color: #e0e0e0; white-space: pre-wrap; word-break: break-all; line-height: 1.5;">{sql}</pre>
                           {/each}
-                          <div style="margin-top: 12px; border-top: 1px solid #333; padding-top: 8px;">
-                            <button class="feedback-btn" onclick={() => {
-                              const allSql = (msg.sqlQueries || []).join('\n\n');
-                              navigator.clipboard.writeText(allSql);
-                            }} style="font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 4px 10px; color: #00fc40;">COPY SQL</button>
-                          </div>
                         </div>
 
-                      <!-- TAB: Graph -->
-                      {:else if currentTab === 'graph' && hasChartData}
+                      <!-- TAB: Chart (multi-chart with sub-tabs) -->
+                      {:else if currentTab === 'chart' && hasChartData}
+                        {@const chartTables = tables.filter((t: any) => hasNumericData(t))}
+                        {@const chartIdx = msg.dataTableIndex || 0}
+                        {@const activeChartTable = chartTables[chartIdx] || chartTables[0]}
                         <div class="bubble-assistant" style="padding: 12px;">
+                          {#if chartTables.length > 1}
+                            <div style="display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap;">
+                              {#each chartTables as _ct, ci}
+                                <button
+                                  style="font-size: 9px; font-weight: 900; padding: 3px 10px; text-transform: uppercase; letter-spacing: 0.05em; border: 2px solid {chartIdx === ci ? 'var(--color-on-surface)' : 'var(--color-on-surface-dim)'}; background: {chartIdx === ci ? 'var(--color-on-surface)' : 'transparent'}; color: {chartIdx === ci ? 'var(--color-surface)' : 'var(--color-on-surface-dim)'}; cursor: pointer;"
+                                  onclick={() => { messages = [...messages.slice(0, i), { ...msg, dataTableIndex: ci, chartType: undefined }, ...messages.slice(i + 1)]; }}
+                                >Chart {ci + 1}</button>
+                              {/each}
+                            </div>
+                          {/if}
                           {#if chartHint?.title}
                             <div style="font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; color: var(--color-on-surface);">{chartHint.title}</div>
                           {/if}
                           <div class="flex gap-0 mb-2">
-                            {#each getAvailableTypes(tables[0]) as ct}
+                            {#each getAvailableTypes(activeChartTable) as ct}
                               <button
                                 class="chart-type-btn"
-                                class:chart-type-btn-active={(msg.chartType || chartHint?.type || detectChartType(tables[0])) === ct}
+                                class:chart-type-btn-active={(msg.chartType || chartHint?.type || detectChartType(activeChartTable)) === ct}
                                 onclick={() => { trackPreference('chart_type', ct); messages = [...messages.slice(0, i), { ...msg, chartType: ct }, ...messages.slice(i + 1)]; }}
                               >{ct.toUpperCase()}</button>
                             {/each}
                           </div>
                           <div style="background: var(--color-surface-bright); padding: 8px; border: 2px solid var(--color-on-surface);">
-                            <EChartView headers={tables[0].headers} rows={tables[0].rows} chartType={msg.chartType || chartHint?.type || detectChartType(tables[0])} />
+                            <EChartView headers={activeChartTable.headers} rows={activeChartTable.rows} chartType={msg.chartType || chartHint?.type || detectChartType(activeChartTable)} />
                           </div>
                           <div class="flex gap-2 mt-3">
                             <button class="feedback-btn flex items-center gap-1" onclick={() => openPinModal(i, tables, msg.content)} style="font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;">{pinned[i] ? 'PINNED' : 'PIN TO DASHBOARD'}</button>
                           </div>
                         </div>
+
+                      <!-- TAB: Sources -->
+                      {:else if currentTab === 'sources'}
+                        {@const sqlTableNames = (() => {
+                          const names = new Set<string>();
+                          for (const sql of (msg.sqlQueries || [])) {
+                            const fromMatches = sql.match(/(?:FROM|JOIN)\s+([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)/gi) || [];
+                            for (const m of fromMatches) {
+                              const t = m.replace(/^(?:FROM|JOIN)\s+/i, '').replace(/^[a-z_]+\./i, '').trim();
+                              if (t && !['select','where','and','or','on','as','group','order','limit','having','union','case','when','then','else','end','not','in','is','null','like','between','exists','all','any','inner','outer','left','right','cross','natural','using','lateral','with','recursive','distinct','count','sum','avg','max','min','coalesce','cast','extract','date_trunc','to_char','row_number','rank','dense_rank','lag','lead','over','partition'].includes(t.toLowerCase())) names.add(t);
+                            }
+                          }
+                          return [...names];
+                        })()}
+                        {@const confMatch = msg.content.match(/\[CONFIDENCE:(\w+[^\]]*)\]/)}
+                        {@const confidence = confMatch ? confMatch[1].trim() : (msg.qualityScore ? (msg.qualityScore >= 4 ? 'HIGH' : msg.qualityScore >= 3 ? 'MEDIUM' : 'LOW') : '')}
+                        {@const confColor = confidence.includes('VERY HIGH') ? '#16a34a' : confidence === 'HIGH' ? '#16a34a' : confidence === 'MEDIUM' ? '#d97706' : confidence === 'LOW' ? '#dc2626' : '#888'}
+                        {@const confPct = confidence.includes('VERY HIGH') ? 95 : confidence === 'HIGH' ? 85 : confidence === 'MEDIUM' ? 60 : confidence === 'LOW' ? 30 : 0}
+                        {@const agentName = projectInfo?.agent_name || 'Agent'}
+                        {@const analysisType = msg.analysisUsed || msg.content.match(/\[ANALYSIS:([^\]]+)\]/)?.[1] || ''}
+                        {@const srcToolCalls = (msg.toolCalls || []).filter((t: any) => (t.name || '') !== 'transfer_to_team_member')}
+                        {@const totalDuration = (() => { let s = 0; for (const t of srcToolCalls) { if (t.duration) s += parseFloat(t.duration); } return s > 0 ? s.toFixed(1) + 's' : ''; })()}
+                        <div style="display: flex; flex-direction: column; gap: 12px;">
+
+                          <!-- Row 1: Metric cards -->
+                          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px;">
+                            <div style="padding: 12px 14px; border: 2px solid var(--color-on-surface); border-bottom-width: 3px; background: var(--color-surface-bright);">
+                              <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-on-surface-dim); margin-bottom: 6px;">AGENT</div>
+                              <div style="font-size: 15px; font-weight: 900; text-transform: uppercase;">{agentName}</div>
+                            </div>
+                            <div style="padding: 12px 14px; border: 2px solid var(--color-on-surface); border-bottom-width: 3px; background: var(--color-surface-bright);">
+                              <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-on-surface-dim); margin-bottom: 6px;">MODE</div>
+                              <div style="font-size: 15px; font-weight: 900; text-transform: uppercase;">{msg.reasoningUsed || 'AUTO'}</div>
+                            </div>
+                            {#if msg.sqlQueries?.length}
+                              <div style="padding: 12px 14px; border: 2px solid var(--color-on-surface); border-bottom-width: 3px; background: var(--color-surface-bright);">
+                                <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-on-surface-dim); margin-bottom: 6px;">QUERIES</div>
+                                <div style="font-size: 15px; font-weight: 900;">{msg.sqlQueries.length}</div>
+                              </div>
+                            {/if}
+                            {#if hasTables}
+                              <div style="padding: 12px 14px; border: 2px solid var(--color-on-surface); border-bottom-width: 3px; background: var(--color-surface-bright);">
+                                <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-on-surface-dim); margin-bottom: 6px;">RESULT TABLES</div>
+                                <div style="font-size: 15px; font-weight: 900;">{tables.length}</div>
+                              </div>
+                            {/if}
+                            {#if confidence}
+                              <div style="padding: 12px 14px; border: 2px solid {confColor}; border-bottom-width: 3px; background: {confColor}08;">
+                                <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-on-surface-dim); margin-bottom: 6px;">CONFIDENCE</div>
+                                <div style="font-size: 15px; font-weight: 900; color: {confColor};">{confidence}</div>
+                                <div style="height: 4px; background: #e5e5e0; margin-top: 6px;"><div style="height: 100%; width: {confPct}%; background: {confColor};"></div></div>
+                              </div>
+                            {/if}
+                            {#if analysisType}
+                              <div style="padding: 12px 14px; border: 2px solid var(--color-on-surface); border-bottom-width: 3px; background: var(--color-surface-bright);">
+                                <div style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-on-surface-dim); margin-bottom: 6px;">ANALYSIS</div>
+                                <div style="font-size: 12px; font-weight: 900; text-transform: uppercase;">{analysisType}</div>
+                              </div>
+                            {/if}
+                          </div>
+
+                          <!-- Row 2: Data sources (actual table names from SQL) -->
+                          {#if sqlTableNames.length}
+                            <div style="border: 2px solid var(--color-on-surface); background: var(--color-surface-bright);">
+                              <div style="padding: 8px 14px; background: var(--color-on-surface); color: var(--color-surface); font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em;">DATA SOURCES &middot; {sqlTableNames.length} {sqlTableNames.length === 1 ? 'TABLE' : 'TABLES'}</div>
+                              <div style="padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 6px;">
+                                {#each sqlTableNames as tbl}
+                                  <span style="padding: 5px 12px; background: #1a1a1a; color: #00fc40; font-size: 11px; font-weight: 700; font-family: 'Space Grotesk', monospace; border: 1px solid #333;">{tbl}</span>
+                                {/each}
+                              </div>
+                            </div>
+                          {/if}
+
+                          <!-- Row 3: Result tables summary -->
+                          {#if hasTables}
+                            <div style="border: 2px solid var(--color-on-surface); background: var(--color-surface-bright);">
+                              <div style="padding: 8px 14px; background: var(--color-on-surface); color: var(--color-surface); font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em;">RESULT DATA &middot; {tables.length} {tables.length === 1 ? 'TABLE' : 'TABLES'}</div>
+                              {#each tables as tbl, ti}
+                                <div style="padding: 8px 14px; border-bottom: 1px solid #e5e5e0; display: flex; justify-content: space-between; align-items: center;">
+                                  <div>
+                                    <span style="font-size: 10px; font-weight: 900; color: var(--color-on-surface-dim); margin-right: 8px;">T{ti+1}</span>
+                                    <span style="font-size: 12px; font-weight: 700;">{tbl.headers.slice(0, 5).join(' · ')}{tbl.headers.length > 5 ? ` +${tbl.headers.length - 5}` : ''}</span>
+                                  </div>
+                                  <div style="display: flex; gap: 10px; font-size: 11px; color: var(--color-on-surface-dim);">
+                                    <span>{tbl.rows.length} rows</span>
+                                    <span>{tbl.headers.length} cols</span>
+                                  </div>
+                                </div>
+                              {/each}
+                            </div>
+                          {/if}
+
+                          <!-- Row 4: Tool execution timeline -->
+                          {#if srcToolCalls.length}
+                            <div style="border: 2px solid var(--color-on-surface); background: var(--color-surface-bright);">
+                              <div style="padding: 8px 14px; background: var(--color-on-surface); color: var(--color-surface); font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; display: flex; justify-content: space-between;">
+                                <span>EXECUTION LOG &middot; {srcToolCalls.length} {srcToolCalls.length === 1 ? 'STEP' : 'STEPS'}</span>
+                                {#if totalDuration}<span style="color: #00fc40;">{totalDuration} total</span>{/if}
+                              </div>
+                              {#each srcToolCalls as tc, ti}
+                                <div style="padding: 6px 14px; border-bottom: 1px solid #f0f0ea; display: flex; align-items: center; gap: 10px; font-size: 12px;">
+                                  <span style="font-size: 10px; color: var(--color-on-surface-dim); font-weight: 700; min-width: 18px;">{ti+1}</span>
+                                  <span style="width: 8px; height: 8px; background: {tc.status === 'done' ? '#16a34a' : tc.status === 'error' ? '#dc2626' : '#d97706'}; flex-shrink: 0;"></span>
+                                  <span style="font-weight: 700; font-family: 'Space Grotesk', monospace; flex: 1;">{tc.name}</span>
+                                  {#if tc.duration}
+                                    <span style="font-size: 10px; color: var(--color-on-surface-dim); font-family: 'Space Grotesk', monospace;">{tc.duration}</span>
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                          {/if}
+
+                          <!-- Row 5: SQL Queries -->
+                          {#if msg.sqlQueries?.length}
+                            <div style="border: 2px solid var(--color-on-surface); background: #1a1a1a;">
+                              <div style="padding: 8px 14px; background: var(--color-on-surface); color: var(--color-surface); font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em;">SQL QUERIES</div>
+                              {#each msg.sqlQueries as sql, si}
+                                <div style="padding: 10px 14px; border-bottom: 1px solid #333;">
+                                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                    <span style="font-size: 9px; font-weight: 900; color: #00fc40; text-transform: uppercase; letter-spacing: 0.08em;">Query {si+1}</span>
+                                    <button style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 2px 8px; color: #888; border: 1px solid #444; background: transparent; cursor: pointer;" onclick={() => navigator.clipboard.writeText(sql)}>COPY</button>
+                                  </div>
+                                  <pre style="margin: 0; font-family: 'Space Grotesk', monospace; font-size: 11px; color: #e0e0e0; white-space: pre-wrap; word-break: break-all; line-height: 1.5;">{sql}</pre>
+                                </div>
+                              {/each}
+                            </div>
+                          {/if}
+                        </div>
                       {/if}
 
-                    <!-- Still streaming — show content normally -->
+                    <!-- Still streaming — show content with cleaned tags -->
                     {:else}
                       <div class="bubble-assistant">
                         {#if msg.content}
                           <div class="prose-chat">
-                            {@html markdownToHtml(msg.content)}
+                            {@html markdownToHtml(msg.content.replace(/\[ANALYSIS:[^\]]+\]/g, '').replace(/\[MODE:\w+\]/g, '').replace(/\[CHART:[^\]]+\]/g, '').replace(/\[CHART_CONFIG:[^\]]+\]/g, '').replace(/\[DASHBOARD:\d+\]/g, '').replace(/\[CLARIFY:[^\]]+\]/g, '').replace(/\[KPI:[^\]]+\]/g, '').replace(/\[CONFIDENCE:[^\]]+\]/g, '').replace(/\[IMPACT:[^\]]+\]/g, '').replace(/\[RELATED:[^\]]+\]/g, '').trim())}
                           </div>
                           {#if msg.status === 'streaming'}
                             <div class="flex items-center gap-2" style="margin-top: 8px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-primary)" stroke-width="2" style="animation: headerFloat 2s ease-in-out infinite; flex-shrink: 0;"><rect x="3" y="11" width="18" height="10"/><path d="M12 2v4"/><circle cx="12" cy="7" r="1"/></svg><div class="typing-indicator"><span></span><span></span><span></span></div></div>

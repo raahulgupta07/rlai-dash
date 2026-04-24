@@ -79,7 +79,7 @@ def build_analyst_tools(knowledge: Knowledge, user_id: str | None = None, projec
     def correlation_tool(table: str, columns: str) -> str:
         return correlation_matrix(table, columns, _engine=ro_engine, _schema=user_schema or "public")
 
-    return [
+    tools = [
         SQLTools(db_engine=ro_engine),
         create_introspect_schema_tool(db_url, engine=ro_engine, user_schema=user_schema),
         create_save_validated_query_tool(knowledge),
@@ -93,6 +93,39 @@ def build_analyst_tools(knowledge: Knowledge, user_id: str | None = None, projec
         correlation_tool,
         ReasoningTools(),
     ]
+
+    # Analysis specialist tools
+    try:
+        from dash.tools.analysis_types import (
+            comparator_analysis, diagnostic_analysis, narrator_analysis,
+            validator_analysis, planner_analysis, trend_analysis,
+            pareto_analysis, anomaly_analysis, benchmark_analysis,
+            root_cause_analysis, prescriptive_analysis,
+        )
+        tools.extend([
+            comparator_analysis, diagnostic_analysis, narrator_analysis,
+            validator_analysis, planner_analysis, trend_analysis,
+            pareto_analysis, anomaly_analysis, benchmark_analysis,
+            root_cause_analysis, prescriptive_analysis,
+        ])
+    except ImportError:
+        pass
+
+    # Visualization agent tool
+    try:
+        from dash.tools.visualizer import auto_visualize
+        tools.append(auto_visualize)
+    except ImportError:
+        pass
+
+    # Context loader tool (on-demand deep context)
+    try:
+        from dash.tools.context_loader import load_context
+        tools.append(load_context)
+    except ImportError:
+        pass
+
+    return tools
 
 
 def build_engineer_tools(knowledge: Knowledge, user_id: str | None = None, project_slug: str | None = None, dashboard_user_id: int | None = None) -> list:

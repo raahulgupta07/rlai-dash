@@ -1,4 +1,4 @@
-from dash.settings import TRAINING_MODEL
+from dash.settings import DEEP_MODEL
 """
 Auto-Evolve Instructions
 ========================
@@ -68,7 +68,7 @@ Respond with ONLY valid JSON: {{"instructions": "...", "reasoning": "..."}}"""
         resp = httpx.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": TRAINING_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 800, "temperature": 0.1},
+            json={"model": DEEP_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": 800, "temperature": 0.1},
             timeout=30,
         )
         result = resp.json()
