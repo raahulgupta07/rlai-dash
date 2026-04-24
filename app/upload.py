@@ -3017,6 +3017,167 @@ def _handle_image(file_path: str, filename: str) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Rules Engine: Deterministic Excel structure detection (no LLM, 100% consistent)
+# ---------------------------------------------------------------------------
+
+_MONTH_RE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", re.IGNORECASE)
+_META_RE = re.compile(r"^(Company|Period|Date|Prepared|Updated|Report|Source|Assets|Month|Dep rate)[\s:]*", re.IGNORECASE)
+_UNIT_WORDS = {"sachets", "kg", "lbs", "tons", "%", "usd", "eur", "gbp", "pcs", "units", "sachets/min", "kg/hr", "sachets/ctn"}
+_SUMMARY_RE = re.compile(r"^(Total|Subtotal|Grand|Sum|Utilisation|Utilization|Average|Overall|Net)", re.IGNORECASE)
+
+
+def _rules_detect_header(rows: list[list[str]]) -> tuple[int, float]:
+    """Find header row using scoring (no LLM). Returns (row_index, confidence)."""
+    best_row, best_score = 0, 0
+    for i, row in enumerate(rows[:15]):
+        if not row:
+            continue
+        non_empty = [v for v in row if v and str(v).strip()]
+        if not non_empty:
+            continue
+        score = 0
+        text_count = 0
+        for v in non_empty:
+            s = str(v).strip()
+            # Short text = likely header
+            if len(s) > 1 and len(s) < 50 and not s.replace('.', '').replace('-', '').replace(',', '').isdigit():
+                score += 3
+                text_count += 1
+            # Pure number = likely data, not header
+            elif s.replace('.', '').replace('-', '').replace(',', '').isdigit():
+                score -= 1
+            # Metadata keyword = not header, skip
+            if _META_RE.match(s):
+                score -= 5
+            # Unit word = not header
+            if s.lower() in _UNIT_WORDS:
+                score -= 3
+        # Prefer rows with many text values
+        text_ratio = text_count / max(len(non_empty), 1)
+        score += text_ratio * 5
+        if score > best_score:
+            best_score = score
+            best_row = i
+    confidence = min(1.0, best_score / 15.0)
+    return best_row, confidence
+
+
+def _rules_find_blank_boundaries(rows: list[list[str]]) -> list[int]:
+    """Find row indices where 2+ consecutive rows are all blank."""
+    boundaries = []
+    i = 0
+    while i < len(rows) - 1:
+        is_blank = all(not v or str(v).strip() == "" for v in rows[i])
+        next_blank = all(not v or str(v).strip() == "" for v in rows[i + 1]) if i + 1 < len(rows) else False
+        if is_blank and next_blank:
+            boundaries.append(i)
+            # Skip consecutive blanks
+            while i < len(rows) and all(not v or str(v).strip() == "" for v in rows[i]):
+                i += 1
+        else:
+            i += 1
+    return boundaries
+
+
+def _rules_detect_skip_rows(rows: list[list[str]], header_row: int) -> list[int]:
+    """Find rows to skip: metadata, units, summaries (no LLM)."""
+    skip = []
+    for i, row in enumerate(rows):
+        if i == header_row:
+            continue
+        non_empty = [str(v).strip().lower() for v in row if v and str(v).strip()]
+        if not non_empty:
+            continue
+        # Unit row: most values are unit words
+        unit_count = sum(1 for v in non_empty if v in _UNIT_WORDS)
+        if unit_count >= len(non_empty) * 0.5 and len(non_empty) >= 2:
+            skip.append(i)
+            continue
+        # Metadata row: matches Company:, Period:, etc
+        if len(non_empty) <= 3 and any(_META_RE.match(str(v).strip()) for v in row if v):
+            skip.append(i)
+            continue
+        # Summary row: Total, Utilisation, etc
+        if any(_SUMMARY_RE.match(str(v).strip()) for v in row if v and str(v).strip()):
+            skip.append(i)
+    return skip
+
+
+def _rules_has_month_columns(header_values: list[str]) -> bool:
+    """Check if 3+ columns are month/date names → needs unpivot."""
+    month_count = sum(1 for v in header_values if v and _MONTH_RE.match(str(v).strip()))
+    return month_count >= 3
+
+
+def _rules_analyze_sheet(rows: list[list[str]], merged_cells: list = None) -> dict:
+    """Deterministic sheet analysis — no LLM, 100% consistent.
+    Returns extraction plan with confidence score."""
+    plan = {"action": "load", "confidence": 0.0, "header_row": 0, "skip_rows": [], "blocks": []}
+
+    if not rows or len(rows) < 2:
+        plan["action"] = "skip"
+        plan["confidence"] = 1.0
+        return plan
+
+    # Step 1: Find blank row boundaries (table separators)
+    boundaries = _rules_find_blank_boundaries(rows)
+
+    # Step 2: If boundaries found → multiple tables in one sheet
+    if boundaries:
+        # Split into blocks
+        block_starts = [0] + [b + 2 for b in boundaries]  # skip blank rows
+        block_ends = boundaries + [len(rows)]
+        blocks = []
+        for start, end in zip(block_starts, block_ends):
+            block_rows = rows[start:end]
+            # Skip empty blocks
+            non_empty_rows = [r for r in block_rows if any(v and str(v).strip() for v in r)]
+            if len(non_empty_rows) < 2:
+                continue
+            # Detect header within this block
+            header_idx, conf = _rules_detect_header(block_rows)
+            skip = _rules_detect_skip_rows(block_rows, header_idx)
+            blocks.append({
+                "start": start,
+                "end": end - 1,
+                "header_row": start + header_idx,
+                "data_start": start + header_idx + 1,
+                "data_end": end - 1,
+                "skip_rows": [start + s for s in skip],
+                "header_values": [str(v).strip() for v in block_rows[header_idx] if v] if header_idx < len(block_rows) else [],
+            })
+
+        if len(blocks) >= 2:
+            plan["action"] = "split"
+            plan["blocks"] = blocks
+            plan["confidence"] = 0.9
+        elif len(blocks) == 1:
+            plan["header_row"] = blocks[0]["header_row"]
+            plan["skip_rows"] = blocks[0]["skip_rows"]
+
+    # Step 3: If no blocks found, detect header for whole sheet
+    if plan["action"] == "load":
+        header_row, conf = _rules_detect_header(rows)
+        plan["header_row"] = header_row
+        plan["confidence"] = conf
+        plan["skip_rows"] = _rules_detect_skip_rows(rows, header_row)
+
+    # Step 4: Check for month columns → unpivot
+    header_idx = plan["header_row"] if plan["action"] != "split" else (plan["blocks"][0]["header_row"] if plan.get("blocks") else 0)
+    if header_idx < len(rows):
+        header_vals = [str(v).strip() for v in rows[header_idx] if v]
+        if _rules_has_month_columns(header_vals):
+            plan["action"] = "unpivot"
+            plan["confidence"] = max(plan["confidence"], 0.95)
+
+    # Step 5: Note merged cells (handled by forward-fill, doesn't reduce confidence)
+    if merged_cells:
+        plan["has_merges"] = True
+
+    return plan
+
+
 def _is_clean_sheet(df_preview: pd.DataFrame, merged_cells: list = []) -> bool:
     """Quick check: is this sheet clean data (proper headers, no mess) or messy (needs AI)?"""
     if len(df_preview) < 2:
@@ -3103,66 +3264,195 @@ def _handle_excel(file_path: str, filename: str) -> dict:
         result["warnings"].append("No sheets found in Excel file")
         return result
 
-    # Step 2: MASTER DECISION — is this clean or messy data?
+    # Step 2: RULES ENGINE — deterministic structure detection (no LLM)
     file_slug = _sanitize_table_name(Path(filename).stem)
-    clean_sheets = {}
-    messy_sheets = {}
+    rules_plans = {}  # sheet_name → rules plan
+    needs_llm = []    # sheets where rules are uncertain
 
     for sname in sheet_names:
         info = sheet_previews.get(sname, {})
+        rows = info.get("rows", [])
         merged = info.get("merged_cells", [])
-        # Quick read with header=0 to check if it's clean
-        try:
-            df_peek = pd.read_excel(file_path, sheet_name=sname, header=0, nrows=10)
-            if _is_clean_sheet(df_peek, merged):
-                clean_sheets[sname] = True
-            else:
-                messy_sheets[sname] = True
-        except Exception:
-            messy_sheets[sname] = True
+        plan = _rules_analyze_sheet(rows, merged)
+        rules_plans[sname] = plan
 
-    # FAST PATH: All sheets are clean → direct load, no AI needed
-    if not messy_sheets and clean_sheets:
-        result["warnings"].append(f"Clean data detected — direct load ({len(clean_sheets)} sheets, no AI needed)")
-        for sname in sheet_names:
+        if plan["confidence"] >= 0.9 and plan["action"] != "skip":
+            # HIGH CONFIDENCE — execute with rules, no LLM needed
+            pass
+        elif plan["action"] == "skip":
+            result["warnings"].append(f"Sheet '{sname}': empty — skipped (rules)")
+        else:
+            needs_llm.append(sname)
+
+    # RULES PATH: Process sheets with high confidence (no LLM, $0)
+    rules_processed = 0
+    for sname in sheet_names:
+        plan = rules_plans.get(sname, {})
+        if plan.get("confidence", 0) < 0.9 or plan.get("action") == "skip":
+            continue
+        if sname in needs_llm:
+            continue
+
+        sheet_idx = sheet_names.index(sname) + 1
+
+        if plan["action"] == "load":
+            # Simple table — direct load with detected header
             try:
-                df = pd.read_excel(file_path, sheet_name=sname, header=0)
+                hrow = plan.get("header_row", 0)
+                skip = plan.get("skip_rows", [])
+                df = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=[s for s in skip if s != hrow])
                 df = _clean_dataframe(df)
                 if len(df) == 0:
                     continue
                 tname = f"{file_slug}_{_sanitize_table_name(str(sname))}" if len(sheet_names) > 1 else file_slug
-                tname = _sanitize_table_name(tname)
-                sheet_idx = sheet_names.index(sname) + 1
-                result["tables"].append({"name": tname, "df": df, "source": sname, "sheet_number": sheet_idx, "description": f"Clean data from sheet '{sname}'"})
+                result["tables"].append({"name": _sanitize_table_name(tname), "df": df, "source": f"{sname} [rules]", "sheet_number": sheet_idx, "description": f"Direct load (rules, confidence {plan['confidence']:.0%})"})
+                rules_processed += 1
             except Exception as e:
-                result["warnings"].append(f"Sheet '{sname}' failed: {e}")
-        return result
+                needs_llm.append(sname)  # rules failed, try LLM
 
-    # MIXED: Some clean, some messy — load clean ones directly, AI for messy
-    if clean_sheets:
-        for sname in list(clean_sheets.keys()):
+        elif plan["action"] == "unpivot":
+            # Month columns detected — unpivot deterministically (no LLM)
             try:
-                df = pd.read_excel(file_path, sheet_name=sname, header=0)
-                df = _clean_dataframe(df)
-                if len(df) == 0:
-                    continue
-                tname = f"{file_slug}_{_sanitize_table_name(str(sname))}"
-                tname = _sanitize_table_name(tname)
-                sheet_idx = sheet_names.index(sname) + 1
-                result["tables"].append({"name": tname, "df": df, "source": f"{sname} [direct]", "sheet_number": sheet_idx, "description": f"Clean data from '{sname}'"})
-                result["warnings"].append(f"Sheet '{sname}': clean data — loaded directly (no AI)")
-            except Exception:
-                messy_sheets[sname] = True  # Failed direct load, try AI
+                hrow = plan.get("header_row", 0)
+                skip = [s for s in plan.get("skip_rows", []) if s != hrow]
+                df_raw = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=skip)
 
-    # AI PATH: Only for messy sheets
-    # Filter sheet_names to only messy ones for AI analysis
-    ai_sheet_names = [s for s in sheet_names if s in messy_sheets]
+                # Identify id columns vs month columns using regex
+                id_cols = []
+                month_cols = []
+                for col in df_raw.columns:
+                    if _MONTH_RE.match(str(col).strip()):
+                        month_cols.append(col)
+                    elif str(col).strip() and not str(col).startswith("Unnamed"):
+                        id_cols.append(col)
+
+                if month_cols and id_cols:
+                    # Drop summary columns (Total Output, Utilisation Rate, FY repeat)
+                    keep_cols = id_cols + month_cols
+                    df_use = df_raw[[c for c in keep_cols if c in df_raw.columns]]
+
+                    # Forward-fill first column (plant name in merged cells)
+                    if id_cols:
+                        df_use.iloc[:, 0] = df_use.iloc[:, 0].ffill()
+
+                    # Filter rows: drop summary rows, unit rows, blank rows
+                    def _is_data_row(row):
+                        vals = [str(v).strip().lower() for v in row.dropna() if str(v).strip()]
+                        if not vals:
+                            return False
+                        if any(_SUMMARY_RE.match(v) for v in vals):
+                            return False
+                        if all(v in _UNIT_WORDS for v in vals):
+                            return False
+                        return True
+                    df_use = df_use[df_use.apply(_is_data_row, axis=1)]
+
+                    # Melt: months as columns → rows
+                    df_long = df_use.melt(id_vars=id_cols, value_vars=month_cols,
+                                          var_name="month", value_name="output")
+
+                    # Parse dates from month names
+                    try:
+                        from dash.settings import training_llm_call
+                        unique_months = df_long["month"].unique().tolist()[:20]
+                        date_raw = training_llm_call(
+                            f'Convert to ISO dates: {unique_months}\nReturn JSON: {{"Jul\'21":"2021-07-01",...}}',
+                            "extraction")
+                        if date_raw:
+                            date_map = json.loads(date_raw)
+                            df_long["date"] = df_long["month"].map(date_map)
+                            df_long["date"] = pd.to_datetime(df_long["date"], errors="coerce")
+                    except Exception:
+                        pass
+
+                    # Add fiscal year from sheet name
+                    fy_match = re.search(r"FY\d{4}", sname)
+                    if fy_match:
+                        df_long["fiscal_year"] = fy_match.group()
+
+                    # Clean
+                    df_long = df_long.dropna(subset=["output"], how="all")
+                    df_long = df_long.dropna(how="all")
+
+                    if len(df_long) > 0:
+                        tname = f"{file_slug}_{_sanitize_table_name(str(sname))}"
+                        tname = _sanitize_table_name(tname)
+                        existing = [t for t in result["tables"] if t["name"] == tname]
+                        if existing:
+                            existing[0]["df"] = pd.concat([existing[0]["df"], df_long], ignore_index=True)
+                            existing[0]["source"] += f" + {sname}"
+                        else:
+                            result["tables"].append({"name": tname, "df": df_long, "source": f"{sname} [rules-unpivot]", "sheet_number": sheet_idx, "description": f"Unpivoted (rules, {len(month_cols)} month columns)"})
+                        rules_processed += 1
+                    else:
+                        needs_llm.append(sname)
+                else:
+                    needs_llm.append(sname)
+            except Exception as e:
+                needs_llm.append(sname)
+                result["warnings"].append(f"Rules unpivot failed for '{sname}': {e}")
+
+        elif plan["action"] == "split":
+            # Multiple tables in one sheet — extract each block
+            try:
+                df_raw = pd.read_excel(file_path, sheet_name=sname, header=None)
+                for bi, block in enumerate(plan.get("blocks", [])):
+                    hrow = block.get("header_row", 0)
+                    dstart = block.get("data_start", hrow + 1)
+                    dend = block.get("data_end", len(df_raw) - 1)
+                    skip = set(block.get("skip_rows", []))
+                    skip.add(hrow)
+
+                    if hrow >= len(df_raw):
+                        continue
+                    headers = [str(v).strip() if pd.notna(v) and str(v).strip() else f"col_{i}" for i, v in enumerate(df_raw.iloc[hrow])]
+                    data_rows = [df_raw.iloc[ri].values for ri in range(dstart, min(dend + 1, len(df_raw))) if ri not in skip]
+                    if not data_rows:
+                        continue
+                    df = pd.DataFrame(data_rows, columns=headers[:len(df_raw.columns)])
+                    df = _clean_dataframe(df)
+                    if len(df) == 0:
+                        continue
+                    # Standardize first column if blocks have different names for same concept
+                    header_text = block.get("header_values", [])
+                    machine_type = ""
+                    for hv in header_text:
+                        if "ffs" in hv.lower() or "machine" in hv.lower():
+                            machine_type = "FFS"
+                        elif "spray" in hv.lower() or "dryer" in hv.lower():
+                            machine_type = "Spray Dryer"
+                        elif "drum" in hv.lower() or "roller" in hv.lower():
+                            machine_type = "Drum Roller"
+                    if machine_type:
+                        df["machine_type"] = machine_type
+                        # Rename first column to generic name
+                        first_col = df.columns[0]
+                        if "no of" in str(first_col).lower() or "number" in str(first_col).lower():
+                            df = df.rename(columns={first_col: "machine_count"})
+
+                    tname = f"{file_slug}_{_sanitize_table_name(str(sname))}"
+                    tname = _sanitize_table_name(tname)
+                    existing = [t for t in result["tables"] if t["name"] == tname]
+                    if existing:
+                        existing[0]["df"] = pd.concat([existing[0]["df"], df], ignore_index=True)
+                        existing[0]["source"] += f" + block{bi}"
+                    else:
+                        result["tables"].append({"name": tname, "df": df, "source": f"{sname} [rules-split]", "sheet_number": sheet_idx, "description": f"Split table (rules, block {bi+1})"})
+                rules_processed += 1
+            except Exception as e:
+                needs_llm.append(sname)
+
+    if rules_processed > 0:
+        result["warnings"].append(f"{rules_processed} sheet(s) processed by rules engine (no LLM, $0)")
+
+    # LLM PATH: Only for uncertain sheets (low confidence or unpivot)
+    ai_sheet_names = list(set(needs_llm))
     if not ai_sheet_names:
         return result
 
-    result["warnings"].append(f"{len(ai_sheet_names)} messy sheet(s) → AI analysis")
+    result["warnings"].append(f"{len(ai_sheet_names)} sheet(s) need LLM (rules confidence < 90% or unpivot)")
 
-    # Step 3: AI analysis — send previews, get extraction plan (only messy sheets)
+    # Step 3: AI analysis — send previews, get extraction plan (only uncertain sheets)
     ai_plan = None
     try:
         from dash.settings import training_llm_call
