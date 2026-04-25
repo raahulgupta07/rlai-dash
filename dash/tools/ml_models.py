@@ -20,6 +20,7 @@ Auto-training:
 import json
 import pickle
 import logging
+import time
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -283,8 +284,16 @@ def create_predict_tool(project_slug: str):
             result += "\n".join(rows)
             ml_tag = f"[ML:FORECAST|model={model_info['name']}|algorithm={model_info['algorithm']}|accuracy={model_info['accuracy'].get('mape','?')}|data={model_info['accuracy'].get('data_points','?')} rows|tier=instant]"
             result = ml_tag + "\n" + result
+
+            forecast_rows = []
+            for i, row in forecast.iterrows():
+                for col in forecast.columns:
+                    if col not in ('unique_id', 'ds'):
+                        forecast_rows.append({"period": i+1, "value": float(row[col])})
+
             _save_experiment(project_slug, "forecast", model_info["name"], model_info["algorithm"], "instant",
-                result_data={"predictions": [r for r in rows]}, accuracy=model_info["accuracy"])
+                result_data={"predictions": forecast_rows, "periods": periods},
+                accuracy=model_info["accuracy"])
             return result
         except Exception as e:
             return f"Prediction failed: {e}. Use llm_predict as fallback."
@@ -364,10 +373,46 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
             top3 = ", ".join(f"{fname.replace('_encoded','')} {imp/total*100:.0f}%" for fname, imp in features_ranked[:3])
             ml_tag = f"[ML:DRIVERS|algorithm=LightGBM|r2={r2:.2f}|target={target_column}|features={len(feature_cols)}|top={top3}|data={len(df_clean)} rows]"
             result = ml_tag + "\n" + result
+
+            # Compute rich artifacts for ML Insights
+            actual = y.tolist()[:50]
+            predicted = model.predict(X).tolist()[:50]
+            residuals = (y - model.predict(X)).tolist()[:50]
+
+            # Column stats
+            col_stats = {}
+            for c in feature_cols:
+                vals = df_clean[c].dropna()
+                col_stats[c] = {"min": float(vals.min()), "max": float(vals.max()), "mean": float(vals.mean()), "std": float(vals.std())}
+
+            # Correlation between features
+            corr_data = {}
+            try:
+                corr = X.corr()
+                for c1 in corr.columns:
+                    for c2 in corr.columns:
+                        if c1 < c2:
+                            corr_data[f"{c1}__{c2}"] = round(float(corr.loc[c1, c2]), 3)
+            except Exception:
+                pass
+
+            # Sample data (first 5 rows)
+            sample = df_clean.head(5).values.tolist()
+            sample_cols = list(df_clean.columns)
+
             _save_experiment(project_slug, "importance", f"{table}_{target_column}", "LightGBM", "on-demand",
-                input_summary={"table": table, "target": target_column, "rows": len(df_clean), "features": len(feature_cols)},
-                result_data={"factors": [{"name": fname.replace("_encoded",""), "importance": round(imp/total*100, 1)} for fname, imp in features_ranked[:10]]},
-                accuracy={"r2": round(r2, 2)})
+                input_summary={"table": table, "target": target_column, "rows": len(df_clean), "features": len(feature_cols), "columns": feature_cols},
+                result_data={
+                    "factors": [{"name": fname.replace("_encoded",""), "importance": round(imp/total*100, 1)} for fname, imp in features_ranked[:10]],
+                    "actual_vs_predicted": {"actual": actual, "predicted": predicted},
+                    "residuals": residuals,
+                    "correlation": corr_data,
+                    "column_stats": col_stats,
+                    "sample_data": sample,
+                    "sample_columns": sample_cols,
+                    "hyperparameters": {"n_estimators": 100, "max_depth": 5, "random_state": 42},
+                },
+                accuracy={"r2": round(r2, 4)})
             return result
         except ImportError:
             return "LightGBM not installed. Cannot compute feature importance."
@@ -429,13 +474,49 @@ def create_anomaly_ml_tool(project_slug: str, engine=None, schema: str = None):
             else:
                 result += "No anomalies detected — all data appears normal.\n"
 
-            high = len([i for i, s in zip(anomaly_idx, [scores[j] for j in anomaly_idx]) if s < -0.1])
+            # Severity breakdown
+            high = len([idx for idx in anomaly_idx if scores[idx] < -0.1])
+            medium = len([idx for idx in anomaly_idx if -0.1 <= scores[idx] < -0.05])
+            low = len(anomaly_idx) - high - medium
+
+            # Full anomaly details with all column values
+            anomaly_details = []
+            for idx in anomaly_idx[:20]:
+                row_data = {c: float(df.iloc[idx][c]) if c in available_cols else str(df.iloc[idx][c]) for c in df.columns[:8] if pd.notna(df.iloc[idx][c])}
+                row_data["_row"] = int(idx)
+                row_data["_score"] = float(scores[idx])
+                row_data["_severity"] = "HIGH" if scores[idx] < -0.1 else "MEDIUM" if scores[idx] < -0.05 else "LOW"
+                anomaly_details.append(row_data)
+
+            # Normal data stats for comparison
+            normal_idx = [i for i, p in enumerate(predictions) if p == 1]
+            normal_stats = {}
+            for c in available_cols:
+                normal_vals = df_num.iloc[normal_idx][c]
+                normal_stats[c] = {"mean": float(normal_vals.mean()), "std": float(normal_vals.std()), "min": float(normal_vals.min()), "max": float(normal_vals.max())}
+
+            # Scatter plot data (first 2 features)
+            scatter = None
+            if len(available_cols) >= 2:
+                scatter = {
+                    "x_col": available_cols[0],
+                    "y_col": available_cols[1],
+                    "normal": [[float(df_num.iloc[i][available_cols[0]]), float(df_num.iloc[i][available_cols[1]])] for i in normal_idx[:100]],
+                    "anomaly": [[float(df_num.iloc[i][available_cols[0]]), float(df_num.iloc[i][available_cols[1]])] for i in anomaly_idx],
+                }
+
             ml_tag = f"[ML:ANOMALY|algorithm=IsolationForest|scanned={len(df_num)}|found={len(anomaly_idx)}|high={high}|features={len(available_cols)}]"
             result = ml_tag + "\n" + result
             _save_experiment(project_slug, "anomaly", f"{table}_anomaly", "IsolationForest", "instant",
-                input_summary={"table": table, "rows": len(df_num), "features": len(available_cols)},
-                result_data={"total_anomalies": len(anomaly_idx), "high_severity": high,
-                    "anomalies": [{"row": int(idx), "score": float(scores[idx])} for idx in anomaly_idx[:10]]})
+                input_summary={"table": table, "rows": len(df_num), "features": len(available_cols), "columns": available_cols},
+                result_data={
+                    "total_anomalies": len(anomaly_idx),
+                    "severity": {"high": high, "medium": medium, "low": low},
+                    "anomalies": anomaly_details,
+                    "normal_stats": normal_stats,
+                    "scatter": scatter,
+                    "contamination": 0.1,
+                })
             return result
         except Exception as e:
             return f"Anomaly detection failed: {e}"
@@ -483,7 +564,9 @@ Return ONLY valid JSON:
   "method": "LLM trend analysis"
 }}"""
 
+            _t0 = time.time()
             raw = training_llm_call(prompt, "extraction")
+            _duration = int((time.time() - _t0) * 1000)
             if not raw:
                 return "LLM prediction failed — no response."
 
@@ -509,7 +592,7 @@ Return ONLY valid JSON:
             ml_tag = f"[ML:FORECAST|model=llm_analysis|algorithm=LLM|accuracy={parsed.get('confidence','?')}|data={len(df)} rows|tier=llm|trend={parsed.get('trend','?')}]"
             result = ml_tag + "\n" + result
             _save_experiment(project_slug, "forecast", f"{table}_{value_column}", "LLM", "llm",
-                input_summary={"table": table, "date_col": date_column, "value_col": value_column, "rows": len(df)},
+                input_summary={"table": table, "date_col": date_column, "value_col": value_column, "rows": len(df), "training_duration_ms": _duration},
                 result_data=parsed, accuracy={"confidence": parsed.get("confidence", "?")})
             return result
         except Exception as e:

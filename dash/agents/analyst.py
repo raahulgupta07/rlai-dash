@@ -30,9 +30,10 @@ def create_analyst(
         id="analyst",
         name="Analyst",
         role=(
-            "Data analyst with 11 specialist analysis tools: comparator (period comparison), "
+            "SQL data analyst with 11 specialist analysis tools: comparator (period comparison), "
             "diagnostic (root cause), narrator (executive summary), validator (data quality), "
-            "planner (what-if scenarios), trend, pareto, anomaly, benchmark, root_cause, prescriptive."
+            "planner (what-if scenarios), trend, pareto, benchmark, root_cause, prescriptive. "
+            "No ML or prediction tools. Delegate ML tasks to Data Scientist."
         ),
         model=MODEL,
         db=agent_db,

@@ -141,7 +141,10 @@
           <tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">TARGET</td><td>{selectedModel.target_column || 'N/A'}</td></tr>
           <tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">FEATURES</td><td>{selectedModel.features || 'N/A'}</td></tr>
           <tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">DATA</td><td>{selectedModel.row_count} rows</td></tr>
-          <tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">ACCURACY</td><td>{JSON.stringify(selectedModel.accuracy)}</td></tr>
+          <tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">ACCURACY</td><td>{formatAccuracy(selectedModel.accuracy)}</td></tr>
+          {#if selectedModel.accuracy?.method}<tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">METHOD</td><td>{selectedModel.accuracy.method}</td></tr>{/if}
+          {#if selectedModel.accuracy?.contamination}<tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">CONTAMINATION</td><td>{(selectedModel.accuracy.contamination * 100).toFixed(0)}%</td></tr>{/if}
+          {#if selectedModel.accuracy?.features}<tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">FEATURES USED</td><td>{selectedModel.accuracy.features}</td></tr>{/if}
           <tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">PROJECT</td><td>{selectedModel.project_slug}</td></tr>
           <tr><td style="font-weight: 900; text-transform: uppercase; font-size: 10px; color: var(--color-on-surface-dim);">CREATED</td><td>{formatDate(selectedModel.created_at)}</td></tr>
         </tbody>
@@ -320,7 +323,7 @@
     </select>
   </div>
 
-  <!-- Model cards -->
+  <!-- Model cards (grid like Projects page) -->
   {#if loading}
     <div style="text-align: center; padding: 40px; color: var(--color-on-surface-dim);">Loading...</div>
   {:else if filteredModels.length === 0}
@@ -329,22 +332,45 @@
       <div style="font-size: 11px; color: var(--color-on-surface-dim); margin-top: 8px;">Train a project to auto-create ML models</div>
     </div>
   {:else}
-    <div style="display: flex; flex-direction: column; gap: 8px;">
+    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px;">
       {#each filteredModels as model}
-        <button style="width: 100%; text-align: left; border: 2px solid var(--color-on-surface); background: var(--color-surface-bright); padding: 14px 16px; cursor: pointer; font-family: var(--font-family-display); display: flex; justify-content: space-between; align-items: center;" onclick={() => openDetail(model)}>
-          <div style="display: flex; align-items: center; gap: 10px;">
-            <span style="font-size: 18px;">{model.model_type === 'forecast' ? '📊' : model.model_type === 'anomaly' ? '🔍' : '🎯'}</span>
-            <div>
-              <div style="font-size: 13px; font-weight: 900; text-transform: uppercase;">{model.name}</div>
-              <div style="font-size: 10px; color: var(--color-on-surface-dim);">{model.algorithm} · {model.row_count} rows · {formatAccuracy(model.accuracy)}</div>
+        <div style="border: 2px solid var(--color-on-surface); background: var(--color-surface-bright); display: flex; flex-direction: column;">
+          <!-- Card header -->
+          <div style="padding: 20px 20px 12px 20px;">
+            <div style="font-size: 32px; margin-bottom: 12px;">
+              {model.model_type === 'forecast' ? '📊' : model.model_type === 'anomaly' ? '🔍' : '🎯'}
+            </div>
+            <div style="font-size: 16px; font-weight: 900; text-transform: uppercase; letter-spacing: -0.02em;">{model.name}</div>
+            <div style="font-size: 11px; color: var(--color-on-surface-dim); margin-top: 4px; line-height: 1.4;">
+              {model.algorithm} · {model.project_slug}
             </div>
           </div>
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <span style="font-size: 8px; font-weight: 900; padding: 2px 8px; background: #007518; color: white;">ACTIVE</span>
-            <span style="font-size: 10px; color: var(--color-on-surface-dim);">{model.project_slug}</span>
-            <span style="font-size: 14px; color: var(--color-on-surface-dim);">→</span>
+
+          <!-- Metrics -->
+          <div style="display: flex; margin: 0 20px 12px 20px; gap: 0;">
+            <div style="flex: 1; padding: 8px 12px; border: 1px solid var(--color-on-surface);">
+              <div style="font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-on-surface-dim);">ACCURACY</div>
+              <div style="font-size: 18px; font-weight: 900;">{formatAccuracy(model.accuracy)}</div>
+            </div>
+            <div style="flex: 1; padding: 8px 12px; border: 1px solid var(--color-on-surface); border-left: none;">
+              <div style="font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--color-on-surface-dim);">ROWS</div>
+              <div style="font-size: 18px; font-weight: 900;">{model.row_count}</div>
+            </div>
           </div>
-        </button>
+
+          <!-- Status -->
+          <div style="padding: 0 20px 16px 20px; font-size: 10px; margin-top: auto;">
+            <span style="color: #007518; font-weight: 900;">ACTIVE</span>
+            <span style="color: var(--color-on-surface-dim);"> · {model.created_at ? 'TRAINED ' + formatDate(model.created_at).toUpperCase() : 'NOT TRAINED'}</span>
+          </div>
+
+          <!-- Action buttons -->
+          <div style="display: flex; border-top: 2px solid var(--color-on-surface);">
+            <button onclick={() => openDetail(model)} style="flex: 1; padding: 10px; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.05em; background: var(--color-primary-container); border: none; border-right: 2px solid var(--color-on-surface); cursor: pointer; font-family: var(--font-family-display); color: var(--color-on-surface);">DETAILS</button>
+            <a href="/ui/project/{model.project_slug}" style="flex: 1; padding: 10px; font-size: 11px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.05em; background: transparent; border: none; text-decoration: none; text-align: center; font-family: var(--font-family-display); color: var(--color-on-surface);">CHAT</a>
+            <button onclick={() => retrain(model.id)} style="width: 40px; padding: 10px; font-size: 14px; background: transparent; border: none; border-left: 2px solid var(--color-on-surface); cursor: pointer; color: var(--color-on-surface-dim);" title="Retrain">↻</button>
+          </div>
+        </div>
       {/each}
     </div>
   {/if}

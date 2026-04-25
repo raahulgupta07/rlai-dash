@@ -16,6 +16,7 @@ from agno.learn import LearningMachine
 from agno.team import Team, TeamMode
 
 from dash.agents.analyst import create_analyst
+from dash.agents.data_scientist import create_data_scientist
 from dash.agents.engineer import create_engineer
 from dash.agents.researcher import create_researcher
 from dash.instructions import build_leader_instructions
@@ -178,12 +179,17 @@ def create_project_team(
 
     researcher = create_researcher(knowledge=knowledge, instructions=doc_instructions, project_slug=project_slug)
 
+    data_scientist = create_data_scientist(
+        knowledge=knowledge, learning=learning, project_slug=project_slug,
+        user_id=user_id, actual_user_id=user_id,
+    )
+
     team = Team(
         id="dash",
         name=agent_name,
         mode=TeamMode.coordinate,
         model=MODEL,
-        members=[analyst, engineer, researcher],
+        members=[analyst, engineer, researcher, data_scientist],
         db=agent_db,
         instructions=build_leader_instructions(user_id=project_slug, project_slug=project_slug),
         tools=[],
