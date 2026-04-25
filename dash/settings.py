@@ -50,6 +50,9 @@ TRAINING_CONFIGS = {
     "consolidation":    {"temp": 0.1, "tokens": 800,  "thinking": "high",  "model": DEEP_MODEL, "timeout": 60},
     "domain_knowledge": {"temp": 0.1, "tokens": 1000, "thinking": "high",  "model": DEEP_MODEL, "timeout": 60},
 
+    # ── ML prediction (needs strong reasoning for numerical trends) ──
+    "ml_prediction":    {"temp": 0.1, "tokens": 1000, "thinking": "high",  "model": DEEP_MODEL, "timeout": 30},
+
     # ── Flash Lite tasks (router: fastest, cheapest, bulk) ──
     "scoring":          {"temp": 0.0, "tokens": 100,  "thinking": "none",    "model": LITE_MODEL},
     "routing":          {"temp": 0.0, "tokens": 80,   "thinking": "none",    "model": LITE_MODEL},

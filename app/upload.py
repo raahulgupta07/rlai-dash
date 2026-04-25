@@ -543,9 +543,16 @@ def _contextual_enrich_chunks(chunks: list[str], filename: str, doc_summary: str
             doc_summary = chunks[0][:300]
 
         enriched = []
-        # Process in batches to reduce LLM calls
+        # Process in batches to reduce LLM calls (max 20 calls = 200 chunks)
         batch_size = 10
+        max_batches = 20
+        batch_count = 0
         for batch_start in range(0, len(chunks), batch_size):
+            if batch_count >= max_batches:
+                logger.info(f"Contextual enrichment capped at {max_batches} batches ({batch_count * batch_size} chunks), skipping remaining {len(chunks) - batch_start}")
+                enriched.extend(chunks[batch_start:])
+                break
+            batch_count += 1
             batch = chunks[batch_start:batch_start + batch_size]
             numbered = "\n".join(f"{i+1}. {c[:200]}" for i, c in enumerate(batch))
 
@@ -4797,7 +4804,8 @@ Use schema "{schema}" in all SQL. Only return fixes you are confident about."""
         if not isinstance(fixes, list) or not fixes:
             return []
 
-        # Execute each fix
+        # Execute each fix (sandboxed: only UPDATE/DELETE on this table)
+        _FORBIDDEN = re.compile(r"\b(DROP|ALTER|TRUNCATE|CREATE|INSERT|GRANT|REVOKE|COPY|EXECUTE)\b", re.IGNORECASE)
         applied = []
         with engine.connect() as conn:
             conn.execute(text(f"SET LOCAL search_path TO {schema}, public"))
@@ -4806,8 +4814,22 @@ Use schema "{schema}" in all SQL. Only return fixes you are confident about."""
                 desc = fix.get("description", "")
                 if not sql:
                     continue
+                # Safety: reject dangerous SQL from LLM
+                if _FORBIDDEN.search(sql):
+                    logger.warning(f"AI review blocked dangerous SQL: {sql[:100]}")
+                    continue
+                # Only allow operations on the target table
+                sql_upper = sql.upper()
+                if not (sql_upper.lstrip().startswith("UPDATE") or sql_upper.lstrip().startswith("DELETE")):
+                    logger.warning(f"AI review blocked non-UPDATE/DELETE SQL: {sql[:100]}")
+                    continue
                 try:
-                    conn.execute(text(sql))
+                    result = conn.execute(text(sql))
+                    # Cap: reject if affects too many rows (>50% of table)
+                    if result.rowcount > max(row_count * 0.5, 100):
+                        conn.rollback()
+                        logger.warning(f"AI review rolled back fix affecting {result.rowcount}/{row_count} rows: {desc}")
+                        continue
                     applied.append(desc)
                 except Exception as e:
                     pass  # Skip failed fixes silently

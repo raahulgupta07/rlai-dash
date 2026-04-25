@@ -61,7 +61,7 @@ dash/
 │   ├── engineer.py        # Engineer (views, computed data)
 │   ├── researcher.py      # Document RAG specialist
 │   ├── router.py          # Router Agent (smart project routing)
-│   └── data_scientist.py  # Data Scientist (ML-only: predict, classify, cluster, decompose, anomaly, importance, llm_predict)
+│   └── data_scientist.py  # Data Scientist (ML-only: predict, classify, cluster, decompose, anomaly, importance — 6 tools, predict auto-falls back to LLM)
 ├── context/
 │   ├── semantic_model.py  # Table metadata (Codex-enriched: purpose, grain, PKs, FKs, usage patterns, freshness)
 │   └── business_rules.py  # Business rules + user rules
@@ -123,7 +123,7 @@ frontend/src/routes/
 
 ## Agent System
 
-**30 Agents Total:** 4 core (Leader, Analyst, Engineer, Researcher) + 1 data scientist (Data Scientist — ML experiments with 7 tools) + 10 specialist (Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor) + 7 background (Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector) + 1 visualizer + 1 router (Router Agent — smart project routing with Brain lookup)
+**30 Agents Total:** 4 core (Leader, Analyst, Engineer, Researcher) + 1 data scientist (Data Scientist — ML experiments with 6 tools) + 10 specialist (Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor) + 7 background (Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector) + 1 visualizer + 1 router (Router Agent — smart project routing with Brain lookup)
 **Team:** Leader → Analyst (SQL + forecasting, 31 tools) + Engineer (views + dashboards) + Researcher (document RAG)
 **Modes:** FAST (direct SQL) / DEEP (think + analyze, auto-selected based on query complexity)
 
@@ -512,6 +512,50 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 144. **ML Worker Container** — `ml_worker/main.py` + `ml_worker/Dockerfile` + `compose.yaml` service `dash-ml`. Separate container (1GB RAM cap) that polls `dash_ml_jobs` table and trains heavy models (>1000 rows) in isolation. Never blocks chat. `auto_create_models()` auto-queues large tables to worker instead of training in-process.
 
+145. **ML Worker Port Fix** — compose.yaml ML worker port corrected from 6432→5432, added pgbouncer dependency so worker waits for connection pooler before starting.
+
+146. **LLM SQL Sandbox** — `upload.py` `_ai_review_and_fix_table()` now blocks DROP/ALTER/TRUNCATE statements, only allows UPDATE/DELETE on the target table, and rolls back if >50% rows affected. Prevents LLM-generated SQL from causing data loss.
+
+147. **DB Engine Leak Fix** — `ml_models.py` `_save_model()`, `_load_model()`, `_save_experiment()` now `dispose()` engines in `finally` blocks. Anomaly view engine also fixed. Prevents connection exhaustion from leaked engines.
+
+148. **ML Worker Row Limit** — `ml_worker/main.py` SELECT * queries capped at LIMIT 100,000 to prevent OOM on large tables.
+
+149. **Embedding Cascade Failure Fix** — `db/session.py` returns None instead of broken embedder when all cascade models fail. `create_knowledge()` handles None gracefully instead of crashing.
+
+150. **Batch Predict Size Limit** — POST `/api/ml-predict` caps input at 10,000 rows, returns 413 error for larger payloads.
+
+151. **ML Retrain Health Monitoring** — `_ml_retrain_scheduler` tracks `last_run` and `last_error` timestamps. Exposed in `/health` endpoint. Errors logged instead of silently swallowed.
+
+152. **Contextual Enrichment Cap** — `_contextual_enrich_chunks()` capped at 20 batches (200 chunks max) to prevent runaway LLM costs on large documents.
+
+153. **ML Worker Job Timeout** — 5-minute SIGALRM timeout per job in ML worker. Jobs marked as failed on timeout instead of hanging indefinitely.
+
+154. **Personal Brain Auth Fix** — POST `/brain/personal` now uses `_get_user()` instead of `_require_super_admin()`, allowing regular users to save personal brain entries.
+
+155. **Merged Predict + LLM Predict** — Single `predict` tool that auto-falls back to LLM internally when no trained model exists. 6 ML tools now (was 7). Agent cannot call both separately.
+
+156. **LLM Prediction Model Upgrade** — `llm_predict` now uses GPT-5.4-mini (DEEP_MODEL) with "high" thinking instead of Flash Lite (weakest model). New "ml_prediction" task config in settings.
+
+157. **Shared ML Preprocessing** — `_preprocess_df()` helper: SimpleImputer (median/mode), temporal feature extraction (month, quarter, day_of_week, is_weekend), categorical encoding. Used by feature_importance, classify, cluster.
+
+158. **GridSearchCV Hyperparameter Tuning** — `feature_importance` and `classify` now auto-tune via GridSearchCV (18 param combos: n_estimators x max_depth x learning_rate).
+
+159. **Better ML Eval Metrics** — classify: F1, Precision, Recall, Confusion Matrix, CV F1. feature_importance: RMSE, MAE alongside R².
+
+160. **Cross-Validation on All Models** — classify now has cross-validation. feature_importance already had it.
+
+161. **Temporal Feature Extraction** — Auto-extracts `_month`, `_quarter`, `_dayofweek`, `_is_weekend` from date columns during ML preprocessing.
+
+162. **Historical Data in Forecast** — predict tool now returns last 12 periods of historical data alongside future predictions for context.
+
+163. **Data Scientist Routing Fix** — Leader instructions updated with explicit ML keyword list (predict, forecast, anomaly, drivers, cluster, segment, etc.) that MUST route to Data Scientist. Added warning that Analyst has NO ML tools.
+
+164. **ML/LLM Badges on Cards** — Green "ML" badge for real ML models, purple "LLM" badge for LLM fallback predictions. All 6 tools (was 4) now show cards: predict, feature_importance, detect_anomalies_ml, classify, cluster, decompose.
+
+165. **Flat Chart Caption** — `generateChartCaption()` returns "Flat at X across all N periods" when all values are identical instead of useless highest/lowest text.
+
+166. **ML Worker Infrastructure Hardening** — compose.yaml ML worker port fix + pgbouncer dependency. ml_worker/main.py row limit + job timeout + SIGALRM signal handling.
+
 ## Self-Evolution Architecture
 
 ```
@@ -787,6 +831,15 @@ docker compose up -d --build
 - PgBouncer health check with CLIENT_IDLE_TIMEOUT and QUERY_WAIT_TIMEOUT
 - Caddy 512M memory limit
 - PostgreSQL idle_in_transaction_session_timeout=60s and statement_timeout=120s
+- LLM SQL sandbox (blocks DROP/ALTER/TRUNCATE, target-table-only UPDATE/DELETE, rollback on >50% row changes)
+- DB engine dispose() in finally blocks (ml_models.py) — prevents connection leaks
+- ML Worker row limit (LIMIT 100,000) — prevents OOM on large tables
+- Embedding cascade graceful failure (returns None instead of broken embedder)
+- Batch predict size cap (10,000 rows, 413 error)
+- ML retrain health monitoring (last_run/last_error exposed in /health)
+- Contextual enrichment cap (200 chunks max, prevents runaway LLM costs)
+- ML Worker job timeout (5-min SIGALRM, marks failed on timeout)
+- Personal brain auth fix (regular users can save personal entries)
 
 ## Key Dependencies (non-obvious)
 

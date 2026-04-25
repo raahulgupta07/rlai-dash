@@ -367,31 +367,26 @@ def _create_embedder() -> OpenAIEmbedder:
             _embed_logger.warning(f"Embedding model {model} failed: {e}, trying next...")
             continue
 
-    # All failed — return last model without validation (will error on use)
-    _embed_logger.error(f"All embedding models failed! Using {cascade[-1]} without validation.")
-    _active_embedding_model = cascade[-1]
-    return OpenAIEmbedder(
-        id=cascade[-1],
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-        dimensions=1536,
-    )
+    # All failed — return None so callers can handle gracefully
+    _embed_logger.critical(f"ALL {len(cascade)} embedding models failed! Search and indexing will be unavailable.")
+    _active_embedding_model = None
+    return None
 
 
 # Cache the embedder — created once, reused for all knowledge bases
 _cached_embedder: OpenAIEmbedder | None = None
 
 
-def _get_embedder() -> OpenAIEmbedder:
-    """Get or create the cached embedder instance."""
+def _get_embedder() -> OpenAIEmbedder | None:
+    """Get or create the cached embedder instance. Returns None if all models failed."""
     global _cached_embedder
     if _cached_embedder is None:
         _cached_embedder = _create_embedder()
     return _cached_embedder
 
 
-def get_active_embedding_model() -> str:
-    """Return the currently active embedding model ID."""
+def get_active_embedding_model() -> str | None:
+    """Return the currently active embedding model ID (None if all models failed)."""
     _get_embedder()  # ensure initialized
     return _active_embedding_model
 
@@ -402,13 +397,17 @@ def create_knowledge(name: str, table_name: str) -> Knowledge:
     Uses Gemini Embedding 2 (primary) with OpenAI fallback.
     Both via OpenRouter — single API key.
     """
+    embedder = _get_embedder()
+    if embedder is None:
+        _embed_logger.error(f"Cannot create knowledge '{name}' — no embedding model available")
+        return None
     return Knowledge(
         name=name,
         vector_db=PgVector(
             db_url=db_url,
             table_name=table_name,
             search_type=SearchType.hybrid,
-            embedder=_get_embedder(),
+            embedder=embedder,
         ),
         contents_db=get_postgres_db(contents_table=f"{table_name}_contents"),
     )

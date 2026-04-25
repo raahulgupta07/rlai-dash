@@ -149,9 +149,11 @@ services:
     container_name: dash-ml
     restart: unless-stopped
     environment:
-      - DATABASE_URL=postgresql://ai:${DB_PASS:-ai}@dash-pgbouncer:6432/ai
+      - DATABASE_URL=postgresql://ai:${DB_PASS:-ai}@dash-pgbouncer:5432/ai
     depends_on:
       dash-db:
+        condition: service_healthy
+      dash-pgbouncer:
         condition: service_healthy
     networks:
       - dash

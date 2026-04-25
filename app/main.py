@@ -9,6 +9,7 @@ Run:
 """
 
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from os import getenv
@@ -1174,6 +1175,11 @@ async def batch_predict(request: Request):
     input_data = body.get("data", [])
     periods = body.get("periods", 3)
 
+    # Size limit: max 10,000 rows
+    if isinstance(input_data, list) and len(input_data) > 10_000:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": f"Too many rows ({len(input_data)}). Max 10,000."}, status_code=413)
+
     from dash.tools.ml_models import _load_model
     model_info = _load_model(project_slug, model_name=model_name or None, model_type=model_type or None)
 
@@ -1213,7 +1219,13 @@ async def batch_predict(request: Request):
 
 
 # Scheduled ML retraining (every 24h, background thread)
+_ml_retrain_last_run = None
+_ml_retrain_last_error = None
+_ml_retrain_alive = True
+
+
 def _ml_retrain_scheduler():
+    global _ml_retrain_last_run, _ml_retrain_last_error, _ml_retrain_alive
     import time as _time
     _time.sleep(300)  # Wait 5 min after startup
     while True:
@@ -1232,11 +1244,16 @@ def _ml_retrain_scheduler():
                     schema = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
                     from dash.tools.ml_models import auto_create_models
                     auto_create_models(slug, schema=schema)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as e:
+                    logger.warning(f"ML retrain failed for {row[0]}: {e}")
+            _ml_retrain_last_run = datetime.now().isoformat()
+            _ml_retrain_last_error = None
+        except Exception as e:
+            _ml_retrain_last_error = str(e)
+            logger.error(f"ML retrain scheduler error: {e}")
         _time.sleep(86400)  # 24 hours
+    _ml_retrain_alive = False
+
 
 import threading
 threading.Thread(target=_ml_retrain_scheduler, daemon=True, name="ml-retrain").start()
@@ -1247,7 +1264,14 @@ def health_check():
     try:
         with _shared_engine.connect() as conn:
             conn.execute(sa_text("SELECT 1"))
-        return {"status": "ok", "db": "connected"}
+        return {
+            "status": "ok", "db": "connected",
+            "ml_retrain": {
+                "alive": _ml_retrain_alive,
+                "last_run": _ml_retrain_last_run,
+                "last_error": _ml_retrain_last_error,
+            },
+        }
     except Exception as e:
         from fastapi.responses import JSONResponse
         return JSONResponse({"status": "unhealthy", "db": str(e)}, status_code=503)

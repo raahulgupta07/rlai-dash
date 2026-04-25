@@ -605,6 +605,9 @@
     const total = values.reduce((s, v) => s + v.val, 0);
     const avg = total / values.length;
     const fmt = (n: number) => n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(1) + 'K' : n % 1 === 0 ? n.toLocaleString() : n.toFixed(1);
+    // Check if all values are the same (flat)
+    const allSame = sorted.length > 1 && top.val === bottom.val;
+    if (allSame) return `Flat at ${fmt(top.val)} ${numHeader} across all ${values.length} periods.`;
     let caption = `Highest ${numHeader}: ${top.label} (${fmt(top.val)})`;
     if (sorted.length > 1 && top.label !== bottom.label) caption += `. Lowest: ${bottom.label} (${fmt(bottom.val)})`;
     if (sorted.length >= 3) caption += `. Average: ${fmt(avg)}`;
@@ -1335,27 +1338,38 @@
                       {@const currentTab = msg.activeTab || 'analysis'}
 
                       <!-- ML Cards (detect from tool calls) -->
-                      {@const mlTools = (msg.toolCalls || []).filter((t: any) => ['predict', 'feature_importance', 'detect_anomalies_ml', 'llm_predict'].includes(t.name) && t.status === 'done')}
+                      {@const mlTools = (msg.toolCalls || []).filter((t: any) => ['predict', 'feature_importance', 'detect_anomalies_ml', 'llm_predict', 'classify', 'cluster', 'decompose'].includes(t.name) && t.status === 'done')}
                       {#if mlTools.length > 0}
                         <div style="margin: 8px 0; border: 2px solid var(--color-on-surface); background: var(--color-surface-bright);">
                           <div style="padding: 6px 12px; background: var(--color-on-surface); color: var(--color-surface); font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em;">MACHINE LEARNING &middot; {mlTools.length} {mlTools.length === 1 ? 'MODEL' : 'MODELS'} USED</div>
                           <div style="padding: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
                             {#each mlTools as mlTool}
-                              {@const isFC = mlTool.name === 'predict' || mlTool.name === 'llm_predict'}
-                              {@const isAN = mlTool.name === 'detect_anomalies_ml'}
-                              {@const isFI = mlTool.name === 'feature_importance'}
+                              {@const isLLM = mlTool.name === 'llm_predict'}
+                              {@const toolMeta = mlTool.name === 'predict' ? { label: 'FORECAST', algo: 'statsforecast/AutoARIMA', color: '#007518', tier: 'ML', cost: '$0' }
+                                : mlTool.name === 'llm_predict' ? { label: 'FORECAST', algo: 'LLM Trend Analysis', color: '#6b21a8', tier: 'LLM', cost: '$0.02' }
+                                : mlTool.name === 'detect_anomalies_ml' ? { label: 'ANOMALY', algo: 'IsolationForest', color: '#dc2626', tier: 'ML', cost: '$0' }
+                                : mlTool.name === 'feature_importance' ? { label: 'DRIVERS', algo: 'LightGBM', color: '#d97706', tier: 'ML', cost: '$0' }
+                                : mlTool.name === 'classify' ? { label: 'CLASSIFY', algo: 'GradientBoosting', color: '#0369a1', tier: 'ML', cost: '$0' }
+                                : mlTool.name === 'cluster' ? { label: 'CLUSTER', algo: 'K-Means', color: '#0d9488', tier: 'ML', cost: '$0' }
+                                : mlTool.name === 'decompose' ? { label: 'DECOMPOSE', algo: 'Seasonal Decompose', color: '#7c3aed', tier: 'ML', cost: '$0' }
+                                : { label: 'ML', algo: mlTool.name, color: '#6b7280', tier: 'ML', cost: '$0' }}
                               <div style="flex: 1; min-width: 180px; max-width: 280px; border: 2px solid var(--color-on-surface); background: var(--color-surface-bright); padding: 10px;">
-                                <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; color: {isFC ? '#007518' : isAN ? '#dc2626' : '#d97706'};">
-                                  {isFC ? '📊 FORECAST' : isAN ? '🔍 ANOMALY' : '🎯 DRIVERS'}
+                                <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 8px;">
+                                  <span style="font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; color: {toolMeta.color};">
+                                    {toolMeta.label}
+                                  </span>
+                                  <span style="font-size: 8px; font-weight: 900; padding: 1px 5px; border-radius: 2px; color: white; background: {isLLM ? '#6b21a8' : '#007518'};">
+                                    {toolMeta.tier}
+                                  </span>
                                 </div>
                                 <div style="font-size: 11px; font-weight: 700; margin-bottom: 4px;">
-                                  {isFC && mlTool.name === 'predict' ? 'statsforecast/AutoARIMA' : isFC ? 'LLM Trend Analysis' : isAN ? 'IsolationForest' : 'LightGBM'}
+                                  {toolMeta.algo}
                                 </div>
                                 {#if mlTool.duration}
                                   <div style="font-size: 10px; color: var(--color-on-surface-dim);">Completed in {mlTool.duration}</div>
                                 {/if}
                                 <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-top: 6px; text-transform: uppercase;">
-                                  {mlTool.name === 'predict' ? '⚡ Pre-trained ($0)' : mlTool.name === 'llm_predict' ? '🧠 LLM ($0.02)' : isAN ? '⚡ Pre-trained ($0)' : '🧠 On-demand'}
+                                  {isLLM ? '🧠 LLM (' + toolMeta.cost + ')' : '⚡ ' + (mlTool.name === 'feature_importance' || mlTool.name === 'classify' || mlTool.name === 'cluster' || mlTool.name === 'decompose' ? 'On-demand' : 'Pre-trained') + ' (' + toolMeta.cost + ')'}
                                 </div>
                               </div>
                             {/each}

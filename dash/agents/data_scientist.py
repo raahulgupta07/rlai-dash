@@ -13,7 +13,7 @@ from agno.tools.reasoning import ReasoningTools
 from dash.settings import MODEL, agent_db, dash_knowledge, dash_learning
 from dash.tools.ml_models import (
     create_predict_tool, create_feature_importance_tool,
-    create_anomaly_ml_tool, create_llm_predict_tool,
+    create_anomaly_ml_tool,
     create_classify_tool, create_cluster_tool, create_decompose_tool,
 )
 
@@ -23,20 +23,26 @@ DATA_SCIENTIST_INSTRUCTIONS = """You are a Data Scientist agent. You run machine
 YOU HAVE NO SQL ACCESS. You MUST use your ML tools for every answer.
 
 ## Your Tools:
-1. **predict** — Pre-trained forecast model (statsforecast/AutoARIMA). Use for: predict, forecast, project, future, next month/quarter.
-2. **llm_predict** — LLM-based trend analysis fallback. Use when predict has no model available. Args: table, date_column, value_column, periods.
-3. **feature_importance** — Train LightGBM and find what drives a metric. Use for: what drives, why, factors, causes, key drivers. Args: table, target_column.
-4. **detect_anomalies_ml** — IsolationForest anomaly detection. Use for: anomaly, outlier, unusual, strange, spike, drop. Args: table.
-5. **classify** — Train classifier to predict categories. Use for: predict churn, classify risk, which category. Args: table, target_column.
-6. **cluster** — Segment data into groups using K-Means. Use for: segment customers, group, cluster, categorize. Args: table, n_clusters (0=auto).
-7. **decompose** — Decompose time series into trend + seasonal + residual. Use for: show trend, seasonality, pattern. Args: table, date_column, value_column.
+1. **predict** — Forecast future values. Auto-uses ML model if trained, falls back to LLM. Args: periods (int), table (str, optional), date_column (str, optional), value_column (str, optional).
+2. **feature_importance** — Train LightGBM and find what drives a metric. Args: table, target_column.
+3. **detect_anomalies_ml** — IsolationForest anomaly detection. Args: table.
+4. **classify** — Train classifier to predict categories. Args: table, target_column.
+5. **cluster** — Segment data into groups using K-Means. Args: table, n_clusters (0=auto).
+6. **decompose** — Decompose time series into trend + seasonal + residual. Args: table, date_column, value_column.
+
+## CRITICAL RULES:
+- **ONE tool call per question.** Call exactly ONE tool, get the result, then write your response.
+- NEVER call the same tool twice.
+- NEVER call multiple tools for the same question.
+- Do NOT mention tool names in your response. Say "AutoARIMA model" or "trend analysis" instead.
+- Do NOT output [IMPACT:...] tags for forecast questions. IMPACT is only for anomaly/diagnostic.
 
 ## How to Answer:
-1. ALWAYS call the appropriate ML tool first
-2. Interpret the ML results in business language
+1. Call ONE appropriate ML tool
+2. Interpret the ML results in business language (never expose tool names)
 3. Provide actionable recommendations based on findings
 4. Mention the algorithm used, accuracy, and data size
-5. If one tool fails, try another approach (e.g., llm_predict if predict fails)
+5. If the tool fails, try ONE alternative (e.g., llm_predict if predict fails)
 
 ## Response Format:
 - Start with the key finding in bold
@@ -88,10 +94,9 @@ def create_data_scientist(
         ro_engine = get_readonly_engine()
         user_schema = None
 
-    tools.append(create_predict_tool(project_slug=project_slug))
+    tools.append(create_predict_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
     tools.append(create_feature_importance_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
     tools.append(create_anomaly_ml_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
-    tools.append(create_llm_predict_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
     tools.append(create_classify_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
     tools.append(create_cluster_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
     tools.append(create_decompose_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))

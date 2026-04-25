@@ -26,6 +26,66 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
+def _preprocess_df(df, target_column=None):
+    """Shared preprocessing: impute missing values, add temporal features, encode categoricals.
+    Returns (X, y, feature_cols, preprocessing_info)."""
+    import pandas as pd
+    import numpy as np
+
+    info = {"imputed_cols": [], "temporal_features": [], "encoded_cols": [], "original_rows": len(df), "rows_after": 0}
+
+    # 1. Separate features
+    numeric_cols = [c for c in df.select_dtypes(include=['number']).columns
+                    if c.lower() not in ('id', 'index', 'row_number') and c != target_column]
+    cat_cols = [c for c in df.select_dtypes(include=['object', 'category']).columns
+                if c != target_column]
+
+    # 2. Impute missing values (median for numeric, mode for categorical) — NOT dropna
+    from sklearn.impute import SimpleImputer
+    if numeric_cols:
+        num_imputer = SimpleImputer(strategy='median')
+        df[numeric_cols] = num_imputer.fit_transform(df[numeric_cols])
+        imputed = [c for c in numeric_cols if df[c].isna().sum() == 0]
+        info["imputed_cols"] = [c for c in numeric_cols]
+
+    if cat_cols:
+        cat_imputer = SimpleImputer(strategy='most_frequent')
+        df[cat_cols] = cat_imputer.fit_transform(df[cat_cols])
+
+    # 3. Temporal features from date columns
+    date_cols = [c for c in df.columns if df[c].dtype in ['datetime64[ns]'] or
+                 (df[c].dtype == 'object' and pd.to_datetime(df[c], errors='coerce').notna().sum() > len(df) * 0.5)]
+    for dc in date_cols[:1]:  # First date column only
+        dt = pd.to_datetime(df[dc], errors='coerce')
+        if dt.notna().sum() > len(df) * 0.3:
+            df['_month'] = dt.dt.month
+            df['_quarter'] = dt.dt.quarter
+            df['_dayofweek'] = dt.dt.dayofweek
+            df['_is_weekend'] = (dt.dt.dayofweek >= 5).astype(int)
+            numeric_cols.extend(['_month', '_quarter', '_dayofweek', '_is_weekend'])
+            info["temporal_features"] = ['_month', '_quarter', '_dayofweek', '_is_weekend']
+
+    # 4. Encode categoricals (label encoding for low cardinality)
+    feature_cols = list(numeric_cols)
+    for col in cat_cols[:5]:
+        if df[col].nunique() < 50:
+            df[f"{col}_enc"] = df[col].astype('category').cat.codes
+            feature_cols.append(f"{col}_enc")
+            info["encoded_cols"].append(col)
+
+    # 5. Build X, y
+    if target_column and target_column in df.columns:
+        valid = df[feature_cols + [target_column]].dropna(subset=[target_column])
+    else:
+        valid = df[feature_cols].copy()
+
+    info["rows_after"] = len(valid)
+    X = valid[feature_cols] if feature_cols else valid
+    y = valid[target_column] if target_column and target_column in valid.columns else None
+
+    return X, y, feature_cols, info
+
+
 def init_ml_tables():
     """Create dash_ml_models table if not exists."""
     try:
@@ -211,6 +271,7 @@ def auto_create_models(project_slug: str, engine=None, schema: str = None):
 
 def _save_model(project_slug, name, model_type, algorithm, target, features, accuracy, row_count, model_bytes):
     """Save or update ML model in dash_ml_models."""
+    engine = None
     try:
         from sqlalchemy import text
         from sqlalchemy import create_engine as _ce
@@ -235,10 +296,14 @@ def _save_model(project_slug, name, model_type, algorithm, target, features, acc
             conn.commit()
     except Exception as e:
         logger.warning(f"Save model failed: {e}")
+    finally:
+        if engine:
+            engine.dispose()
 
 
 def _load_model(project_slug: str, model_name: str = None, model_type: str = None):
     """Load ML model from dash_ml_models."""
+    engine = None
     try:
         from sqlalchemy import text
         from sqlalchemy import create_engine as _ce
@@ -268,11 +333,15 @@ def _load_model(project_slug: str, model_name: str = None, model_type: str = Non
                 }
     except Exception as e:
         logger.warning(f"Load model failed: {e}")
+    finally:
+        if engine:
+            engine.dispose()
     return None
 
 
 def _save_experiment(project_slug, experiment_type, model_name, algorithm, tier, question="", input_summary=None, result_data=None, accuracy=None):
     """Save ML experiment result to dash_ml_experiments."""
+    engine = None
     try:
         from sqlalchemy import text, create_engine as _ce
         from db.url import db_url
@@ -290,49 +359,136 @@ def _save_experiment(project_slug, experiment_type, model_name, algorithm, tier,
             conn.commit()
     except Exception as e:
         logger.debug(f"Save experiment failed: {e}")
+    finally:
+        if engine:
+            engine.dispose()
 
 
-def create_predict_tool(project_slug: str):
-    """Create predict tool for agent."""
+def create_predict_tool(project_slug: str, engine=None, schema: str = None):
+    """Create predict tool for agent. Auto-falls back to LLM if no ML model exists."""
     from agno.tools import tool
 
-    @tool(name="predict", description="Predict future values using pre-trained ML model (statsforecast). Use when user asks to predict, forecast, or project. Returns predicted values with algorithm details. Args: periods (int, default 3) — number of periods to forecast")
-    def predict(periods: int = 3) -> str:
+    @tool(name="predict", description="Predict/forecast future values. Uses pre-trained ML model if available, falls back to LLM trend analysis. This is the ONLY tool for predictions — do NOT call any other forecast tool. Args: periods (int, default 3), table (str, optional), date_column (str, optional), value_column (str, optional)")
+    def predict(periods: int = 3, table: str = "", date_column: str = "", value_column: str = "") -> str:
+        # Try ML model first
         model_info = _load_model(project_slug, model_type="forecast")
-        if not model_info or not model_info["model"]:
-            return "No forecast model available. Use llm_predict instead."
+        if model_info and model_info.get("model"):
+            try:
+                sf = model_info["model"]
+                forecast = sf.predict(h=periods)
 
+                rows = []
+                for i, row in forecast.iterrows():
+                    for col in forecast.columns:
+                        if col not in ('unique_id', 'ds'):
+                            val = row[col]
+                            rows.append(f"Period {i+1}: {val:,.0f}" if abs(val) > 100 else f"Period {i+1}: {val:.2f}")
+
+                result = f"FORECAST ({model_info['algorithm']}):\n"
+                result += f"Target: {model_info['target_column']}\n"
+                result += f"Method: {model_info['algorithm']}\n"
+                result += f"Trained on: {model_info['accuracy'].get('data_points', '?')} data points\n\n"
+                result += "\n".join(rows)
+                ml_tag = f"[ML:FORECAST|model={model_info['name']}|algorithm={model_info['algorithm']}|accuracy={model_info['accuracy'].get('mape','?')}|data={model_info['accuracy'].get('data_points','?')} rows|tier=instant]"
+                result = ml_tag + "\n" + result
+
+                forecast_rows = []
+                for i, row in forecast.iterrows():
+                    for col in forecast.columns:
+                        if col not in ('unique_id', 'ds'):
+                            forecast_rows.append({"period": i+1, "value": float(row[col])})
+
+                _save_experiment(project_slug, "forecast", model_info["name"], model_info["algorithm"], "instant",
+                    result_data={"predictions": forecast_rows, "periods": periods},
+                    accuracy=model_info["accuracy"])
+                return result
+            except Exception as e:
+                logger.warning(f"ML forecast failed, falling back to LLM: {e}")
+
+        # Fallback: LLM trend analysis
         try:
-            sf = model_info["model"]
-            forecast = sf.predict(h=periods)
+            import pandas as pd
+            from db import get_sql_engine
+            from dash.settings import training_llm_call
 
-            rows = []
-            for i, row in forecast.iterrows():
-                for col in forecast.columns:
-                    if col not in ('unique_id', 'ds'):
-                        val = row[col]
-                        rows.append(f"Period {i+1}: {val:,.0f}" if abs(val) > 100 else f"Period {i+1}: {val:.2f}")
+            eng = engine or get_sql_engine()
+            _schema = schema or __import__('re').sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
 
-            result = f"FORECAST ({model_info['algorithm']}):\n"
-            result += f"Target: {model_info['target_column']}\n"
-            result += f"Method: {model_info['algorithm']}\n"
-            result += f"Trained on: {model_info['accuracy'].get('data_points', '?')} data points\n\n"
-            result += "\n".join(rows)
-            ml_tag = f"[ML:FORECAST|model={model_info['name']}|algorithm={model_info['algorithm']}|accuracy={model_info['accuracy'].get('mape','?')}|data={model_info['accuracy'].get('data_points','?')} rows|tier=instant]"
+            # Auto-detect table/columns if not provided
+            if not table or not date_column or not value_column:
+                from sqlalchemy import inspect as sa_inspect
+                insp = sa_inspect(eng)
+                tables = insp.get_table_names(schema=_schema)
+                if not tables:
+                    return "No data tables found for forecasting."
+                # Find first table with date + numeric columns
+                for t in tables[:5]:
+                    qualified = f'"{_schema}"."{t}"'
+                    try:
+                        df_sample = pd.read_sql(f"SELECT * FROM {qualified} LIMIT 50", eng)
+                        date_cols = [c for c in df_sample.columns if df_sample[c].dtype in ['datetime64[ns]', 'object'] and pd.to_datetime(df_sample[c], errors='coerce').notna().sum() > len(df_sample) * 0.3]
+                        num_cols = [c for c in df_sample.select_dtypes(include=['number']).columns if c.lower() not in ('id', 'index', 'row_number')]
+                        if date_cols and num_cols:
+                            table, date_column, value_column = t, date_cols[0], num_cols[0]
+                            break
+                    except Exception:
+                        continue
+                if not table:
+                    return "No suitable table with date + numeric columns found."
+
+            qualified = f'"{_schema}"."{table}"'
+            df = pd.read_sql(
+                f'SELECT "{date_column}", "{value_column}" FROM {qualified} WHERE "{value_column}" IS NOT NULL ORDER BY "{date_column}" DESC LIMIT 24',
+                eng
+            )
+            if len(df) < 3:
+                return "Not enough historical data (need at least 3 data points)."
+
+            data_str = "\n".join(f"  {row[date_column]}: {row[value_column]}" for _, row in df.iterrows())
+            prompt = f"""Analyze this time series data and predict the next {periods} periods.
+
+Historical data ({value_column} by {date_column}):
+{data_str}
+
+Return ONLY valid JSON:
+{{"predictions": [{{"period": "label", "value": number, "reasoning": "brief"}}], "trend": "increasing/decreasing/flat/seasonal", "confidence": "high/medium/low", "growth_rate": "X%", "method": "LLM trend analysis", "historical_summary": "1-2 sentence summary of historical pattern"}}"""
+
+            _t0 = time.time()
+            raw = training_llm_call(prompt, "ml_prediction")
+            _duration = int((time.time() - _t0) * 1000)
+            if not raw:
+                return "LLM prediction failed — no response."
+
+            clean = raw.strip()
+            if clean.startswith("```"):
+                clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            if clean.startswith("json"):
+                clean = clean[4:].strip()
+            parsed = json.loads(clean)
+
+            # Build historical data for context
+            df_sorted = df.sort_values(date_column)
+            historical = []
+            for _, row in df_sorted.iterrows():
+                historical.append({"period": str(row[date_column])[:10], "value": float(row[value_column]) if pd.notna(row[value_column]) else 0})
+
+            result = f"PREDICTION (LLM Analysis):\nMethod: LLM trend analysis (no pre-trained model, using GPT)\nBased on: {len(df)} historical data points\nTrend: {parsed.get('trend', '?')}\nGrowth rate: {parsed.get('growth_rate', '?')}\nConfidence: {parsed.get('confidence', '?')}\n\n"
+            result += f"HISTORICAL DATA (last {min(len(historical), 12)} periods):\n"
+            for h in historical[-12:]:
+                result += f"  {h['period']}: {h['value']:,.2f}\n"
+            result += f"\nFORECAST (next {periods} periods):\n"
+            for p in parsed.get("predictions", []):
+                result += f"  {p.get('period', '?')}: {p.get('value', '?')} — {p.get('reasoning', '')}\n"
+
+            ml_tag = f"[ML:FORECAST|model=llm_analysis|algorithm=LLM|accuracy={parsed.get('confidence','?')}|data={len(df)} rows|tier=llm|trend={parsed.get('trend','?')}]"
             result = ml_tag + "\n" + result
-
-            forecast_rows = []
-            for i, row in forecast.iterrows():
-                for col in forecast.columns:
-                    if col not in ('unique_id', 'ds'):
-                        forecast_rows.append({"period": i+1, "value": float(row[col])})
-
-            _save_experiment(project_slug, "forecast", model_info["name"], model_info["algorithm"], "instant",
-                result_data={"predictions": forecast_rows, "periods": periods},
-                accuracy=model_info["accuracy"])
+            _save_experiment(project_slug, "forecast", f"{table}_{value_column}", "LLM", "llm",
+                input_summary={"table": table, "date_col": date_column, "value_col": value_column, "rows": len(df), "training_duration_ms": _duration},
+                result_data={**parsed, "historical": historical[-12:]},
+                accuracy={"confidence": parsed.get("confidence", "?")})
             return result
         except Exception as e:
-            return f"Prediction failed: {e}. Use llm_predict as fallback."
+            return f"Prediction failed: {e}"
 
     return predict
 
@@ -345,6 +501,7 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
     def feature_importance(table: str, target_column: str) -> str:
         try:
             import pandas as pd
+            import numpy as np
             from db import get_sql_engine
             eng = engine or get_sql_engine()
             qualified = f'"{schema}"."{table}"' if schema else f'"{table}"'
@@ -353,34 +510,28 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
             if target_column not in df.columns:
                 return f"Column '{target_column}' not found in table '{table}'"
 
-            # Prepare features (numeric + encoded categoricals)
-            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-            if target_column in numeric_cols:
-                numeric_cols.remove(target_column)
-
-            # Remove ID-like columns
-            feature_cols = [c for c in numeric_cols if c.lower() not in ('id', 'index', 'row_number')]
-
-            # Encode categorical columns (simple label encoding)
-            cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-            for col in cat_cols[:5]:  # Max 5 categorical
-                if df[col].nunique() < 50:
-                    df[f"{col}_encoded"] = df[col].astype('category').cat.codes
-                    feature_cols.append(f"{col}_encoded")
+            # Shared preprocessing: impute, temporal features, encode
+            X, y, feature_cols, prep_info = _preprocess_df(df, target_column=target_column)
 
             if not feature_cols:
                 return "Not enough features to analyze. Need at least 2 numeric columns."
+            if len(X) < 10:
+                return "Not enough data rows (need at least 10)."
 
-            df_clean = df[feature_cols + [target_column]].dropna()
-            if len(df_clean) < 10:
-                return "Not enough clean data rows (need at least 10)."
-
-            X = df_clean[feature_cols]
-            y = df_clean[target_column]
-
+            # Hyperparameter tuning with GridSearchCV
             import lightgbm as lgb
-            model = lgb.LGBMRegressor(n_estimators=100, max_depth=5, verbose=-1, random_state=42)
-            model.fit(X, y)
+            from sklearn.model_selection import GridSearchCV, cross_val_score
+
+            param_grid = {
+                'n_estimators': [50, 100, 200],
+                'max_depth': [3, 5, 7],
+                'learning_rate': [0.05, 0.1],
+            }
+            n_cv = min(5, max(2, len(X) // 10))
+            base_model = lgb.LGBMRegressor(verbose=-1, random_state=42)
+            grid = GridSearchCV(base_model, param_grid, cv=n_cv, scoring='r2', n_jobs=-1, refit=True)
+            grid.fit(X, y)
+            model = grid.best_estimator_
 
             importances = model.feature_importances_
             total = sum(importances)
@@ -394,20 +545,30 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
 
             r2 = model.score(X, y)
 
+            # Better metrics: RMSE, MAE
+            from sklearn.metrics import mean_squared_error, mean_absolute_error
+            y_pred = model.predict(X)
+            rmse = float(np.sqrt(mean_squared_error(y, y_pred)))
+            mae = float(mean_absolute_error(y, y_pred))
+
             # Cross-validation
             cv_data = {}
             try:
-                from sklearn.model_selection import cross_val_score
-                n_cv = min(5, max(2, len(df_clean) // 10))
                 cv_scores_arr = cross_val_score(model, X, y, cv=n_cv, scoring='r2')
-                cv_data = {"cv_mean": round(float(cv_scores_arr.mean()), 4), "cv_std": round(float(cv_scores_arr.std()), 4), "cv_scores": [round(float(s), 4) for s in cv_scores_arr], "cv_folds": n_cv}
+                cv_data = {"cv_mean": round(float(cv_scores_arr.mean()), 4), "cv_std": round(float(cv_scores_arr.std()), 4), "cv_scores": [round(float(s), 4) for s in cv_scores_arr], "cv_folds": n_cv,
+                           "best_params": grid.best_params_}
             except Exception:
                 pass
 
-            result = f"FEATURE IMPORTANCE (LightGBM, R\u00b2={r2:.2f}):\n"
+            result = f"FEATURE IMPORTANCE (LightGBM, R\u00b2={r2:.2f}, RMSE={rmse:.2f}, MAE={mae:.2f}):\n"
             result += f"Target: {target_column}\n"
-            result += f"Algorithm: LightGBM/GradientBoosting\n"
-            result += f"Data: {len(df_clean)} rows, {len(feature_cols)} features\n\n"
+            result += f"Algorithm: LightGBM (tuned: {grid.best_params_})\n"
+            result += f"Data: {len(X)} rows, {len(feature_cols)} features"
+            if prep_info.get("temporal_features"):
+                result += f" (+{len(prep_info['temporal_features'])} temporal)"
+            if prep_info.get("imputed_cols"):
+                result += f", {len(prep_info['imputed_cols'])} cols imputed"
+            result += "\n\n"
             result += "TOP FACTORS:\n"
             for fname, imp in features_ranked[:10]:
                 pct = imp / total * 100
@@ -477,7 +638,9 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
                     "shap_values": shap_summary,
                     "hyperparameters": {"n_estimators": 100, "max_depth": 5, "random_state": 42},
                 },
-                accuracy={"r2": round(r2, 4), "cv_mean": cv_data.get("cv_mean"), "cv_std": cv_data.get("cv_std")})
+                accuracy={"r2": round(r2, 4), "rmse": round(rmse, 4), "mae": round(mae, 4),
+                          "cv_mean": cv_data.get("cv_mean"), "cv_std": cv_data.get("cv_std"),
+                          "best_params": cv_data.get("best_params"), "preprocessing": prep_info})
             return result
         except ImportError:
             return "LightGBM not installed. Cannot compute feature importance."
@@ -607,20 +770,22 @@ def create_anomaly_ml_tool(project_slug: str, engine=None, schema: str = None):
                 from sqlalchemy import create_engine as _vce
                 from db.url import db_url as _vurl
                 _veng = _vce(_vurl)
-                view_name = f"{table}_anomalies"
-                qualified_view = f'"{_schema}"."{view_name}"' if _schema else f'"{view_name}"'
-                qualified_src = f'"{_schema}"."{table}"' if _schema else f'"{table}"'
-                anomaly_set = ",".join(str(idx) for idx in anomaly_idx)
-                if anomaly_set:
-                    with _veng.connect() as _vc:
-                        _vc.execute(_vt(f"""
-                            CREATE OR REPLACE VIEW {qualified_view} AS
-                            SELECT t.*, CASE WHEN rn IN ({anomaly_set}) THEN true ELSE false END AS is_anomaly
-                            FROM (SELECT *, ROW_NUMBER() OVER () - 1 AS rn FROM {qualified_src}) t
-                        """))
-                        _vc.commit()
-                    result += f"\n[Created view: {view_name} — query with: SELECT * FROM {view_name} WHERE is_anomaly = true]\n"
-                _veng.dispose()
+                try:
+                    view_name = f"{table}_anomalies"
+                    qualified_view = f'"{_schema}"."{view_name}"' if _schema else f'"{view_name}"'
+                    qualified_src = f'"{_schema}"."{table}"' if _schema else f'"{table}"'
+                    anomaly_set = ",".join(str(idx) for idx in anomaly_idx)
+                    if anomaly_set:
+                        with _veng.connect() as _vc:
+                            _vc.execute(_vt(f"""
+                                CREATE OR REPLACE VIEW {qualified_view} AS
+                                SELECT t.*, CASE WHEN rn IN ({anomaly_set}) THEN true ELSE false END AS is_anomaly
+                                FROM (SELECT *, ROW_NUMBER() OVER () - 1 AS rn FROM {qualified_src}) t
+                            """))
+                            _vc.commit()
+                        result += f"\n[Created view: {view_name} — query with: SELECT * FROM {view_name} WHERE is_anomaly = true]\n"
+                finally:
+                    _veng.dispose()
             except Exception:
                 pass
 
@@ -672,7 +837,7 @@ Return ONLY valid JSON:
 }}"""
 
             _t0 = time.time()
-            raw = training_llm_call(prompt, "extraction")
+            raw = training_llm_call(prompt, "ml_prediction")
             _duration = int((time.time() - _t0) * 1000)
             if not raw:
                 return "LLM prediction failed — no response."
@@ -718,8 +883,8 @@ def create_classify_tool(project_slug: str, engine=None, schema: str = None):
             import pandas as pd
             import numpy as np
             from sklearn.ensemble import GradientBoostingClassifier
-            from sklearn.model_selection import train_test_split
-            from sklearn.metrics import accuracy_score, classification_report
+            from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+            from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
             from sklearn.preprocessing import LabelEncoder
             from db import get_sql_engine
 
@@ -731,39 +896,39 @@ def create_classify_tool(project_slug: str, engine=None, schema: str = None):
             if target_column not in df.columns:
                 return f"Column '{target_column}' not found in table '{table}'"
 
-            # Prepare features
-            numeric_cols = [c for c in df.select_dtypes(include=['number']).columns
-                          if c.lower() not in ('id', 'index', 'row_number') and c != target_column]
-
-            # Encode categoricals
-            cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-            feature_cols = list(numeric_cols)
-            for col in cat_cols[:5]:
-                if col != target_column and df[col].nunique() < 50:
-                    df[f"{col}_enc"] = df[col].astype('category').cat.codes
-                    feature_cols.append(f"{col}_enc")
-
-            if not feature_cols:
-                return "Not enough features for classification."
-
-            # Encode target
+            # Encode target first (before preprocessing removes it)
             le = LabelEncoder()
             df['_target'] = le.fit_transform(df[target_column].astype(str))
             classes = list(le.classes_)
 
-            df_clean = df[feature_cols + ['_target']].dropna()
-            if len(df_clean) < 10:
+            # Shared preprocessing: impute, temporal features, encode
+            X, _, feature_cols, prep_info = _preprocess_df(df, target_column='_target')
+
+            if not feature_cols:
+                return "Not enough features for classification."
+
+            y = df.loc[X.index, '_target']
+            if len(X) < 10:
                 return "Need at least 10 rows for classification."
 
-            X = df_clean[feature_cols]
-            y = df_clean['_target']
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y if len(classes) > 1 and min(y.value_counts()) >= 2 else None)
 
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-            clf = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
-            clf.fit(X_train, y_train)
+            # Hyperparameter tuning
+            param_grid = {'n_estimators': [50, 100, 200], 'max_depth': [3, 4, 6], 'learning_rate': [0.05, 0.1]}
+            n_cv = min(5, max(2, len(X_train) // 10))
+            grid = GridSearchCV(GradientBoostingClassifier(random_state=42), param_grid, cv=n_cv, scoring='f1_weighted', n_jobs=-1, refit=True)
+            grid.fit(X_train, y_train)
+            clf = grid.best_estimator_
 
             y_pred = clf.predict(X_test)
             acc = accuracy_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+            prec = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+            rec = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+            cm = confusion_matrix(y_test, y_pred).tolist()
+
+            # Cross-validation
+            cv_scores = cross_val_score(clf, X, y, cv=n_cv, scoring='f1_weighted')
 
             # Feature importance
             importances = clf.feature_importances_
@@ -773,10 +938,14 @@ def create_classify_tool(project_slug: str, engine=None, schema: str = None):
             # Class distribution
             class_dist = [{"class": classes[int(c)], "count": int((y == c).sum())} for c in sorted(y.unique())]
 
-            result = f"[ML:CLASSIFY|algorithm=GradientBoosting|accuracy={acc:.2f}|classes={len(classes)}|data={len(df_clean)} rows]\n"
-            result += f"CLASSIFICATION (GradientBoosting, accuracy: {acc:.1%}):\n"
+            result = f"[ML:CLASSIFY|algorithm=GradientBoosting|accuracy={acc:.2f}|f1={f1:.2f}|classes={len(classes)}|data={len(X)} rows]\n"
+            result += f"CLASSIFICATION (GradientBoosting, tuned: {grid.best_params_}):\n"
             result += f"Target: {target_column} ({len(classes)} classes)\n"
-            result += f"Data: {len(df_clean)} rows, {len(feature_cols)} features\n\n"
+            result += f"Data: {len(X)} rows, {len(feature_cols)} features"
+            if prep_info.get("temporal_features"):
+                result += f" (+{len(prep_info['temporal_features'])} temporal)"
+            result += f"\n\nMETRICS:\n  Accuracy: {acc:.1%}\n  F1 Score: {f1:.1%}\n  Precision: {prec:.1%}\n  Recall: {rec:.1%}\n"
+            result += f"  CV F1 ({n_cv}-fold): {cv_scores.mean():.1%} \u00b1 {cv_scores.std():.1%}\n\n"
             result += "CLASS DISTRIBUTION:\n"
             for cd in class_dist:
                 result += f"  {cd['class']}: {cd['count']} rows\n"
@@ -786,9 +955,12 @@ def create_classify_tool(project_slug: str, engine=None, schema: str = None):
                 result += f"  {fname.replace('_enc', '')}: {pct:.1f}%\n"
 
             _save_experiment(project_slug, "classification", f"{table}_{target_column}", "GradientBoosting", "on-demand",
-                input_summary={"table": table, "target": target_column, "rows": len(df_clean), "features": len(feature_cols)},
-                result_data={"classes": class_dist, "factors": [{"name": f.replace("_enc",""), "importance": round(i/total*100,1)} for f, i in features_ranked[:10]]},
-                accuracy={"accuracy": round(acc, 4)})
+                input_summary={"table": table, "target": target_column, "rows": len(X), "features": len(feature_cols)},
+                result_data={"classes": class_dist, "factors": [{"name": f.replace("_enc",""), "importance": round(i/total*100,1)} for f, i in features_ranked[:10]],
+                             "confusion_matrix": cm, "class_names": classes},
+                accuracy={"accuracy": round(acc, 4), "f1": round(f1, 4), "precision": round(prec, 4), "recall": round(rec, 4),
+                          "cv_f1_mean": round(float(cv_scores.mean()), 4), "cv_f1_std": round(float(cv_scores.std()), 4),
+                          "best_params": grid.best_params_, "preprocessing": prep_info})
 
             return result
         except Exception as e:
@@ -807,7 +979,7 @@ def create_cluster_tool(project_slug: str, engine=None, schema: str = None):
             import numpy as np
             from sklearn.cluster import KMeans
             from sklearn.preprocessing import StandardScaler
-            from sklearn.metrics import silhouette_score
+            from sklearn.metrics import silhouette_score, calinski_harabasz_score
             from db import get_sql_engine
 
             eng = engine or get_sql_engine()
@@ -815,11 +987,14 @@ def create_cluster_tool(project_slug: str, engine=None, schema: str = None):
             qualified = f'"{_schema}"."{table}"' if _schema else f'"{table}"'
 
             df = pd.read_sql(f"SELECT * FROM {qualified} LIMIT 1000", eng)
-            numeric_cols = [c for c in df.select_dtypes(include=['number']).columns if c.lower() not in ('id','index','row_number')]
+
+            # Shared preprocessing: impute missing values
+            X, _, feature_cols, prep_info = _preprocess_df(df)
+            numeric_cols = [c for c in feature_cols if c in df.select_dtypes(include=['number']).columns or c.startswith('_')]
             if len(numeric_cols) < 2:
                 return "Need at least 2 numeric columns for clustering."
 
-            df_num = df[numeric_cols].dropna()
+            df_num = X[numeric_cols]
             if len(df_num) < 10:
                 return "Need at least 10 rows for clustering."
 
@@ -867,8 +1042,10 @@ def create_cluster_tool(project_slug: str, engine=None, schema: str = None):
 
             _save_experiment(project_slug, "clustering", f"{table}_clusters", "K-Means", "on-demand",
                 input_summary={"table": table, "rows": len(df_num), "features": len(numeric_cols), "columns": numeric_cols[:6]},
-                result_data={"n_clusters": n_clusters, "silhouette": round(sil, 4), "profiles": profiles, "scatter": scatter},
-                accuracy={"silhouette": round(sil, 4)})
+                result_data={"n_clusters": n_clusters, "silhouette": round(sil, 4), "profiles": profiles, "scatter": scatter,
+                             "calinski_harabasz": round(float(calinski_harabasz_score(X_scaled, labels)), 2)},
+                accuracy={"silhouette": round(sil, 4), "calinski_harabasz": round(float(calinski_harabasz_score(X_scaled, labels)), 2),
+                          "preprocessing": prep_info})
 
             return result
         except Exception as e:

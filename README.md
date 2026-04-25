@@ -79,7 +79,15 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Scheduled ML Retraining** -- Background thread retrains all models every 24h automatically
 - **Batch Prediction API** -- POST /api/ml-predict for forecast and anomaly scoring on custom data
 - **Model Comparison** -- Side-by-side experiment comparison in ML Insights detail view
-- **ML Worker Container** -- Separate Docker service for training heavy models (>1000 rows) without blocking chat. Auto-queued from training pipeline
+- **ML Worker Container** -- Separate Docker service for training heavy models (>1000 rows) without blocking chat. Auto-queued from training pipeline. 5-min job timeout, 100K row limit, pgbouncer dependency
+- **Unified Predict Tool** -- Single `predict` tool auto-falls back to LLM (GPT-5.4-mini with high thinking) when no trained model exists. 6 ML tools total: predict, feature_importance, detect_anomalies_ml, classify, cluster, decompose
+- **ML Preprocessing Pipeline** -- Shared `_preprocess_df()`: SimpleImputer (median/mode), temporal features (month, quarter, day_of_week, is_weekend), categorical encoding. Used by feature_importance, classify, cluster
+- **GridSearchCV Tuning** -- feature_importance and classify auto-tune via 18 param combos (n_estimators x max_depth x learning_rate)
+- **Better ML Metrics** -- classify: F1, Precision, Recall, Confusion Matrix, CV F1. feature_importance: RMSE, MAE alongside R². Cross-validation on all models
+- **Historical Data in Forecast** -- predict returns last 12 periods of historical data alongside future predictions
+- **Data Scientist Routing** -- Leader instructions with explicit ML keyword list for reliable routing. Analyst warned it has NO ML tools
+- **ML/LLM Badges** -- Green "ML" badge for real models, purple "LLM" badge for LLM fallback. All 6 ML tool cards visible in UI
+- **Flat Chart Caption** -- generateChartCaption() returns "Flat at X across all N periods" when values are identical
 
 ## Fresh Install
 
@@ -248,7 +256,8 @@ Each project gets an isolated PostgreSQL schema (`proj_{slug}`), its own PgVecto
 All DB connections route through PgBouncer. App engines use NullPool (PgBouncer owns pooling). Schema isolation via `SET LOCAL search_path` in SQLAlchemy `begin` events (PgBouncer transaction-safe).
 
 **Agent Team:** Leader (persona + routing + result review) dispatches to:
-- **Analyst** — SQL queries on data tables, 11 analysis types (each connected to real tools), 30 tools, Prophet forecasting, auto-visualization, context loader
+- **Analyst** — SQL queries on data tables, 11 analysis types (each connected to real tools), 31 tools, Prophet forecasting, auto-visualization, context loader
+- **Data Scientist** — 6 ML tools: predict (auto-falls back to LLM), feature_importance, detect_anomalies_ml, classify, cluster, decompose. GridSearchCV tuning, shared preprocessing, SHAP explanations
 - **Engineer** — Create views, dashboards
 - **Researcher** — Document RAG — answers from uploaded PPTX/PDF/DOCX (text + tables + image descriptions via vision)
 
@@ -437,12 +446,20 @@ docker compose restart dash-pgbouncer dash-api
 - Atomic JSON writes (prevents file corruption under concurrent uploads)
 - Configurable rate limiting via `RATE_LIMIT` env var
 - PostgreSQL idle transaction timeout (60s) + statement timeout (120s)
+- LLM SQL sandbox (blocks DROP/ALTER/TRUNCATE, target-table-only mutations, rollback on >50% row changes)
+- DB engine leak prevention (dispose() in finally blocks for all ML model engines)
+- ML Worker safeguards (100K row limit, 5-min SIGALRM job timeout)
+- Embedding cascade graceful degradation (returns None instead of crashing)
+- Batch predict size cap (10K rows, 413 error)
+- ML retrain health monitoring (last_run/last_error in /health endpoint)
+- Contextual enrichment cap (200 chunks max, prevents runaway LLM costs)
+- Personal brain auth fix (proper user-scoped access)
 
 ## Health Check
 
 ```bash
 curl http://localhost:8001/health
-# Returns: {"status":"ok","db":"connected"}
+# Returns: {"status":"ok","db":"connected","ml_retrain":{"last_run":"...","last_error":null}}
 ```
 
 For production with Caddy:

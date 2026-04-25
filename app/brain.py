@@ -487,11 +487,30 @@ def create_project_brain_entry(request: Request, slug: str, req: BrainEntryCreat
 
 @router.post("/brain/personal")
 def create_personal_brain_entry(request: Request, req: BrainEntryCreate):
-    """Create a personal brain entry for Dash Agent."""
+    """Create a personal brain entry for Dash Agent (any authenticated user)."""
     user = _get_user(request)
     req.user_id = user.get("id")
     req.project_slug = None
-    return create_entry(req, request)
+
+    if req.category not in VALID_CATEGORIES:
+        raise HTTPException(400, f"Invalid category. Must be one of: {', '.join(sorted(VALID_CATEGORIES))}")
+
+    safe, reason = _validate_no_data_leak(req.definition)
+    if not safe:
+        raise HTTPException(422, f"Data leak detected: {reason}. Brain stores abstract knowledge only.")
+
+    with _engine.connect() as conn:
+        row = conn.execute(text(
+            "INSERT INTO public.dash_company_brain (category, name, definition, metadata, created_by, project_slug, user_id) "
+            "VALUES (:cat, :name, :def, :meta, :by, :project_slug, :user_id) RETURNING id"
+        ), {
+            "cat": req.category, "name": req.name, "def": req.definition,
+            "meta": json.dumps(req.metadata), "by": user.get("username", ""),
+            "project_slug": None, "user_id": req.user_id,
+        }).fetchone()
+        conn.commit()
+
+    return {"id": row[0], "status": "created"}
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,10 @@ ML Worker — polls dash_ml_jobs, trains heavy models in isolation.
 Runs in separate container so chat is never blocked.
 """
 
-import os, sys, json, time, pickle, re, logging
+import os, sys, json, time, pickle, re, logging, signal
+
+MAX_ROWS = 100_000       # Cap rows loaded per table
+JOB_TIMEOUT_SEC = 300    # 5 min max per job
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [ML-WORKER] %(message)s")
 logger = logging.getLogger("ml_worker")
@@ -76,9 +79,9 @@ def train_model(job):
     engine = create_engine(DATABASE_URL)
     schema = re.sub(r"[^a-z0-9_]", "_", job["project_slug"].lower())[:63]
     qualified = f'"{schema}"."{job["table_name"]}"'
-    df = pd.read_sql(f"SELECT * FROM {qualified}", engine)
+    df = pd.read_sql(f"SELECT * FROM {qualified} LIMIT {MAX_ROWS}", engine)
     engine.dispose()
-    logger.info(f"Loaded {len(df)} rows from {qualified}")
+    logger.info(f"Loaded {len(df)} rows from {qualified} (cap={MAX_ROWS})")
 
     if job["job_type"] == "forecast":
         from statsforecast import StatsForecast
@@ -122,6 +125,13 @@ def save_model_from_result(job, result):
     return row[0] if row else None
 
 
+class JobTimeout(Exception):
+    pass
+
+def _timeout_handler(signum, frame):
+    raise JobTimeout(f"Job exceeded {JOB_TIMEOUT_SEC}s timeout")
+
+
 def main():
     logger.info("ML Worker starting...")
     init_jobs_table()
@@ -133,7 +143,11 @@ def main():
             continue
         logger.info(f"Job #{job['id']}: {job['job_type']} on {job['table_name']}")
         try:
+            # Set timeout alarm
+            signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(JOB_TIMEOUT_SEC)
             result = train_model(job)
+            signal.alarm(0)  # Cancel alarm on success
             if result.get("error"):
                 complete_job(job["id"], error=result["error"])
             else:
@@ -141,7 +155,12 @@ def main():
                 result.pop("model_bytes", None)
                 complete_job(job["id"], result=result, model_id=model_id)
                 logger.info(f"Job #{job['id']} done. Model: {model_id}")
+        except JobTimeout as e:
+            signal.alarm(0)
+            complete_job(job["id"], error=str(e))
+            logger.error(f"Job #{job['id']} timed out after {JOB_TIMEOUT_SEC}s")
         except Exception as e:
+            signal.alarm(0)
             complete_job(job["id"], error=str(e))
             logger.error(f"Job #{job['id']} error: {e}")
 
