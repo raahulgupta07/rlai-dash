@@ -1159,6 +1159,89 @@ async def get_ml_experiment(experiment_id: int, request: Request):
     }
 
 
+@app.post("/api/ml-predict")
+async def batch_predict(request: Request):
+    """Batch prediction using a trained ML model."""
+    user = getattr(getattr(request, 'state', None), 'user', None)
+    if not user:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+
+    body = await request.json()
+    project_slug = body.get("project_slug", "")
+    model_name = body.get("model_name", "")
+    model_type = body.get("model_type", "")
+    input_data = body.get("data", [])
+    periods = body.get("periods", 3)
+
+    from dash.tools.ml_models import _load_model
+    model_info = _load_model(project_slug, model_name=model_name or None, model_type=model_type or None)
+
+    if not model_info or not model_info.get("model"):
+        return {"error": "Model not found", "hint": "Use GET /api/ml-experiments to list models"}
+
+    try:
+        import pandas as pd
+        model = model_info["model"]
+
+        if model_info["model_type"] == "forecast":
+            forecast = model.predict(h=periods)
+            predictions = []
+            for i, row in forecast.iterrows():
+                for col in forecast.columns:
+                    if col not in ('unique_id', 'ds'):
+                        predictions.append({"period": i + 1, "value": float(row[col])})
+            return {"predictions": predictions, "model": model_info["name"], "algorithm": model_info["algorithm"]}
+
+        elif model_info["model_type"] == "anomaly":
+            data = model_info["model"]
+            iso_model = data["model"]
+            columns = data["columns"]
+            if input_data:
+                df = pd.DataFrame(input_data)
+                available = [c for c in columns if c in df.columns]
+                if available:
+                    scores = iso_model.decision_function(df[available])
+                    preds = iso_model.predict(df[available])
+                    results = [{"index": i, "is_anomaly": bool(p == -1), "score": float(s)} for i, (p, s) in enumerate(zip(preds, scores))]
+                    return {"predictions": results, "model": model_info["name"], "algorithm": model_info["algorithm"]}
+            return {"error": "Provide 'data' array with matching columns"}
+
+        return {"error": f"Batch predict not supported for: {model_info['model_type']}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# Scheduled ML retraining (every 24h, background thread)
+def _ml_retrain_scheduler():
+    import time as _time
+    _time.sleep(300)  # Wait 5 min after startup
+    while True:
+        try:
+            from sqlalchemy import text as _rt
+            from db import get_sql_engine
+            _eng = get_sql_engine()
+            with _eng.connect() as conn:
+                slugs = conn.execute(_rt(
+                    "SELECT DISTINCT project_slug FROM public.dash_ml_models WHERE status = 'active'"
+                )).fetchall()
+            for row in slugs:
+                try:
+                    import re
+                    slug = row[0]
+                    schema = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
+                    from dash.tools.ml_models import auto_create_models
+                    auto_create_models(slug, schema=schema)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        _time.sleep(86400)  # 24 hours
+
+import threading
+threading.Thread(target=_ml_retrain_scheduler, daemon=True, name="ml-retrain").start()
+
+
 @app.get("/health")
 def health_check():
     try:

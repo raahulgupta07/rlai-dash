@@ -142,6 +142,24 @@ services:
         limits:
           memory: 512M
 
+  dash-ml:
+    build:
+      context: .
+      dockerfile: ml_worker/Dockerfile
+    container_name: dash-ml
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://ai:${DB_PASS:-ai}@dash-pgbouncer:6432/ai
+    depends_on:
+      dash-db:
+        condition: service_healthy
+    networks:
+      - dash
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
 networks:
   dash:
 

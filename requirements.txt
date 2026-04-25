@@ -127,3 +127,4 @@ lightgbm
 statsforecast
 patsy
 statsmodels
+shap

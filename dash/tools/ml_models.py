@@ -98,8 +98,23 @@ def auto_create_models(project_slug: str, engine=None, schema: str = None):
                 with eng.connect() as conn:
                     row_count = conn.execute(text(f"SELECT COUNT(*) FROM {qualified}")).scalar()
 
-                if row_count < 5 or row_count > 1000:
-                    continue  # Too small or too big
+                if row_count < 5:
+                    continue  # Too small
+                if row_count > 1000:
+                    # Queue to ML worker for heavy training
+                    try:
+                        _jeng = create_engine(db_url)
+                        with _jeng.connect() as _jc:
+                            _jc.execute(text(
+                                "INSERT INTO public.dash_ml_jobs (project_slug, table_name, job_type) "
+                                "VALUES (:s, :t, 'anomaly') ON CONFLICT DO NOTHING"
+                            ), {"s": project_slug, "t": table_name})
+                            _jc.commit()
+                        _jeng.dispose()
+                        logger.info(f"Queued ML job for {table_name} ({row_count} rows)")
+                    except Exception:
+                        pass
+                    continue
 
                 df = pd.read_sql(f"SELECT * FROM {qualified} LIMIT 1000", eng)
                 if len(df) < 5:
@@ -404,6 +419,20 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
             if cv_data:
                 result += f"\nCROSS-VALIDATION ({cv_data.get('cv_folds',0)}-fold): R²={cv_data.get('cv_mean',0):.2f} ± {cv_data.get('cv_std',0):.2f}\n"
 
+            # SHAP explanations (per-row feature impact)
+            shap_summary = []
+            try:
+                import shap
+                explainer = shap.TreeExplainer(model)
+                shap_vals = explainer.shap_values(X.head(20))
+                for si in range(min(5, len(shap_vals))):
+                    row_shap = {col.replace("_encoded", ""): round(float(shap_vals[si][j]), 4) for j, col in enumerate(feature_cols)}
+                    shap_summary.append(row_shap)
+                if shap_summary:
+                    result += f"\nSHAP (per-row explanations available for top {len(shap_summary)} rows)\n"
+            except Exception:
+                pass
+
             top3 = ", ".join(f"{fname.replace('_encoded','')} {imp/total*100:.0f}%" for fname, imp in features_ranked[:3])
             ml_tag = f"[ML:DRIVERS|algorithm=LightGBM|r2={r2:.2f}|target={target_column}|features={len(feature_cols)}|top={top3}|data={len(df_clean)} rows]"
             result = ml_tag + "\n" + result
@@ -445,6 +474,7 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
                     "sample_data": sample,
                     "sample_columns": sample_cols,
                     "cross_validation": cv_data,
+                    "shap_values": shap_summary,
                     "hyperparameters": {"n_estimators": 100, "max_depth": 5, "random_state": 42},
                 },
                 accuracy={"r2": round(r2, 4), "cv_mean": cv_data.get("cv_mean"), "cv_std": cv_data.get("cv_std")})
@@ -570,6 +600,30 @@ def create_anomaly_ml_tool(project_slug: str, engine=None, schema: str = None):
                     "scatter": scatter,
                     "contamination": 0.1,
                 })
+
+            # Create SQL view with anomaly flags (so Analyst can query it)
+            try:
+                from sqlalchemy import text as _vt
+                from sqlalchemy import create_engine as _vce
+                from db.url import db_url as _vurl
+                _veng = _vce(_vurl)
+                view_name = f"{table}_anomalies"
+                qualified_view = f'"{_schema}"."{view_name}"' if _schema else f'"{view_name}"'
+                qualified_src = f'"{_schema}"."{table}"' if _schema else f'"{table}"'
+                anomaly_set = ",".join(str(idx) for idx in anomaly_idx)
+                if anomaly_set:
+                    with _veng.connect() as _vc:
+                        _vc.execute(_vt(f"""
+                            CREATE OR REPLACE VIEW {qualified_view} AS
+                            SELECT t.*, CASE WHEN rn IN ({anomaly_set}) THEN true ELSE false END AS is_anomaly
+                            FROM (SELECT *, ROW_NUMBER() OVER () - 1 AS rn FROM {qualified_src}) t
+                        """))
+                        _vc.commit()
+                    result += f"\n[Created view: {view_name} — query with: SELECT * FROM {view_name} WHERE is_anomaly = true]\n"
+                _veng.dispose()
+            except Exception:
+                pass
+
             return result
         except Exception as e:
             return f"Anomaly detection failed: {e}"

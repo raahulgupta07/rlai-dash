@@ -130,6 +130,9 @@
     </button>
     <button class="response-tab" class:response-tab-active={detailTab === 'history'} onclick={() => detailTab = 'history'}>History<span class="tab-badge">{modelExperiments.length}</span></button>
     <button class="response-tab" class:response-tab-active={detailTab === 'chart'} onclick={() => detailTab = 'chart'}>Chart</button>
+    {#if modelExperiments.length >= 2}
+      <button class="response-tab" class:response-tab-active={detailTab === 'compare'} onclick={() => detailTab = 'compare'}>Compare</button>
+    {/if}
   </div>
 
   <div style="border: 2px solid var(--color-on-surface); border-top: none; padding: 16px;">
@@ -343,6 +346,35 @@
           <div style="font-size: 11px; margin-top: 6px;">Run an experiment to generate chart visualizations</div>
         </div>
       {/if}
+
+    {:else if detailTab === 'compare' && modelExperiments.length >= 2}
+      {@const exp1 = modelExperiments[0]}
+      {@const exp2 = modelExperiments[1]}
+      <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px; color: var(--color-on-surface-dim);">EXPERIMENT COMPARISON</div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+        {#each [exp1, exp2] as exp, ei}
+          <div style="border: 2px solid {ei === 0 ? 'var(--color-on-surface)' : 'var(--color-on-surface-dim)'}; padding: 14px;">
+            <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+              <span style="font-size: 11px; font-weight: 900;">RUN #{modelExperiments.length - ei}</span>
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: {ei === 0 ? '#007518' : 'var(--color-on-surface-dim)'}; color: {ei === 0 ? 'white' : 'var(--color-surface)'};">{ei === 0 ? 'LATEST' : 'PREVIOUS'}</span>
+            </div>
+            <div style="font-size: 10px; color: var(--color-on-surface-dim); margin-bottom: 8px;">{formatDate(exp.created_at)}</div>
+            <table class="data-table" style="font-size: 11px;">
+              <tbody>
+                <tr><td style="font-weight: 700; font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim);">Algorithm</td><td>{exp.algorithm}</td></tr>
+                <tr><td style="font-weight: 700; font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim);">Tier</td><td>{exp.tier === 'instant' ? '⚡ Pre-trained' : exp.tier === 'llm' ? '🧠 LLM' : exp.tier || '—'}</td></tr>
+                {#if exp.accuracy?.r2}<tr><td style="font-weight: 700; font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim);">R²</td><td>{exp.accuracy.r2}</td></tr>{/if}
+                {#if exp.accuracy?.mape}<tr><td style="font-weight: 700; font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim);">MAPE</td><td>{exp.accuracy.mape}%</td></tr>{/if}
+                {#if exp.accuracy?.accuracy}<tr><td style="font-weight: 700; font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim);">Accuracy</td><td>{(exp.accuracy.accuracy * 100).toFixed(1)}%</td></tr>{/if}
+                {#if exp.accuracy?.cv_mean}<tr><td style="font-weight: 700; font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim);">CV Score</td><td>{exp.accuracy.cv_mean} ± {exp.accuracy.cv_std}</td></tr>{/if}
+                {#if exp.result_data?.total_anomalies !== undefined}<tr><td style="font-weight: 700; font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim);">Anomalies</td><td>{exp.result_data.total_anomalies}</td></tr>{/if}
+                {#if exp.result_data?.factors}<tr><td style="font-weight: 700; font-size: 9px; text-transform: uppercase; color: var(--color-on-surface-dim);">Top Factor</td><td>{exp.result_data.factors[0]?.name} ({exp.result_data.factors[0]?.importance}%)</td></tr>{/if}
+              </tbody>
+            </table>
+            {#if exp.question}<div style="font-size: 10px; margin-top: 8px; font-style: italic; color: var(--color-on-surface-dim);">"{exp.question}"</div>{/if}
+          </div>
+        {/each}
+      </div>
     {/if}
   </div>
 
