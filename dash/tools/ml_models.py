@@ -48,6 +48,8 @@ def init_ml_tables():
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
+            conn.execute(text("ALTER TABLE public.dash_ml_models ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'"))
+            conn.execute(text("ALTER TABLE public.dash_ml_models ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 1"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS public.dash_ml_experiments (
                     id SERIAL PRIMARY KEY,
@@ -139,6 +141,21 @@ def auto_create_models(project_slug: str, engine=None, schema: str = None):
                             model_bytes = pickle.dumps(sf)
                             accuracy = {"mape": "auto", "method": "AutoARIMA", "data_points": len(df_sf)}
 
+                            # Validate on holdout
+                            hold_out = max(2, len(df_sf) // 5)
+                            if len(df_sf) > hold_out + 5:
+                                train_sf = df_sf.iloc[:-hold_out]
+                                test_sf = df_sf.iloc[-hold_out:]
+                                sf_val = StatsForecast(models=[AutoARIMA(season_length=min(12, len(train_sf)//2) or 1)], freq='MS', fallback_model=AutoETS(season_length=1))
+                                sf_val.fit(train_sf)
+                                fc_val = sf_val.predict(h=hold_out)
+                                try:
+                                    from sklearn.metrics import mean_absolute_percentage_error
+                                    mape_val = mean_absolute_percentage_error(test_sf['y'].values, fc_val['AutoARIMA'].values)
+                                    accuracy["mape"] = round(mape_val * 100, 1)
+                                except Exception:
+                                    pass
+
                             _save_model(project_slug, model_name, "forecast", "statsforecast/AutoARIMA",
                                        value_col, date_col, accuracy, row_count, model_bytes)
                             models_created += 1
@@ -185,17 +202,21 @@ def _save_model(project_slug, name, model_type, algorithm, target, features, acc
         from db.url import db_url
         engine = _ce(db_url)
         with engine.connect() as conn:
-            # Delete existing model with same name
+            # Archive old version instead of deleting
             conn.execute(text(
-                "DELETE FROM public.dash_ml_models WHERE project_slug = :slug AND name = :name"
+                "UPDATE public.dash_ml_models SET status = 'archived' WHERE project_slug = :slug AND name = :name AND (status IS NULL OR status = 'active')"
             ), {"slug": project_slug, "name": name})
+            # Get next version number
+            ver = conn.execute(text(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM public.dash_ml_models WHERE project_slug = :slug AND name = :name"
+            ), {"slug": project_slug, "name": name}).scalar()
             # Insert new
             conn.execute(text(
-                "INSERT INTO public.dash_ml_models (project_slug, name, model_type, algorithm, target_column, features, accuracy, row_count, model_bytes) "
-                "VALUES (:slug, :name, :type, :algo, :target, :features, :acc, :rows, :model)"
+                "INSERT INTO public.dash_ml_models (project_slug, name, model_type, algorithm, target_column, features, accuracy, row_count, model_bytes, version) "
+                "VALUES (:slug, :name, :type, :algo, :target, :features, :acc, :rows, :model, :ver)"
             ), {"slug": project_slug, "name": name, "type": model_type, "algo": algorithm,
                 "target": target, "features": features, "acc": json.dumps(accuracy),
-                "rows": row_count, "model": model_bytes})
+                "rows": row_count, "model": model_bytes, "ver": ver})
             conn.commit()
     except Exception as e:
         logger.warning(f"Save model failed: {e}")
@@ -212,12 +233,12 @@ def _load_model(project_slug: str, model_name: str = None, model_type: str = Non
             if model_name:
                 row = conn.execute(text(
                     "SELECT name, model_type, algorithm, target_column, features, accuracy, model_bytes "
-                    "FROM public.dash_ml_models WHERE project_slug = :slug AND name = :name"
+                    "FROM public.dash_ml_models WHERE project_slug = :slug AND name = :name AND (status IS NULL OR status = 'active')"
                 ), {"slug": project_slug, "name": model_name}).fetchone()
             elif model_type:
                 row = conn.execute(text(
                     "SELECT name, model_type, algorithm, target_column, features, accuracy, model_bytes "
-                    "FROM public.dash_ml_models WHERE project_slug = :slug AND model_type = :type "
+                    "FROM public.dash_ml_models WHERE project_slug = :slug AND model_type = :type AND (status IS NULL OR status = 'active') "
                     "ORDER BY created_at DESC LIMIT 1"
                 ), {"slug": project_slug, "type": model_type}).fetchone()
             else:
@@ -358,6 +379,16 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
 
             r2 = model.score(X, y)
 
+            # Cross-validation
+            cv_data = {}
+            try:
+                from sklearn.model_selection import cross_val_score
+                n_cv = min(5, max(2, len(df_clean) // 10))
+                cv_scores_arr = cross_val_score(model, X, y, cv=n_cv, scoring='r2')
+                cv_data = {"cv_mean": round(float(cv_scores_arr.mean()), 4), "cv_std": round(float(cv_scores_arr.std()), 4), "cv_scores": [round(float(s), 4) for s in cv_scores_arr], "cv_folds": n_cv}
+            except Exception:
+                pass
+
             result = f"FEATURE IMPORTANCE (LightGBM, R\u00b2={r2:.2f}):\n"
             result += f"Target: {target_column}\n"
             result += f"Algorithm: LightGBM/GradientBoosting\n"
@@ -369,6 +400,9 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
                 # Clean up encoded column names
                 display_name = fname.replace("_encoded", "")
                 result += f"  {bar} {display_name}: {pct:.1f}%\n"
+
+            if cv_data:
+                result += f"\nCROSS-VALIDATION ({cv_data.get('cv_folds',0)}-fold): R²={cv_data.get('cv_mean',0):.2f} ± {cv_data.get('cv_std',0):.2f}\n"
 
             top3 = ", ".join(f"{fname.replace('_encoded','')} {imp/total*100:.0f}%" for fname, imp in features_ranked[:3])
             ml_tag = f"[ML:DRIVERS|algorithm=LightGBM|r2={r2:.2f}|target={target_column}|features={len(feature_cols)}|top={top3}|data={len(df_clean)} rows]"
@@ -410,9 +444,10 @@ def create_feature_importance_tool(project_slug: str, engine=None, schema: str =
                     "column_stats": col_stats,
                     "sample_data": sample,
                     "sample_columns": sample_cols,
+                    "cross_validation": cv_data,
                     "hyperparameters": {"n_estimators": 100, "max_depth": 5, "random_state": 42},
                 },
-                accuracy={"r2": round(r2, 4)})
+                accuracy={"r2": round(r2, 4), "cv_mean": cv_data.get("cv_mean"), "cv_std": cv_data.get("cv_std")})
             return result
         except ImportError:
             return "LightGBM not installed. Cannot compute feature importance."
@@ -479,6 +514,13 @@ def create_anomaly_ml_tool(project_slug: str, engine=None, schema: str = None):
             medium = len([idx for idx in anomaly_idx if -0.1 <= scores[idx] < -0.05])
             low = len(anomaly_idx) - high - medium
 
+            # Normal data stats for comparison
+            normal_idx = [i for i, p in enumerate(predictions) if p == 1]
+            normal_stats = {}
+            for c in available_cols:
+                normal_vals = df_num.iloc[normal_idx][c]
+                normal_stats[c] = {"mean": float(normal_vals.mean()), "std": float(normal_vals.std()), "min": float(normal_vals.min()), "max": float(normal_vals.max())}
+
             # Full anomaly details with all column values
             anomaly_details = []
             for idx in anomaly_idx[:20]:
@@ -486,14 +528,25 @@ def create_anomaly_ml_tool(project_slug: str, engine=None, schema: str = None):
                 row_data["_row"] = int(idx)
                 row_data["_score"] = float(scores[idx])
                 row_data["_severity"] = "HIGH" if scores[idx] < -0.1 else "MEDIUM" if scores[idx] < -0.05 else "LOW"
+                # Explain WHY this is anomalous
+                explanations = []
+                for col in available_cols:
+                    if col in row_data and col in normal_stats:
+                        val = float(row_data[col]) if isinstance(row_data[col], (int, float)) else 0
+                        n_mean = normal_stats[col]["mean"]
+                        n_std = max(normal_stats[col]["std"], 0.001)
+                        z = (val - n_mean) / n_std
+                        if abs(z) > 1.5:
+                            direction = "above" if z > 0 else "below"
+                            explanations.append(f"{col}: {val:,.0f} is {abs(z):.1f}x std {direction} normal ({n_mean:,.0f})")
+                row_data["_explanation"] = explanations
                 anomaly_details.append(row_data)
 
-            # Normal data stats for comparison
-            normal_idx = [i for i, p in enumerate(predictions) if p == 1]
-            normal_stats = {}
-            for c in available_cols:
-                normal_vals = df_num.iloc[normal_idx][c]
-                normal_stats[c] = {"mean": float(normal_vals.mean()), "std": float(normal_vals.std()), "min": float(normal_vals.min()), "max": float(normal_vals.max())}
+            if anomaly_idx:
+                result += "\nWHY THESE ARE ANOMALIES:\n"
+                for detail in anomaly_details[:5]:
+                    if detail.get("_explanation"):
+                        result += f"  Row {detail['_row']}: {'; '.join(detail['_explanation'][:3])}\n"
 
             # Scatter plot data (first 2 features)
             scatter = None
@@ -599,3 +652,235 @@ Return ONLY valid JSON:
             return f"LLM prediction failed: {e}"
 
     return llm_predict
+
+
+def create_classify_tool(project_slug: str, engine=None, schema: str = None):
+    """Create classification tool for agent."""
+    from agno.tools import tool
+
+    @tool(name="classify", description="Train a classifier to predict categories. Use when user asks to predict churn, classify risk, which category. Args: table (str), target_column (str)")
+    def classify(table: str, target_column: str) -> str:
+        try:
+            import pandas as pd
+            import numpy as np
+            from sklearn.ensemble import GradientBoostingClassifier
+            from sklearn.model_selection import train_test_split
+            from sklearn.metrics import accuracy_score, classification_report
+            from sklearn.preprocessing import LabelEncoder
+            from db import get_sql_engine
+
+            eng = engine or get_sql_engine()
+            _schema = schema or __import__('re').sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+            qualified = f'"{_schema}"."{table}"' if _schema else f'"{table}"'
+
+            df = pd.read_sql(f"SELECT * FROM {qualified} LIMIT 1000", eng)
+            if target_column not in df.columns:
+                return f"Column '{target_column}' not found in table '{table}'"
+
+            # Prepare features
+            numeric_cols = [c for c in df.select_dtypes(include=['number']).columns
+                          if c.lower() not in ('id', 'index', 'row_number') and c != target_column]
+
+            # Encode categoricals
+            cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+            feature_cols = list(numeric_cols)
+            for col in cat_cols[:5]:
+                if col != target_column and df[col].nunique() < 50:
+                    df[f"{col}_enc"] = df[col].astype('category').cat.codes
+                    feature_cols.append(f"{col}_enc")
+
+            if not feature_cols:
+                return "Not enough features for classification."
+
+            # Encode target
+            le = LabelEncoder()
+            df['_target'] = le.fit_transform(df[target_column].astype(str))
+            classes = list(le.classes_)
+
+            df_clean = df[feature_cols + ['_target']].dropna()
+            if len(df_clean) < 10:
+                return "Need at least 10 rows for classification."
+
+            X = df_clean[feature_cols]
+            y = df_clean['_target']
+
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            clf = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
+            clf.fit(X_train, y_train)
+
+            y_pred = clf.predict(X_test)
+            acc = accuracy_score(y_test, y_pred)
+
+            # Feature importance
+            importances = clf.feature_importances_
+            total = sum(importances) or 1
+            features_ranked = sorted(zip(feature_cols, importances), key=lambda x: x[1], reverse=True)
+
+            # Class distribution
+            class_dist = [{"class": classes[int(c)], "count": int((y == c).sum())} for c in sorted(y.unique())]
+
+            result = f"[ML:CLASSIFY|algorithm=GradientBoosting|accuracy={acc:.2f}|classes={len(classes)}|data={len(df_clean)} rows]\n"
+            result += f"CLASSIFICATION (GradientBoosting, accuracy: {acc:.1%}):\n"
+            result += f"Target: {target_column} ({len(classes)} classes)\n"
+            result += f"Data: {len(df_clean)} rows, {len(feature_cols)} features\n\n"
+            result += "CLASS DISTRIBUTION:\n"
+            for cd in class_dist:
+                result += f"  {cd['class']}: {cd['count']} rows\n"
+            result += "\nTOP PREDICTORS:\n"
+            for fname, imp in features_ranked[:8]:
+                pct = imp / total * 100
+                result += f"  {fname.replace('_enc', '')}: {pct:.1f}%\n"
+
+            _save_experiment(project_slug, "classification", f"{table}_{target_column}", "GradientBoosting", "on-demand",
+                input_summary={"table": table, "target": target_column, "rows": len(df_clean), "features": len(feature_cols)},
+                result_data={"classes": class_dist, "factors": [{"name": f.replace("_enc",""), "importance": round(i/total*100,1)} for f, i in features_ranked[:10]]},
+                accuracy={"accuracy": round(acc, 4)})
+
+            return result
+        except Exception as e:
+            return f"Classification failed: {e}"
+    return classify
+
+
+def create_cluster_tool(project_slug: str, engine=None, schema: str = None):
+    """Create clustering tool for agent."""
+    from agno.tools import tool
+
+    @tool(name="cluster", description="Segment data into groups using K-Means clustering. Use when user asks to segment, group, cluster, categorize. Args: table (str), n_clusters (int, default 0 for auto)")
+    def cluster(table: str, n_clusters: int = 0) -> str:
+        try:
+            import pandas as pd
+            import numpy as np
+            from sklearn.cluster import KMeans
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.metrics import silhouette_score
+            from db import get_sql_engine
+
+            eng = engine or get_sql_engine()
+            _schema = schema or __import__('re').sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+            qualified = f'"{_schema}"."{table}"' if _schema else f'"{table}"'
+
+            df = pd.read_sql(f"SELECT * FROM {qualified} LIMIT 1000", eng)
+            numeric_cols = [c for c in df.select_dtypes(include=['number']).columns if c.lower() not in ('id','index','row_number')]
+            if len(numeric_cols) < 2:
+                return "Need at least 2 numeric columns for clustering."
+
+            df_num = df[numeric_cols].dropna()
+            if len(df_num) < 10:
+                return "Need at least 10 rows for clustering."
+
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(df_num)
+
+            # Auto-select k
+            if n_clusters <= 0:
+                best_k, best_score = 2, -1
+                for k in range(2, min(9, len(df_num) // 3)):
+                    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+                    labels = km.fit_predict(X_scaled)
+                    score = silhouette_score(X_scaled, labels)
+                    if score > best_score:
+                        best_k, best_score = k, score
+                n_clusters = best_k
+
+            km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            labels = km.fit_predict(X_scaled)
+            sil = silhouette_score(X_scaled, labels)
+
+            # Cluster profiles
+            df_num['_cluster'] = labels
+            profiles = []
+            for c in range(n_clusters):
+                mask = df_num['_cluster'] == c
+                size = int(mask.sum())
+                means = {col: round(float(df_num.loc[mask, col].mean()), 2) for col in numeric_cols[:6]}
+                profiles.append({"cluster": c, "size": size, "pct": round(size/len(df_num)*100, 1), "means": means})
+
+            # Scatter data (first 2 cols)
+            scatter = {
+                "x_col": numeric_cols[0], "y_col": numeric_cols[1],
+                "points": [[float(row[numeric_cols[0]]), float(row[numeric_cols[1]]), int(row['_cluster'])] for _, row in df_num.head(200).iterrows()]
+            }
+
+            result = f"[ML:CLUSTER|algorithm=K-Means|clusters={n_clusters}|silhouette={sil:.2f}|data={len(df_num)} rows]\n"
+            result += f"CLUSTERING (K-Means, {n_clusters} segments, silhouette: {sil:.2f}):\n"
+            result += f"Data: {len(df_num)} rows, {len(numeric_cols)} features\n\n"
+            result += "SEGMENTS:\n"
+            for p in profiles:
+                result += f"\n  Cluster {p['cluster']} ({p['size']} rows, {p['pct']}%):\n"
+                for col, val in list(p['means'].items())[:4]:
+                    result += f"    {col}: {val}\n"
+
+            _save_experiment(project_slug, "clustering", f"{table}_clusters", "K-Means", "on-demand",
+                input_summary={"table": table, "rows": len(df_num), "features": len(numeric_cols), "columns": numeric_cols[:6]},
+                result_data={"n_clusters": n_clusters, "silhouette": round(sil, 4), "profiles": profiles, "scatter": scatter},
+                accuracy={"silhouette": round(sil, 4)})
+
+            return result
+        except Exception as e:
+            return f"Clustering failed: {e}"
+    return cluster
+
+
+def create_decompose_tool(project_slug: str, engine=None, schema: str = None):
+    """Create time series decomposition tool."""
+    from agno.tools import tool
+
+    @tool(name="decompose", description="Decompose time series into trend + seasonal + residual components. Use when user asks about trend, seasonality, pattern, decompose. Args: table (str), date_column (str), value_column (str)")
+    def decompose(table: str, date_column: str, value_column: str) -> str:
+        try:
+            import pandas as pd
+            from statsmodels.tsa.seasonal import seasonal_decompose
+            from db import get_sql_engine
+
+            eng = engine or get_sql_engine()
+            _schema = schema or __import__('re').sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+            qualified = f'"{_schema}"."{table}"' if _schema else f'"{table}"'
+
+            df = pd.read_sql(f'SELECT "{date_column}", "{value_column}" FROM {qualified} ORDER BY "{date_column}"', eng)
+            df[date_column] = pd.to_datetime(df[date_column], errors='coerce')
+            df = df.dropna().set_index(date_column)
+
+            if len(df) < 8:
+                return "Need at least 8 data points for decomposition."
+
+            period = min(12, len(df) // 2)
+            decomp = seasonal_decompose(df[value_column], model='additive', period=period)
+
+            trend_vals = decomp.trend.dropna().tolist()
+            seasonal_vals = decomp.seasonal.dropna().tolist()
+            resid_vals = decomp.resid.dropna().tolist()
+
+            # Trend direction
+            if len(trend_vals) >= 2:
+                trend_dir = "increasing" if trend_vals[-1] > trend_vals[0] else "decreasing" if trend_vals[-1] < trend_vals[0] else "flat"
+                trend_change = ((trend_vals[-1] - trend_vals[0]) / abs(trend_vals[0]) * 100) if trend_vals[0] != 0 else 0
+            else:
+                trend_dir, trend_change = "unknown", 0
+
+            # Seasonal strength
+            seasonal_strength = max(seasonal_vals) - min(seasonal_vals) if seasonal_vals else 0
+
+            result = f"[ML:DECOMPOSE|algorithm=Seasonal Decompose|trend={trend_dir}|period={period}|data={len(df)} rows]\n"
+            result += f"TIME SERIES DECOMPOSITION:\n"
+            result += f"Data: {len(df)} points, period={period}\n\n"
+            result += f"TREND: {trend_dir} ({trend_change:+.1f}%)\n"
+            result += f"SEASONAL STRENGTH: {seasonal_strength:,.0f}\n"
+            result += f"RESIDUAL STD: {pd.Series(resid_vals).std():,.0f}\n"
+
+            _save_experiment(project_slug, "decomposition", f"{table}_{value_column}", "SeasonalDecompose", "on-demand",
+                input_summary={"table": table, "date_col": date_column, "value_col": value_column, "rows": len(df), "period": period},
+                result_data={
+                    "trend": trend_vals[:50], "seasonal": seasonal_vals[:50], "residual": resid_vals[:50],
+                    "trend_direction": trend_dir, "trend_change_pct": round(trend_change, 1),
+                    "seasonal_strength": round(seasonal_strength, 2),
+                    "dates": [str(d)[:10] for d in decomp.trend.dropna().index[:50]],
+                },
+                accuracy={"trend": trend_dir, "period": period})
+
+            return result
+        except ImportError:
+            return "statsmodels not installed."
+        except Exception as e:
+            return f"Decomposition failed: {e}"
+    return decompose

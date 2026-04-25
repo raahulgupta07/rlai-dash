@@ -14,6 +14,7 @@ from dash.settings import MODEL, agent_db, dash_knowledge, dash_learning
 from dash.tools.ml_models import (
     create_predict_tool, create_feature_importance_tool,
     create_anomaly_ml_tool, create_llm_predict_tool,
+    create_classify_tool, create_cluster_tool, create_decompose_tool,
 )
 
 
@@ -26,6 +27,9 @@ YOU HAVE NO SQL ACCESS. You MUST use your ML tools for every answer.
 2. **llm_predict** — LLM-based trend analysis fallback. Use when predict has no model available. Args: table, date_column, value_column, periods.
 3. **feature_importance** — Train LightGBM and find what drives a metric. Use for: what drives, why, factors, causes, key drivers. Args: table, target_column.
 4. **detect_anomalies_ml** — IsolationForest anomaly detection. Use for: anomaly, outlier, unusual, strange, spike, drop. Args: table.
+5. **classify** — Train classifier to predict categories. Use for: predict churn, classify risk, which category. Args: table, target_column.
+6. **cluster** — Segment data into groups using K-Means. Use for: segment customers, group, cluster, categorize. Args: table, n_clusters (0=auto).
+7. **decompose** — Decompose time series into trend + seasonal + residual. Use for: show trend, seasonality, pattern. Args: table, date_column, value_column.
 
 ## How to Answer:
 1. ALWAYS call the appropriate ML tool first
@@ -88,6 +92,9 @@ def create_data_scientist(
     tools.append(create_feature_importance_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
     tools.append(create_anomaly_ml_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
     tools.append(create_llm_predict_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
+    tools.append(create_classify_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
+    tools.append(create_cluster_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
+    tools.append(create_decompose_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
 
     # Also add search_all for context
     try:

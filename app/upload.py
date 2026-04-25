@@ -5864,6 +5864,15 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
         else:
             change_type = "new"
 
+        # Auto-retrain ML models on new data
+        try:
+            from dash.tools.ml_models import auto_create_models
+            import re as _re
+            _ml_schema = _re.sub(r"[^a-z0-9_]", "_", project.lower())[:63]
+            auto_create_models(project, schema=_ml_schema)
+        except Exception:
+            pass
+
         return {
             "status": "ok",
             "table_name": tbl,

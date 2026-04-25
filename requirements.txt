@@ -125,3 +125,5 @@ threadpoolctl
 scikit-learn
 lightgbm
 statsforecast
+patsy
+statsmodels

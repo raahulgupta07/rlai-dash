@@ -129,6 +129,7 @@
       {selectedModel.model_type === 'forecast' ? 'Predictions' : selectedModel.model_type === 'anomaly' ? 'Anomalies' : 'Factors'}
     </button>
     <button class="response-tab" class:response-tab-active={detailTab === 'history'} onclick={() => detailTab = 'history'}>History<span class="tab-badge">{modelExperiments.length}</span></button>
+    <button class="response-tab" class:response-tab-active={detailTab === 'chart'} onclick={() => detailTab = 'chart'}>Chart</button>
   </div>
 
   <div style="border: 2px solid var(--color-on-surface); border-top: none; padding: 16px;">
@@ -277,6 +278,70 @@
         </div>
       {:else}
         <div style="text-align: center; padding: 30px; color: var(--color-on-surface-dim);">No experiment history yet</div>
+      {/if}
+
+    {:else if detailTab === 'chart'}
+      <!-- Chart visualizations from experiment data -->
+      {#if modelExperiments.length > 0}
+        {@const latest = modelExperiments[0]}
+        {@const resultData = latest.result_data || {}}
+
+        {#if latest.experiment_type === 'importance'}
+          <!-- Importance: horizontal bar from factors -->
+          {#if resultData.factors?.length}
+            <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px; color: var(--color-on-surface-dim);">FEATURE IMPORTANCE</div>
+            <EChartView
+              headers={['Feature', 'Importance']}
+              rows={resultData.factors.map((f: any) => [f.name, String(f.importance)])}
+              chartType="bar"
+            />
+          {/if}
+          <!-- Importance: scatter from actual_vs_predicted -->
+          {#if resultData.actual_vs_predicted?.length}
+            <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin: 20px 0 12px; color: var(--color-on-surface-dim);">ACTUAL vs PREDICTED</div>
+            <EChartView
+              headers={['Actual', 'Predicted']}
+              rows={resultData.actual_vs_predicted.map((p: any) => [String(p.actual), String(p.predicted)])}
+              chartType="scatter"
+            />
+          {/if}
+
+        {:else if latest.experiment_type === 'anomaly'}
+          <!-- Anomaly: pie from severity -->
+          {#if resultData.severity?.length}
+            <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px; color: var(--color-on-surface-dim);">SEVERITY DISTRIBUTION</div>
+            <EChartView
+              headers={['Severity', 'Count']}
+              rows={resultData.severity.map((s: any) => [s.level || s.name, String(s.count || s.value)])}
+              chartType="pie"
+            />
+          {/if}
+          <!-- Anomaly: scatter from scatter data -->
+          {#if resultData.scatter?.length}
+            <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin: 20px 0 12px; color: var(--color-on-surface-dim);">ANOMALY SCATTER</div>
+            <EChartView
+              headers={['X', 'Y']}
+              rows={resultData.scatter.map((p: any) => [String(p.x), String(p.y)])}
+              chartType="scatter"
+            />
+          {/if}
+
+        {:else if latest.experiment_type === 'forecast'}
+          <!-- Forecast: line from predictions -->
+          {#if resultData.predictions?.length}
+            <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px; color: var(--color-on-surface-dim);">FORECAST PREDICTIONS</div>
+            <EChartView
+              headers={['Period', 'Value']}
+              rows={resultData.predictions.map((p: any) => typeof p === 'string' ? [p, '0'] : [p.period || String(p.label || ''), String(p.value || p.forecast || 0)])}
+              chartType="line"
+            />
+          {/if}
+        {/if}
+      {:else}
+        <div style="text-align: center; padding: 30px; color: var(--color-on-surface-dim);">
+          <div style="font-size: 13px; font-weight: 900; text-transform: uppercase;">NO CHART DATA</div>
+          <div style="font-size: 11px; margin-top: 6px;">Run an experiment to generate chart visualizations</div>
+        </div>
       {/if}
     {/if}
   </div>
