@@ -33,7 +33,7 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Smart Suggestions** -- LLM-generated business questions replace raw table names in chat suggestions
 - **Dashboard Generator** -- D button in chat creates executive dashboards from conversation with metrics, charts, tables, and insights
 - **Role-Based Permissions** -- viewer (chat only), editor (upload + train), admin (all) with granular access control
-- **Command Center** -- 8-tab super admin panel: Users, Projects, Logs, Schemas, Chat Logs, Health, Stats, Integrations
+- **Command Center** -- 9-tab super admin panel: Users, Projects, Logs, Schemas, Chat Logs, Health, Stats, Integrations, Architecture (interactive flow diagram with live metrics)
 - **Per-Table Training Progress** -- shows which table is being trained (Table 2/7: name · step)
 - **SSE Streaming Upload** -- document uploads stream real-time progress via Server-Sent Events with live agent cards
 - **Unified ALL_FILES Table** -- DATASETS tab shows documents + data tables in one table (FILE, TYPE, SIZE, CONTENT, STATUS)
@@ -88,6 +88,15 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Data Scientist Routing** -- Leader instructions with explicit ML keyword list for reliable routing. Analyst warned it has NO ML tools
 - **ML/LLM Badges** -- Green "ML" badge for real models, purple "LLM" badge for LLM fallback. All 6 ML tool cards visible in UI
 - **Flat Chart Caption** -- generateChartCaption() returns "Flat at X across all N periods" when values are identical
+- **Architecture Page** -- Command Center → ARCHITECTURE tab with interactive ECharts flow diagram (35 nodes, 30+ edges, 8 color-coded categories). Live DB metrics, hover tooltips, drag/zoom. Detailed cards for ML tools, knowledge layers, AI models, security, infrastructure. Backend: `GET /api/architecture`
+- **Data Scientist Context** -- `build_data_scientist_instructions()` injects table shapes, past ML experiments, active models into Data Scientist prompt. No cold starts
+- **Analyst Context Budget** -- MAX_TOTAL_CHARS increased 30K→50K (~16K tokens). Self-learning context 12K→20K. Weighted truncation prioritizes instructions > semantic model > learnings > examples
+- **ML Keyword Rejection** -- Analyst stops immediately for ML keywords (predict, forecast, anomaly, etc.) and returns "route to Data Scientist" instead of wasting SQL retries
+- **Multi-Agent Questions** -- Leader calls BOTH Analyst + Researcher when question references data AND documents, then synthesizes results
+- **Data Scientist Fallback Chain** -- when ML tool fails, explains WHY in business language and suggests Analyst SQL alternative
+- **Leader Stuck-Agent Detection** -- auto-escalates: "zero rows" → Engineer introspect_schema, "ML question" from Analyst → re-route to Data Scientist, same error 2x → try different agent
+- **Discover Tables Tool** -- introspect_schema renamed to discover_tables for Data Scientist. Instructions say "call FIRST before choosing ML tool"
+- **Cluster Calinski-Harabasz** -- cluster tool reports Calinski-Harabasz score alongside Silhouette for better cluster quality evaluation
 
 ## Fresh Install
 
@@ -255,11 +264,13 @@ Each project gets an isolated PostgreSQL schema (`proj_{slug}`), its own PgVecto
 
 All DB connections route through PgBouncer. App engines use NullPool (PgBouncer owns pooling). Schema isolation via `SET LOCAL search_path` in SQLAlchemy `begin` events (PgBouncer transaction-safe).
 
-**Agent Team:** Leader (persona + routing + result review) dispatches to:
-- **Analyst** — SQL queries on data tables, 11 analysis types (each connected to real tools), 31 tools, Prophet forecasting, auto-visualization, context loader
-- **Data Scientist** — 6 ML tools: predict (auto-falls back to LLM), feature_importance, detect_anomalies_ml, classify, cluster, decompose. GridSearchCV tuning, shared preprocessing, SHAP explanations
+**Agent Team:** Leader (persona + routing + result review + stuck-agent detection) dispatches to:
+- **Analyst** — SQL queries on data tables, 11 analysis types (each connected to real tools), 31 tools, Prophet forecasting, auto-visualization, context loader. 50K char context budget. ML keyword rejection (routes to Data Scientist)
+- **Data Scientist** — 6 ML tools: predict (auto-falls back to LLM), feature_importance, detect_anomalies_ml, classify, cluster, decompose. GridSearchCV tuning, shared preprocessing, SHAP explanations. Project-aware instructions (table shapes, past experiments, active models). Fallback chain explains failures in business language
 - **Engineer** — Create views, dashboards
 - **Researcher** — Document RAG — answers from uploaded PPTX/PDF/DOCX (text + tables + image descriptions via vision)
+
+**Leader Intelligence:** Stuck-agent detection auto-escalates "zero rows" → Engineer, "ML question" from Analyst → Data Scientist, same error 2x → different agent. Multi-agent questions (data AND documents) → calls both Analyst + Researcher and synthesizes.
 
 **Permissions:** viewer (chat only) → editor (upload + train) → admin (settings + share + delete) → owner (full)
 

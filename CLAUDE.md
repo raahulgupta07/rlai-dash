@@ -54,7 +54,7 @@ app/
 dash/
 ├── team.py               # Team factory (with persona injection)
 ├── settings.py            # Shared config + training_llm_call + training_vision_call
-├── instructions.py        # Dynamic instructions (persona + rules + training + self-learning + self-correction + source attribution + clarifying questions)
+├── instructions.py        # Dynamic instructions (persona + rules + training + self-learning + self-correction + source attribution + clarifying questions + build_data_scientist_instructions)
 ├── paths.py               # Path constants
 ├── agents/
 │   ├── analyst.py         # Analyst (read-only SQL, reasoning, self-correction loop)
@@ -123,9 +123,12 @@ frontend/src/routes/
 
 ## Agent System
 
-**30 Agents Total:** 4 core (Leader, Analyst, Engineer, Researcher) + 1 data scientist (Data Scientist — ML experiments with 6 tools) + 10 specialist (Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor) + 7 background (Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector) + 1 visualizer + 1 router (Router Agent — smart project routing with Brain lookup)
-**Team:** Leader → Analyst (SQL + forecasting, 31 tools) + Engineer (views + dashboards) + Researcher (document RAG)
+**30 Agents Total:** 4 core (Leader, Analyst, Engineer, Researcher) + 1 data scientist (Data Scientist — ML experiments with 6 tools, project-aware instructions with table shapes/past experiments/active models) + 10 specialist (Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor) + 7 background (Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector) + 1 visualizer + 1 router (Router Agent — smart project routing with Brain lookup)
+**Team:** Leader → Analyst (SQL + forecasting, 31 tools, 50K char context budget) + Engineer (views + dashboards) + Researcher (document RAG) + Data Scientist (6 ML tools, project-aware context)
 **Modes:** FAST (direct SQL) / DEEP (think + analyze, auto-selected based on query complexity)
+**Leader Stuck-Agent Detection:** auto-escalates "zero rows" → Engineer introspect_schema, "ML question" from Analyst → re-route to Data Scientist, same error 2x → try different agent
+**ML Keyword Rejection:** Analyst STOPS immediately for ML keywords and returns "route to Data Scientist" instead of wasting SQL retries
+**Multi-Agent Questions:** Leader calls BOTH Analyst + Researcher when question references data AND documents, then synthesizes
 
 **Self-Correction Loop (Analyst):**
 ```
@@ -358,7 +361,7 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 67. **Dashboard Save/Discard** — Generated dashboards show PREVIEW badge with SAVE (green) + DISCARD (red) buttons. No auto-save. Closing panel without saving auto-discards.
 
-68. **Command Center 8 Tabs** — USERS (inline expand with deep insights), PROJECTS (all projects with brain health), LOGS (audit trail with filters), SCHEMAS (PostgreSQL schemas with table drill-down), CHAT LOGS (all sessions with filters), HEALTH (system status), STATS (platform metrics), INTEGRATIONS (connector admin config). All data loads on tab switch.
+68. **Command Center 9 Tabs** — USERS (inline expand with deep insights), PROJECTS (all projects with brain health), LOGS (audit trail with filters), SCHEMAS (PostgreSQL schemas with table drill-down), CHAT LOGS (all sessions with filters), HEALTH (system status), STATS (platform metrics), INTEGRATIONS (connector admin config), ARCHITECTURE (interactive ECharts flow diagram with 35 nodes, live DB metrics). All data loads on tab switch.
 
 69. **Project Delete Cleanup** — Deleting a project now removes `knowledge/{slug}/` directory on disk via `shutil.rmtree`. Previously only cleaned DB.
 
@@ -555,6 +558,36 @@ All steps tracked in dash_training_runs for UI progress bar.
 165. **Flat Chart Caption** — `generateChartCaption()` returns "Flat at X across all N periods" when all values are identical instead of useless highest/lowest text.
 
 166. **ML Worker Infrastructure Hardening** — compose.yaml ML worker port fix + pgbouncer dependency. ml_worker/main.py row limit + job timeout + SIGALRM signal handling.
+
+167. **Architecture Page** — Command Center → ARCHITECTURE tab. Interactive ECharts flow diagram (35 nodes, 30+ edges, 8 color-coded categories). Nodes: User→Caddy→FastAPI→PgBouncer→PostgreSQL, Router→Leader→4 agents, 13 Knowledge layers, 6 ML tools, 11 Background agents, Self-Learning loop, Upload/Training/Connectors/Export. Hover tooltips show live data from DB (counts, model names from env). Drag to pan, scroll to zoom. Below diagram: detailed cards for ML tools, knowledge layers, AI models, security (5 categories), self-learning, infrastructure, live metrics (10 counters from DB). Backend: `GET /api/architecture` returns models from env vars + counts from DB.
+
+168. **ML Preprocessing Pipeline** — Shared `_preprocess_df()` helper in ml_models.py. SimpleImputer (median for numeric, mode for categorical) replaces dropna() — keeps more data rows. Auto-extracts temporal features (_month, _quarter, _dayofweek, _is_weekend) from date columns. Label encoding for categoricals (< 50 unique). Used by feature_importance, classify, cluster tools.
+
+169. **GridSearchCV Hyperparameter Tuning** — feature_importance and classify tools now auto-tune via GridSearchCV (18 param combos: n_estimators × max_depth × learning_rate). Best params saved to experiment accuracy dict.
+
+170. **Better ML Eval Metrics** — classify: F1, Precision, Recall, Confusion Matrix, CV F1 (weighted). feature_importance: RMSE, MAE alongside R². Cluster: Calinski-Harabasz score alongside Silhouette.
+
+171. **Historical Data in Forecast** — predict tool returns last 12 periods of historical data alongside future predictions. LLM prompt asks for historical_summary.
+
+172. **LLM Prediction Model Upgrade** — llm_predict now uses GPT-5.4-mini (DEEP_MODEL) with "high" thinking via new "ml_prediction" task config. Was using Flash Lite (weakest model).
+
+173. **Merged predict + llm_predict** — Single `predict` tool auto-falls back to LLM internally. 6 ML tools now (was 7). Agent can't call both separately. Auto-detects table/date/value columns if not provided.
+
+174. **ML/LLM Badges** — Green "ML" badge for real ML models, purple "LLM" badge for LLM fallback. All 6 tools show cards (was 4): predict, feature_importance, detect_anomalies_ml, classify, cluster, decompose.
+
+175. **Data Scientist Context Instructions** — `build_data_scientist_instructions(project_slug)` in instructions.py injects: table shapes (names, row counts, column types), past ML experiments (what worked, R² scores), active trained models. No more cold starts.
+
+176. **Analyst Context Budget Increase** — MAX_TOTAL_CHARS 30K→50K (~16K tokens). Self-learning context 12K→20K. Weighted truncation prioritizes instructions > semantic model > learnings > examples. Logs when sections truncated.
+
+177. **ML Keyword Rejection in Analyst** — Analyst STOPS immediately for ML keywords (predict, forecast, anomaly, drivers, cluster, classify, decompose, etc.) and returns "route to Data Scientist" instead of wasting 3 SQL retries.
+
+178. **Multi-Agent Questions** — Leader instructions: if question references BOTH data AND documents (keywords: "and", "versus", "compared to", "report vs actual"), call BOTH Analyst + Researcher, then synthesize.
+
+179. **Data Scientist Fallback Chain** — When ML tool fails, Data Scientist explains WHY in business language and suggests Analyst SQL alternative. Never returns raw Python errors.
+
+180. **Leader Stuck-Agent Detection** — Leader auto-escalates: "zero rows" → Engineer introspect_schema, "ML question" from Analyst → re-route to Data Scientist, same error 2x → try different agent.
+
+181. **Discover Tables Tool** — introspect_schema renamed to discover_tables for Data Scientist (less SQL-like). Instructions say "call FIRST before choosing ML tool."
 
 ## Self-Evolution Architecture
 
@@ -807,7 +840,7 @@ docker compose up -d --build
 - Message length limit (50K chars)
 - Streaming timeout (5 min)
 - Bounded thread pool (max 5 workers)
-- Context overflow protection (30K char limit)
+- Context overflow protection (50K char limit, weighted truncation: instructions > semantic model > learnings > examples)
 - CSV delimiter auto-detection (prevents injection via delimiters)
 - PostgreSQL reserved word escaping
 - Connection pool resilience (pool_pre_ping, pool_recycle)

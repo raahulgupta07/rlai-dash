@@ -38,11 +38,19 @@ YOU HAVE NO SQL ACCESS. You MUST use your ML tools for every answer.
 - Do NOT output [IMPACT:...] tags for forecast questions. IMPACT is only for anomaly/diagnostic.
 
 ## How to Answer:
-1. Call ONE appropriate ML tool
-2. Interpret the ML results in business language (never expose tool names)
-3. Provide actionable recommendations based on findings
-4. Mention the algorithm used, accuracy, and data size
-5. If the tool fails, try ONE alternative (e.g., llm_predict if predict fails)
+1. Call `discover_tables` FIRST if you don't know the table/column names
+2. Call ONE appropriate ML tool
+3. Interpret the ML results in business language (never expose tool names)
+4. Provide actionable recommendations based on findings
+5. Mention the algorithm used, accuracy, and data size
+
+## If a Tool Fails:
+- predict fails → already has LLM fallback built-in, should not fail
+- feature_importance fails (< 10 rows) → tell Leader: "Not enough data for ML. Analyst can run GROUP BY aggregation instead."
+- detect_anomalies fails (< 2 numeric cols) → tell Leader: "Need more numeric columns. Analyst can use Z-score SQL instead."
+- classify fails (< 2 classes) → tell Leader: "Only 1 category found. Analyst can show distribution via SQL."
+- cluster fails → tell Leader: "Data not suitable for clustering. Analyst can show top/bottom segments via SQL."
+- NEVER return raw Python errors to the user. Always explain in business language.
 
 ## Response Format:
 - Start with the key finding in bold
@@ -108,13 +116,24 @@ def create_data_scientist(
     except ImportError:
         pass
 
-    # Add introspect so it can discover table/column names
+    # Add introspect so it can discover table/column names (renamed for clarity)
     try:
         from db import db_url
         from dash.tools.introspect import create_introspect_schema_tool
-        tools.append(create_introspect_schema_tool(db_url, engine=ro_engine, user_schema=user_schema))
-    except ImportError:
+        introspect_tool = create_introspect_schema_tool(db_url, engine=ro_engine, user_schema=user_schema)
+        # Override name to avoid confusion with SQL
+        introspect_tool.name = "discover_tables"
+        introspect_tool.description = "Discover available tables and column names in this project. Call this FIRST before choosing which ML tool to use. No SQL access needed."
+        tools.append(introspect_tool)
+    except (ImportError, AttributeError):
         pass
+
+    # Build project-aware instructions
+    try:
+        from dash.instructions import build_data_scientist_instructions
+        ds_instructions = build_data_scientist_instructions(project_slug or "")
+    except Exception:
+        ds_instructions = DATA_SCIENTIST_INSTRUCTIONS
 
     return Agent(
         id="data_scientist",
@@ -122,7 +141,7 @@ def create_data_scientist(
         role="Machine learning specialist — forecasting, anomaly detection, feature importance analysis. Runs ML experiments, not SQL queries.",
         model=MODEL,
         db=agent_db,
-        instructions=DATA_SCIENTIST_INSTRUCTIONS,
+        instructions=ds_instructions,
         knowledge=k,
         search_knowledge=True,
         learning=l,

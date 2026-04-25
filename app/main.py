@@ -1277,6 +1277,125 @@ def health_check():
         return JSONResponse({"status": "unhealthy", "db": str(e)}, status_code=503)
 
 
+@app.get("/api/architecture")
+def get_architecture():
+    """Return full system architecture info: models from env, counts from DB."""
+    from os import getenv
+
+    # AI Models from environment
+    models = {
+        "chat":      getenv("CHAT_MODEL", "google/gemini-3-flash-preview"),
+        "deep":      getenv("DEEP_MODEL", "openai/gpt-5.4-mini"),
+        "lite":      getenv("LITE_MODEL", "google/gemini-3.1-flash-lite-preview"),
+        "embedding": getenv("EMBEDDING_MODEL", "google/gemini-embedding-2-preview"),
+        "provider":  "OpenRouter",
+    }
+
+    # Live metrics from DB
+    metrics = {}
+    try:
+        with _shared_engine.connect() as conn:
+            metrics["projects"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_projects")).scalar() or 0
+            metrics["users"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_users")).scalar() or 0
+            metrics["chats"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_chat_sessions")).scalar() or 0
+            try:
+                metrics["ml_models"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_ml_models WHERE status='active'")).scalar() or 0
+            except Exception:
+                metrics["ml_models"] = 0
+            try:
+                metrics["experiments"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_ml_experiments")).scalar() or 0
+            except Exception:
+                metrics["experiments"] = 0
+            try:
+                metrics["brain_entries"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_company_brain")).scalar() or 0
+            except Exception:
+                metrics["brain_entries"] = 0
+            try:
+                metrics["memories"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_memories")).scalar() or 0
+            except Exception:
+                metrics["memories"] = 0
+            try:
+                metrics["feedback"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_feedback")).scalar() or 0
+            except Exception:
+                metrics["feedback"] = 0
+            try:
+                metrics["kg_triples"] = conn.execute(sa_text("SELECT COUNT(*) FROM public.dash_knowledge_triples")).scalar() or 0
+            except Exception:
+                metrics["kg_triples"] = 0
+            try:
+                metrics["quality_avg"] = round(float(conn.execute(sa_text("SELECT AVG(score) FROM public.dash_quality_scores")).scalar() or 0), 1)
+            except Exception:
+                metrics["quality_avg"] = 0
+    except Exception:
+        pass
+
+    # Infrastructure
+    infra = {
+        "containers": ["dash-api (8GB)", "dash-db (4GB)", "dash-pgbouncer (512MB)", "dash-ml (1GB)", "dash-caddy (512MB)"],
+        "db": "PostgreSQL 18 + pgvector",
+        "pooler": "PgBouncer (transaction mode, NullPool)",
+        "proxy": "Caddy (auto-SSL/TLS)",
+        "workers": int(getenv("WORKERS", "8")),
+        "rate_limit": getenv("RATE_LIMIT", "500/minute"),
+    }
+
+    # Security
+    security = {
+        "network": ["Auto-SSL/TLS", "HSTS", "X-Frame-Options", "XSS protection", "Rate limit: " + infra["rate_limit"], "Body max: 250MB", "Timeout: 300s"],
+        "auth": ["SCRAM-SHA-256", "Token-based + TTL", "Role-based ACL (viewer/editor/admin)", "Keycloak SSO optional"],
+        "database": ["Schema isolation per project", "Read-only Analyst", "Parameterized SQL", "Statement timeout: 120s", "Idle timeout: 60s"],
+        "application": ["LLM SQL sandbox (block DROP/ALTER)", "Batch predict cap: 10K rows", "ML worker timeout: 5 min", "ML worker row limit: 100K", "Engine disposal (no leaks)", "Prompt injection sanitization", "Atomic JSON writes", "50K char message limit"],
+        "monitoring": ["/health + ML retrain status", "Audit log", "Brain access log", "Training run tracking", "Quality scoring (1-5)"],
+    }
+
+    # Agents
+    agents = {
+        "total": 30,
+        "chat_team": ["Leader (coordinator)", "Analyst (31 tools, SQL)", "Engineer (views, dashboards)", "Researcher (document RAG)", "Data Scientist (6 ML tools)"],
+        "specialists": ["Comparator", "Diagnostician", "Narrator", "Validator", "Planner", "Trend", "Pareto", "Anomaly", "Benchmark", "Prescriptor"],
+        "background": ["Judge", "Rule Suggester", "Proactive Insights", "Query Plan Extractor", "Meta Learner", "Auto Evolver", "KG Extractor", "Auto-Memory", "User Prefs", "Episodic Memory", "Follow-ups"],
+        "upload": ["Conductor", "Parser", "Scanner", "Vision", "Inspector"],
+    }
+
+    # ML
+    ml = {
+        "tools": [
+            {"name": "predict", "algorithm": "AutoARIMA → LLM fallback", "type": "Pre-trained / LLM", "cost": "$0 / $0.02"},
+            {"name": "feature_importance", "algorithm": "LightGBM + GridSearchCV + SHAP", "type": "On-demand", "cost": "$0"},
+            {"name": "detect_anomalies_ml", "algorithm": "IsolationForest", "type": "Pre-trained", "cost": "$0"},
+            {"name": "classify", "algorithm": "GradientBoosting + GridSearchCV", "type": "On-demand", "cost": "$0"},
+            {"name": "cluster", "algorithm": "K-Means (auto-K)", "type": "On-demand", "cost": "$0"},
+            {"name": "decompose", "algorithm": "Seasonal Decompose", "type": "On-demand", "cost": "$0"},
+        ],
+        "preprocessing": ["SimpleImputer (median/mode)", "Temporal features (month, quarter, day, weekend)", "Label encoding (< 50 categories)"],
+        "evaluation": ["R², RMSE, MAE", "F1, Precision, Recall, Confusion Matrix", "Silhouette, Calinski-Harabasz", "MAPE on holdout", "Cross-validation (2-5 fold)"],
+        "worker": {"row_limit": 100000, "timeout_sec": 300, "retrain_interval": "24h"},
+    }
+
+    # Knowledge
+    knowledge = {
+        "layers": 13,
+        "search": "Unified: PgVector + Brain + KG + Facts → Cohere reranking",
+        "embedding_cascade": ["Gemini Embed 2", "OpenAI large", "OpenAI small", "Cohere v4"],
+        "rerank_cascade": ["Cohere rerank-4-pro", "rerank-4-fast", "rerank-v3.5", "keyword fallback"],
+    }
+
+    # Data pipeline
+    pipeline = {
+        "formats": 18,
+        "format_list": ["CSV", "Excel", "JSON", "SQL", "PPTX", "DOCX", "PDF", "MD", "TXT", "JPG", "PNG", "TIFF", "BMP", "GIF", "WEBP", "PY", "XLS"],
+        "training_steps": 14,
+        "connectors": ["SharePoint", "Google Drive", "PostgreSQL", "MySQL", "Microsoft Fabric"],
+        "export": ["PPTX (8 themes)", "Excel (4 sheets)", "PDF", "Dashboards"],
+    }
+
+    return {
+        "models": models, "metrics": metrics, "infra": infra, "security": security,
+        "agents": agents, "ml": ml, "knowledge": knowledge, "pipeline": pipeline,
+        "ml_retrain": {"alive": _ml_retrain_alive, "last_run": _ml_retrain_last_run, "last_error": _ml_retrain_last_error},
+    }
+
+
 @app.post("/knowledge/reload")
 def reload_knowledge() -> dict[str, str]:
     """Reload knowledge files into the vector database."""

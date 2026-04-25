@@ -37,6 +37,7 @@ The Analyst has NO ML tools. If you send ML questions to Analyst, it will loop f
 - If the project has uploaded documents (PPTX/PDF/DOCX) → route to **Researcher** for document questions
 - If the project has data tables (CSV/Excel) → route to **Analyst** for SQL queries
 - If both exist → route to **Researcher** for "what does the report say?" and **Analyst** for "show me the numbers"
+- **MULTI-AGENT:** If question references BOTH data AND documents (keywords: "and", "versus", "compared to", "report says", "document vs actual", "validate against") → call BOTH Analyst + Researcher, then synthesize their answers into one response
 - **Default to Researcher** if no data tables exist
 
 ## Two Schemas
@@ -61,7 +62,11 @@ The Analyst reads from both schemas. The Engineer writes only to `dash`.
 4. **Synthesize.** Rewrite specialist output into a clean, insightful response.
    - Don't just echo numbers. Add context, comparisons, and implications.
    - "Starter: 12% churn" → "Starter has 12% monthly churn, 3x higher than Enterprise. Usage drops 60% in the week before cancellation."
-5. **Self-correction loop.** The Analyst is trained to self-correct. If it returns zero rows, errors, or suspicious results, it will automatically investigate and retry up to 3 times. Let it work through the problem. Only intervene if it explicitly says it's stuck. If it fails after retries, delegate to Engineer to introspect the schema and report back.
+5. **Self-correction loop.** The Analyst self-corrects up to 3 times. Let it work. But if it returns:
+   - "zero rows" or "no data found" → ask **Engineer** to run `introspect_schema` to verify table/column names exist, then retry Analyst with corrected names
+   - "machine learning question" → immediately re-route to **Data Scientist** (do NOT retry Analyst)
+   - Same error twice → try a **different agent** (e.g., Researcher for context, or Data Scientist for ML approach)
+   - "Not enough data" from Data Scientist → ask **Analyst** for SQL approximation instead
 6. **Review intermediate results.** When the Analyst returns data, sanity-check it before presenting. If something looks off (e.g., revenue is $0, count is impossibly low), send it back with specific feedback: "That revenue number seems wrong, can you verify the join?"
 7. Use your members like you would a team of people. You are the leader, they are the specialists. You need more context, ask them for help.
 
@@ -168,9 +173,7 @@ If no tables exist, answer from documents and memories only.
 1. **CHECK your context FIRST** — look at the UPLOADED DOCUMENTS, AGENT MEMORIES, and TRAINING EXAMPLES sections below. The answer is likely already there.
 2. **ALWAYS call `search_all`** BEFORE writing SQL — this searches documents, brain (glossary, formulas, thresholds, aliases), knowledge graph, and grounded facts. It tells you: what targets/benchmarks to compare against, what aliases/abbreviations mean, what formulas to use, and relationships between entities. Results are ranked by relevance. Skip ONLY for simple "show me the table" queries.
 3. **If data tables exist** → Write SQL using context from search_all. LIMIT 50 by default, no SELECT *, ORDER BY for rankings.
-4. **For predictions/forecasts** → Delegate to Data Scientist agent. Keywords: predict, forecast, future, next month/quarter, estimate, project.
-5. **For "what drives X"** → Delegate to Data Scientist agent. Keywords: what drives, why, factors, causes, impact, key drivers.
-6. **For anomaly/outlier detection** → Delegate to Data Scientist agent. Keywords: anomaly, outlier, unusual, strange, abnormal, spike, drop.
+4. **STOP for ML questions** → If the question contains: predict, forecast, future, next month/quarter, what drives, factors, causes, anomaly, outlier, unusual, classify, cluster, segment, decompose, seasonality, trend analysis, machine learning — then STOP IMMEDIATELY. Do NOT write SQL. Return ONLY this: "This is a machine learning question that requires the Data Scientist agent. I cannot answer this with SQL." The Leader will re-route to Data Scientist.
 7. **If NO data tables exist** → Answer from context + knowledge search. You have enough information.
 8. **Execute** via SQLTools (only if tables exist).
 9. **On error** → use `introspect_schema` to inspect the actual schema → fix → `save_learning`.
@@ -598,6 +601,77 @@ def build_leader_instructions(user_id: str | None = None, project_slug: str | No
     return _schema_replace(instructions, user_id)
 
 
+def build_data_scientist_instructions(project_slug: str) -> str:
+    """Build project-aware instructions for Data Scientist with table shapes, past experiments, proven models."""
+    from dash.agents.data_scientist import DATA_SCIENTIST_INSTRUCTIONS
+    parts = [DATA_SCIENTIST_INSTRUCTIONS]
+
+    if not project_slug:
+        return DATA_SCIENTIST_INSTRUCTIONS
+
+    # 1. Table shapes: names, row counts, numeric columns
+    try:
+        import re
+        from sqlalchemy import inspect as sa_inspect, text as sa_text
+        from db import get_sql_engine
+        eng = get_sql_engine()
+        schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+        insp = sa_inspect(eng)
+        tables = insp.get_table_names(schema=schema)
+        if tables:
+            lines = ["\n## PROJECT DATA OVERVIEW"]
+            for t in tables[:8]:
+                try:
+                    cols = insp.get_columns(t, schema=schema)
+                    with eng.connect() as conn:
+                        rc = conn.execute(sa_text(f'SELECT COUNT(*) FROM "{schema}"."{t}"')).scalar() or 0
+                    num_cols = [c['name'] for c in cols if str(c.get('type','')).startswith(('INTEGER','FLOAT','NUMERIC','DOUBLE','REAL','BIGINT','SMALLINT'))]
+                    date_cols = [c['name'] for c in cols if str(c.get('type','')).startswith(('TIMESTAMP','DATE'))]
+                    lines.append(f"- **{t}**: {rc} rows, numeric=[{', '.join(num_cols[:5])}], dates=[{', '.join(date_cols)}]")
+                except Exception:
+                    lines.append(f"- **{t}**")
+            parts.append("\n".join(lines))
+    except Exception:
+        pass
+
+    # 2. Past ML experiments: what worked, accuracy
+    try:
+        from sqlalchemy import text as sa_text
+        from db import get_sql_engine
+        eng = get_sql_engine()
+        with eng.connect() as conn:
+            rows = conn.execute(sa_text(
+                "SELECT experiment_type, model_name, algorithm, accuracy FROM public.dash_ml_experiments "
+                "WHERE project_slug = :s ORDER BY created_at DESC LIMIT 5"
+            ), {"s": project_slug}).fetchall()
+        if rows:
+            lines = ["\n## PAST ML EXPERIMENTS (use these to pick the right approach)"]
+            for r in rows:
+                acc = r[3] if isinstance(r[3], dict) else {}
+                acc_str = ", ".join(f"{k}={v}" for k, v in acc.items() if v and k != 'preprocessing') if acc else "?"
+                lines.append(f"- {r[0]}: {r[2]} on {r[1]} ({acc_str})")
+            parts.append("\n".join(lines))
+    except Exception:
+        pass
+
+    # 3. Active trained models
+    try:
+        with eng.connect() as conn:
+            models = conn.execute(sa_text(
+                "SELECT name, model_type, algorithm, row_count FROM public.dash_ml_models "
+                "WHERE project_slug = :s AND status = 'active' ORDER BY created_at DESC LIMIT 5"
+            ), {"s": project_slug}).fetchall()
+        if models:
+            lines = ["\n## TRAINED MODELS AVAILABLE (predict/anomaly use these instantly)"]
+            for m in models:
+                lines.append(f"- {m[0]}: {m[1]} ({m[2]}, {m[3]} rows)")
+            parts.append("\n".join(lines))
+    except Exception:
+        pass
+
+    return "\n\n".join(parts)
+
+
 def _build_persona_context(project_slug: str) -> str:
     """Load persona from persona.json and format for leader prompt."""
     import json as _json
@@ -721,10 +795,27 @@ def build_analyst_instructions(user_id: str | None = None, project_slug: str | N
 
     final_prompt = "\n\n---\n\n".join(parts)
 
-    # Total prompt budget
-    MAX_TOTAL_CHARS = 30000  # ~10K tokens
+    # Total prompt budget — weighted truncation
+    MAX_TOTAL_CHARS = 50000  # ~16K tokens (increased from 30K)
     if len(final_prompt) > MAX_TOTAL_CHARS:
-        final_prompt = final_prompt[:MAX_TOTAL_CHARS] + "\n\n[Instructions truncated]"
+        # Prioritize: instructions > semantic model > learnings > training examples
+        # Trim from the end (training examples and self-learning first)
+        truncated_sections = []
+        budget = MAX_TOTAL_CHARS
+        for i, part in enumerate(parts):
+            if budget > 0:
+                allowed = min(len(part), budget)
+                if allowed < len(part):
+                    parts[i] = part[:allowed] + "\n\n[Section truncated]"
+                    truncated_sections.append(f"part {i+1}")
+                budget -= len(part)
+            else:
+                parts[i] = ""
+                truncated_sections.append(f"part {i+1}")
+        final_prompt = "\n\n---\n\n".join(p for p in parts if p)
+        if truncated_sections:
+            import logging
+            logging.getLogger(__name__).info(f"Analyst context: {len(final_prompt)}/{MAX_TOTAL_CHARS} chars. Truncated: {', '.join(truncated_sections)}")
 
     return _schema_replace(final_prompt, user_id)
 
@@ -898,7 +989,7 @@ def _build_self_learning_context(project_slug: str, actual_user_id: int | None =
         pass
 
     # Enforce total context budget (roughly 4000 tokens ≈ 12000 chars)
-    MAX_CONTEXT_CHARS = 12000
+    MAX_CONTEXT_CHARS = 20000  # Increased from 12K to fit more learnings
     result = "\n".join(lines) if lines else ""
     if len(result) > MAX_CONTEXT_CHARS:
         result = result[:MAX_CONTEXT_CHARS] + "\n\n[Context truncated to fit token limit]"

@@ -21,6 +21,7 @@
     { id: 'health',   label: 'HEALTH' },
     { id: 'stats',    label: 'STATS' },
     { id: 'integrations', label: 'INTEGRATIONS' },
+    { id: 'architecture', label: 'ARCHITECTURE' },
   ];
 
   /* ─── USERS state ─── */
@@ -67,6 +68,233 @@
 
   /* ─── STATS state ─── */
   let stats = $state<any>(null);
+
+  /* ─── ARCHITECTURE state ─── */
+  let arch = $state<any>(null);
+  let archFlowEl: HTMLDivElement;
+  let archChart: any = null;
+
+  async function loadArchitecture() {
+    try { const r = await fetch('/api/architecture', { headers: _h() }); if (r.ok) arch = await r.json(); } catch {}
+    // Render flow chart after data loads
+    setTimeout(() => renderArchFlow(), 300);
+  }
+
+  async function renderArchFlow() {
+    if (!archFlowEl || !arch) return;
+    const echarts = await import('echarts/core');
+    const { GraphChart } = await import('echarts/charts');
+    const { TooltipComponent, TitleComponent } = await import('echarts/components');
+    const { CanvasRenderer } = await import('echarts/renderers');
+    echarts.use([GraphChart, TooltipComponent, TitleComponent, CanvasRenderer]);
+
+    if (archChart) archChart.dispose();
+    archChart = echarts.init(archFlowEl);
+
+    const cats = [
+      { name: 'Network',   itemStyle: { color: '#3b82f6' } },
+      { name: 'Agent',     itemStyle: { color: '#22c55e' } },
+      { name: 'Data',      itemStyle: { color: '#f59e0b' } },
+      { name: 'ML',        itemStyle: { color: '#a855f7' } },
+      { name: 'Knowledge', itemStyle: { color: '#06b6d4' } },
+      { name: 'Security',  itemStyle: { color: '#ef4444' } },
+      { name: 'Learning',  itemStyle: { color: '#ec4899' } },
+      { name: 'Export',    itemStyle: { color: '#84cc16' } },
+    ];
+
+    const m = arch.metrics || {};
+    const md = arch.models || {};
+    const w = arch.infra?.workers || 8;
+    const rl = arch.infra?.rate_limit || '500/min';
+
+    // Helper for tooltip
+    const tt = (title: string, lines: string[]) => `<div style="font-size:12px;font-weight:700;margin-bottom:4px;color:#0f0;">${title}</div>` + lines.map(l => `<div style="font-size:11px;line-height:1.5;">${l}</div>`).join('');
+
+    const nodes: any[] = [
+      // ─── NETWORK LAYER ───
+      { name: 'Users', x: 400, y: 20, symbolSize: 45, symbol: 'roundRect', category: 0,
+        tooltip: { formatter: () => tt('USERS', [`${m.users || 0} registered`, `${m.chats || 0} chat sessions`]) } },
+      { name: 'Caddy', x: 400, y: 90, symbolSize: 35, symbol: 'diamond', category: 5,
+        tooltip: { formatter: () => tt('CADDY — REVERSE PROXY', ['Auto-SSL/TLS certificates', 'HSTS, X-Frame-Options, XSS', `Rate limit: ${rl}`, 'Body max: 250MB', 'Timeout: 300s']) } },
+      { name: `FastAPI`, x: 400, y: 160, symbolSize: 50, symbol: 'roundRect', category: 0,
+        tooltip: { formatter: () => tt(`FASTAPI — ${w} WORKERS`, ['Auth middleware + token cache', 'SSE streaming + rate limiter', `Model: ${md.chat}`, 'NullPool → PgBouncer']) } },
+      { name: 'PgBouncer', x: 620, y: 110, symbolSize: 28, category: 0,
+        tooltip: { formatter: () => tt('PGBOUNCER', ['Transaction pooling mode', 'Max 200 DB connections', 'NullPool (no double-pool)', 'SCRAM-SHA-256 auth']) } },
+      { name: 'PostgreSQL', x: 770, y: 110, symbolSize: 50, symbol: 'roundRect', category: 3,
+        tooltip: { formatter: () => tt('POSTGRESQL 18 + PGVECTOR', [`${m.projects || 0} project schemas`, '35+ system tables', 'Schema isolation per project', 'Statement timeout: 120s', 'pgvector for embeddings']) } },
+
+      // ─── ROUTING ───
+      { name: 'Router', x: 230, y: 240, symbolSize: 35, symbol: 'diamond', category: 5,
+        tooltip: { formatter: () => tt('SMART ROUTER — 2 TIER', ['Tier 1: Keyword scoring (7 signals, $0, <1ms)', 'Tier 2: Router Agent + Brain ($0.001, <1.5s)', '', '"revenue by month" → Analyst', '"predict sales" → Data Scientist', '"what does report say" → Researcher']) } },
+
+      // ─── AGENT LAYER ───
+      { name: 'Leader', x: 400, y: 310, symbolSize: 45, symbol: 'roundRect', category: 1,
+        tooltip: { formatter: () => tt('LEADER AGENT', ['Coordinates team of 4 specialists', 'Synthesizes responses', 'Decomposes complex questions', `Model: ${md.chat}`]) } },
+      { name: 'Analyst', x: 180, y: 400, symbolSize: 42, symbol: 'roundRect', category: 1,
+        tooltip: { formatter: () => tt('ANALYST — 31 TOOLS', ['SQL queries (read-only)', 'Self-correction (3 retries)', 'Auto-visualize charts', 'search_all for context first', `Model: ${md.chat}`]) } },
+      { name: 'Researcher', x: 340, y: 400, symbolSize: 36, symbol: 'roundRect', category: 1,
+        tooltip: { formatter: () => tt('RESEARCHER — DOC RAG', ['PPTX/PDF/DOCX analysis', 'Multi-signal search', 'Grounded facts (LangExtract)', 'Knowledge graph context', `Model: ${md.chat}`]) } },
+      { name: 'Data Scientist', x: 510, y: 400, symbolSize: 42, symbol: 'roundRect', category: 4,
+        tooltip: { formatter: () => tt('DATA SCIENTIST — 6 ML TOOLS', ['NO SQL access (forces ML usage)', 'predict: AutoARIMA → LLM fallback', 'feature_importance: LightGBM + SHAP', 'detect_anomalies: IsolationForest', 'classify: GradientBoosting', 'cluster: K-Means / decompose', `Model: ${md.chat}`]) } },
+      { name: 'Engineer', x: 670, y: 400, symbolSize: 36, symbol: 'roundRect', category: 1,
+        tooltip: { formatter: () => tt('ENGINEER', ['Create views + dashboards', 'Schema management', 'Auto-VIEW at 3+ query uses', `Model: ${md.chat}`]) } },
+      { name: 'Specialists', x: 180, y: 490, symbolSize: 28, category: 1,
+        tooltip: { formatter: () => tt('10 SPECIALIST AGENTS', (arch.agents?.specialists || []).map((s: string) => `› ${s}`)) } },
+
+      // ─── KNOWLEDGE LAYER ───
+      { name: '13 Layers', x: 80, y: 310, symbolSize: 42, symbol: 'roundRect', category: 4,
+        tooltip: { formatter: () => tt('13 CONTEXT LAYERS', ['1. Proven query patterns', '2. Approved responses', '3. Anti-patterns', '4. Agent memories', '5. Column annotations', '6. JOIN strategies', '7. User preferences', '8. Self-correction strategies', '9. Evolved instructions', '10. DB rules', '11. Grounded facts', '12. Knowledge graph', '13. Company brain']) } },
+      { name: 'PgVector KB', x: 30, y: 400, symbolSize: 28, category: 4,
+        tooltip: { formatter: () => tt('PGVECTOR KNOWLEDGE BASE', [`Embedding: ${md.embedding}`, 'Hybrid search (semantic + keyword)', 'Contextual retrieval (-49% failures)', '1536 dimensions']) } },
+      { name: `Brain`, x: 30, y: 470, symbolSize: 28, category: 4,
+        tooltip: { formatter: () => tt(`COMPANY BRAIN — ${m.brain_entries || 0} ENTRIES`, ['Formulas, glossary, aliases', 'Patterns, org structure', '3 scopes: global/project/personal', 'Cohere reranking']) } },
+      { name: `KG`, x: 110, y: 470, symbolSize: 28, category: 4,
+        tooltip: { formatter: () => tt(`KNOWLEDGE GRAPH — ${m.kg_triples || 0} TRIPLES`, ['SPO triple extraction', 'Entity standardization (fuzzy match)', 'Cross-source inference', 'Community detection (BFS)']) } },
+      { name: 'Reranker', x: 30, y: 540, symbolSize: 22, category: 4,
+        tooltip: { formatter: () => tt('COHERE RERANKING CASCADE', (arch.knowledge?.rerank_cascade || []).map((r: string, i: number) => `${i+1}. ${r}`)) } },
+
+      // ─── ML LAYER ───
+      { name: 'ML Worker', x: 770, y: 310, symbolSize: 38, symbol: 'roundRect', category: 4,
+        tooltip: { formatter: () => tt('ML WORKER — ISOLATED CONTAINER', [`${m.ml_models || 0} active models`, '1GB RAM cap', 'Heavy jobs > 1000 rows', '5-min timeout per job', '100K row limit', 'Auto-retrain every 24h']) } },
+      { name: 'AutoARIMA', x: 560, y: 490, symbolSize: 24, category: 4,
+        tooltip: { formatter: () => tt('FORECAST', ['statsforecast/AutoARIMA', `LLM fallback: ${md.deep}`, 'Pre-trained ($0) or LLM ($0.02)', 'Includes historical data']) } },
+      { name: 'LightGBM', x: 630, y: 490, symbolSize: 24, category: 4,
+        tooltip: { formatter: () => tt('FEATURE IMPORTANCE', ['LightGBM + GridSearchCV', 'SHAP per-row explanations', 'Auto-tuned hyperparameters', 'R², RMSE, MAE, 5-fold CV']) } },
+      { name: 'IsolForest', x: 700, y: 490, symbolSize: 24, category: 4,
+        tooltip: { formatter: () => tt('ANOMALY DETECTION', ['sklearn/IsolationForest', 'Pre-trained on upload', 'Severity: high/medium/low', 'Creates SQL view for queries']) } },
+      { name: 'K-Means', x: 770, y: 490, symbolSize: 24, category: 4,
+        tooltip: { formatter: () => tt('CLUSTER + CLASSIFY + DECOMPOSE', ['K-Means (auto-K via silhouette)', 'GradientBoosting (GridSearchCV)', 'Seasonal decomposition', 'F1, Precision, Recall']) } },
+      { name: 'Preprocessing', x: 660, y: 550, symbolSize: 22, category: 4,
+        tooltip: { formatter: () => tt('ML PREPROCESSING (shared)', ['SimpleImputer (median/mode)', 'Temporal: month, quarter, weekday', 'Label encoding (< 50 categories)', 'No more dropna() data loss']) } },
+
+      // ─── BACKGROUND + LEARNING ───
+      { name: '11 Background', x: 400, y: 530, symbolSize: 35, symbol: 'roundRect', category: 6,
+        tooltip: { formatter: () => tt('11 BACKGROUND AGENTS — EVERY CHAT', ['Judge: Quality score (1-5)', 'Rule Suggester: Extract rules', 'KG Extractor: 3-10 triples', 'Auto-Memory: Save facts', 'Meta Learner: Track corrections', 'Auto Evolver: Every 20 chats', 'User Prefs + Episodic Memory', 'Proactive Insights + Follow-ups']) } },
+      { name: 'Self-Learning', x: 250, y: 590, symbolSize: 35, symbol: 'roundRect', category: 6,
+        tooltip: { formatter: () => tt('SELF-LEARNING LOOP', [`${m.memories || 0} memories`, `${m.feedback || 0} feedback entries`, `Avg quality: ${m.quality_avg || 0}★`, 'Auto-evolve every 20 chats', 'ML retrain every 24h', 'Self-correction: 3 attempts']) } },
+
+      // ─── DATA PIPELINE ───
+      { name: 'Upload', x: 770, y: 20, symbolSize: 38, symbol: 'roundRect', category: 3,
+        tooltip: { formatter: () => tt('DATA INGESTION — 18 FORMATS', ['CSV, Excel, JSON, SQL, PPTX, DOCX', 'PDF, MD, TXT, images (JPG/PNG/etc)', 'Excel: 5-layer pipeline', 'Vision OCR + contextual enrichment', 'Encoding detection (chardet)']) } },
+      { name: 'Training', x: 770, y: 210, symbolSize: 35, symbol: 'roundRect', category: 3,
+        tooltip: { formatter: () => tt('TRAINING PIPELINE — 14 STEPS', ['1. Drift check', '2. Deep analysis (Codex)', '3. Q&A generation', '4. Persona creation', '5. Workflows', '6. Relationships', '7. Knowledge index', '8. Brain fill (7 sub-steps)', '9. Domain knowledge (6 sub-steps)', '10-14. Seed, enrich, facts, KG, ML']) } },
+      { name: 'Connectors', x: 620, y: 20, symbolSize: 28, category: 3,
+        tooltip: { formatter: () => tt('DATA CONNECTORS', (arch.pipeline?.connectors || []).map((c: string) => `› ${c}`).concat(['', 'Live query on remote DBs', 'SSE streaming sync', 'Change detection'])) } },
+
+      // ─── EXPORT ───
+      { name: 'Export', x: 530, y: 590, symbolSize: 30, symbol: 'roundRect', category: 7,
+        tooltip: { formatter: () => tt('EXPORT', (arch.pipeline?.export || []).map((e: string) => `› ${e}`).concat(['', 'Conversation-to-report', '8 PPTX design themes', 'Excel: 4 sheets + charts'])) } },
+
+      // ─── OUTPUT ───
+      { name: 'SSE Stream', x: 400, y: 640, symbolSize: 32, symbol: 'roundRect', category: 0,
+        tooltip: { formatter: () => tt('SSE STREAM → BROWSER', ['ToolCallStarted → Completed', 'Content streaming (5-min timeout)', 'ML cards with badges', 'KPI cards, charts, tables', 'SOURCES tab, inline charts']) } },
+
+      // ─── AI MODELS (right side) ───
+      { name: `Chat Model`, x: 140, y: 160, symbolSize: 25, category: 0,
+        tooltip: { formatter: () => tt('CHAT MODEL', [`${md.chat}`, 'Chat agents, SQL, vision, Q&A', 'Dashboard generation']) } },
+      { name: `Deep Model`, x: 140, y: 210, symbolSize: 25, category: 6,
+        tooltip: { formatter: () => tt('DEEP MODEL', [`${md.deep}`, 'Analysis, relationships, domain', 'ML predictions, auto-evolve']) } },
+      { name: `Lite Model`, x: 140, y: 260, symbolSize: 25, category: 3,
+        tooltip: { formatter: () => tt('LITE MODEL', [`${md.lite}`, 'Scoring, routing, extraction', 'Meta-learning, mining']) } },
+    ];
+
+    const links: any[] = [
+      // Main request flow (thick, animated)
+      { source: 'Users', target: 'Caddy', lineStyle: { width: 3 } },
+      { source: 'Caddy', target: 'FastAPI', lineStyle: { width: 3 } },
+      { source: 'FastAPI', target: 'Router', lineStyle: { width: 2.5 } },
+      { source: 'Router', target: 'Leader', lineStyle: { width: 2.5 } },
+
+      // DB connections
+      { source: 'FastAPI', target: 'PgBouncer', lineStyle: { width: 2, type: 'dashed' } },
+      { source: 'PgBouncer', target: 'PostgreSQL', lineStyle: { width: 2, type: 'dashed' } },
+
+      // Agent delegation
+      { source: 'Leader', target: 'Analyst' },
+      { source: 'Leader', target: 'Researcher' },
+      { source: 'Leader', target: 'Data Scientist' },
+      { source: 'Leader', target: 'Engineer' },
+      { source: 'Analyst', target: 'Specialists', lineStyle: { type: 'dashed' } },
+
+      // Knowledge connections
+      { source: 'Analyst', target: '13 Layers', lineStyle: { color: '#06b6d4' } },
+      { source: 'Researcher', target: '13 Layers', lineStyle: { color: '#06b6d4' } },
+      { source: '13 Layers', target: 'PgVector KB', lineStyle: { color: '#06b6d4' } },
+      { source: '13 Layers', target: 'Brain', lineStyle: { color: '#06b6d4' } },
+      { source: '13 Layers', target: 'KG', lineStyle: { color: '#06b6d4' } },
+      { source: 'PgVector KB', target: 'Reranker', lineStyle: { color: '#06b6d4', type: 'dashed' } },
+      { source: 'Brain', target: 'Reranker', lineStyle: { color: '#06b6d4', type: 'dashed' } },
+
+      // ML connections
+      { source: 'Data Scientist', target: 'AutoARIMA', lineStyle: { color: '#a855f7' } },
+      { source: 'Data Scientist', target: 'LightGBM', lineStyle: { color: '#a855f7' } },
+      { source: 'Data Scientist', target: 'IsolForest', lineStyle: { color: '#a855f7' } },
+      { source: 'Data Scientist', target: 'K-Means', lineStyle: { color: '#a855f7' } },
+      { source: 'AutoARIMA', target: 'Preprocessing', lineStyle: { color: '#a855f7', type: 'dashed' } },
+      { source: 'LightGBM', target: 'Preprocessing', lineStyle: { color: '#a855f7', type: 'dashed' } },
+      { source: 'Data Scientist', target: 'ML Worker', lineStyle: { color: '#a855f7' } },
+      { source: 'ML Worker', target: 'PostgreSQL', lineStyle: { color: '#a855f7', type: 'dashed' } },
+
+      // Background + learning loop
+      { source: 'Leader', target: '11 Background', lineStyle: { color: '#ec4899' } },
+      { source: '11 Background', target: 'Self-Learning', lineStyle: { color: '#ec4899' } },
+      { source: 'Self-Learning', target: '13 Layers', lineStyle: { color: '#ec4899', type: 'dashed' } },
+
+      // Data pipeline
+      { source: 'Connectors', target: 'Upload', lineStyle: { color: '#f59e0b' } },
+      { source: 'Upload', target: 'FastAPI', lineStyle: { color: '#f59e0b' } },
+      { source: 'Upload', target: 'Training', lineStyle: { color: '#f59e0b' } },
+      { source: 'Training', target: 'PostgreSQL', lineStyle: { color: '#f59e0b', type: 'dashed' } },
+
+      // Export + output
+      { source: 'Engineer', target: 'Export', lineStyle: { color: '#84cc16' } },
+      { source: 'Leader', target: 'SSE Stream', lineStyle: { width: 2.5 } },
+      { source: 'SSE Stream', target: 'Users', lineStyle: { width: 2.5, type: 'dashed' } },
+
+      // Model connections
+      { source: 'Chat Model', target: 'FastAPI', lineStyle: { type: 'dotted', color: '#666' } },
+      { source: 'Deep Model', target: 'FastAPI', lineStyle: { type: 'dotted', color: '#666' } },
+      { source: 'Lite Model', target: 'FastAPI', lineStyle: { type: 'dotted', color: '#666' } },
+    ];
+
+    archChart.setOption({
+      backgroundColor: 'transparent',
+      tooltip: { trigger: 'item', backgroundColor: '#0a0a0a', borderColor: '#333', borderWidth: 1, padding: 12,
+        textStyle: { color: '#ddd', fontSize: 11, fontFamily: 'var(--font-family-display)' },
+        extraCssText: 'max-width: 320px; white-space: normal;' },
+      legend: { data: cats.map(c => c.name), bottom: 4, textStyle: { color: '#888', fontSize: 9, fontFamily: 'var(--font-family-display)' }, itemWidth: 10, itemHeight: 10, itemGap: 14 },
+      animationDuration: 1500,
+      animationEasingUpdate: 'quinticInOut',
+      series: [{
+        type: 'graph',
+        layout: 'none',
+        roam: true,
+        zoom: 1.05,
+        scaleLimit: { min: 0.5, max: 3 },
+        categories: cats,
+        nodes: nodes.map(n => ({
+          ...n,
+          label: { show: true, fontSize: 9, color: '#ddd', fontWeight: 'bold',
+            fontFamily: 'var(--font-family-display)',
+            formatter: (p: any) => p.name, position: 'inside', lineHeight: 12 },
+          itemStyle: { borderWidth: 2, borderColor: '#222', shadowBlur: 8, shadowColor: 'rgba(0,0,0,0.5)' },
+        })),
+        links: links.map(l => ({
+          ...l,
+          lineStyle: { color: l.lineStyle?.color || '#444', width: l.lineStyle?.width || 1.5, curveness: 0.15, type: l.lineStyle?.type || 'solid', opacity: 0.7 },
+          symbol: ['none', 'arrow'], symbolSize: [0, 8],
+        })),
+        emphasis: {
+          focus: 'adjacency',
+          lineStyle: { width: 4, opacity: 1 },
+          itemStyle: { borderWidth: 3, borderColor: '#fff', shadowBlur: 15, shadowColor: 'rgba(255,255,255,0.3)' },
+          label: { fontSize: 11 },
+        },
+      }],
+    });
+
+    window.addEventListener('resize', () => archChart?.resize());
+  }
 
   /* ─── INTEGRATIONS state ─── */
   let spAdminConfig = $state<any>({});
@@ -152,6 +380,7 @@
       if (id === 'health')   await loadHealth();
       if (id === 'stats')    await loadStats();
       if (id === 'integrations') await loadIntegrations();
+      if (id === 'architecture') await loadArchitecture();
     } catch {}
     loading = false;
   }
@@ -1259,6 +1488,220 @@
       </div>
     </div>
   </div>
+
+{:else if activeTab === 'architecture'}
+  <div class="cli-terminal" style="margin-bottom: 16px; padding: 8px 14px;">
+    <div class="cli-line">
+      <span class="cli-prompt">$</span>
+      <span class="cli-command">dash system --architecture</span>
+      <span style="margin-left: auto; font-size: 11px; opacity: 0.6;">full system blueprint</span>
+    </div>
+  </div>
+
+  {#if arch}
+  <!-- INTERACTIVE FLOW DIAGRAM -->
+  <div class="ink-border" style="padding: 0; background: #0a0a0a; margin-bottom: 16px; position: relative;">
+    <div style="padding: 6px 12px; background: var(--color-on-surface); color: var(--color-surface); font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em;">
+      SYSTEM FLOW — drag to pan, scroll to zoom, hover for details
+    </div>
+    <div bind:this={archFlowEl} style="width: 100%; height: 500px;"></div>
+  </div>
+
+  <!-- SYSTEM OVERVIEW -->
+  <div class="ink-border" style="padding: 16px; background: #111; color: #0f0; font-family: var(--font-family-display); font-size: 11px; margin-bottom: 16px; line-height: 1.8; white-space: pre;">
+<span style="color: #fbbf24; font-weight: 900;">DASH — SELF-LEARNING DATA NOTEBOOK</span>
+<span style="float: right; color: #00fc40;">LIVE ● UPTIME: {arch.ml_retrain?.last_run ? 'Active' : 'Starting'}</span>
+
+Multi-tenant │ {arch.agents?.total} Agents │ {arch.ml?.tools?.length} ML Models │ {arch.knowledge?.layers} Context Layers
+
+<span style="color: #888;">┌─── NETWORK LAYER ───────────────────────────────────────────────────┐</span>
+<span style="color: #888;">│</span> User → <span style="color: #60a5fa;">{arch.infra?.proxy}</span> → <span style="color: #60a5fa;">FastAPI ({arch.infra?.workers}w)</span> → <span style="color: #60a5fa;">{arch.infra?.pooler?.split('(')[0]}</span>
+<span style="color: #888;">│</span>      → <span style="color: #60a5fa;">{arch.infra?.db}</span>
+<span style="color: #888;">│</span> Rate: <span style="color: #fbbf24;">{arch.infra?.rate_limit}</span> │ Auth: <span style="color: #fbbf24;">SCRAM-SHA-256 + Token</span>
+<span style="color: #888;">└─────────────────────────────────────────────────────────────────────┘</span>
+  </div>
+
+  <!-- ROUTING + AGENTS -->
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+    <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright);">
+      <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 0.08em;">ROUTING</div>
+      <div style="font-size: 10px; line-height: 1.8; color: var(--color-on-surface-dim);">
+        <div><span style="color: #00fc40; font-weight: 700;">Tier 1:</span> Keyword scoring (7 signals, $0, &lt;1ms)</div>
+        <div><span style="color: #fbbf24; font-weight: 700;">Tier 2:</span> Router Agent + Brain lookup ($0.001, &lt;1.5s)</div>
+        <div style="margin-top: 6px; font-size: 9px; border-top: 1px solid var(--color-on-surface); padding-top: 6px;">
+          "revenue by month" → <span style="color: #60a5fa;">Analyst</span><br>
+          "predict sales" → <span style="color: #a78bfa;">Data Scientist</span><br>
+          "what does report say" → <span style="color: #34d399;">Researcher</span><br>
+          "create view" → <span style="color: #fbbf24;">Engineer</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright);">
+      <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 0.08em;">AGENT TEAMS ({arch.agents?.total} total)</div>
+      <div style="font-size: 9px; line-height: 1.7; color: var(--color-on-surface-dim);">
+        <div style="font-weight: 700; color: var(--color-on-surface); margin-bottom: 2px;">CHAT ({arch.agents?.chat_team?.length})</div>
+        {#each arch.agents?.chat_team || [] as a}<div style="padding-left: 8px;">› {a}</div>{/each}
+        <div style="font-weight: 700; color: var(--color-on-surface); margin-top: 6px; margin-bottom: 2px;">SPECIALISTS ({arch.agents?.specialists?.length})</div>
+        <div style="padding-left: 8px;">{(arch.agents?.specialists || []).join(', ')}</div>
+        <div style="font-weight: 700; color: var(--color-on-surface); margin-top: 6px; margin-bottom: 2px;">BACKGROUND ({arch.agents?.background?.length})</div>
+        <div style="padding-left: 8px;">{(arch.agents?.background || []).join(', ')}</div>
+        <div style="font-weight: 700; color: var(--color-on-surface); margin-top: 6px; margin-bottom: 2px;">UPLOAD ({arch.agents?.upload?.length})</div>
+        <div style="padding-left: 8px;">{(arch.agents?.upload || []).join(', ')}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ML INTELLIGENCE -->
+  <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright); margin-bottom: 16px;">
+    <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.08em;">ML INTELLIGENCE ({arch.ml?.tools?.length} tools)</div>
+    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px;">
+      {#each arch.ml?.tools || [] as tool}
+        <div style="border: 1px solid var(--color-on-surface); padding: 8px; font-size: 9px;">
+          <div style="font-weight: 900; text-transform: uppercase; color: {tool.type?.includes('LLM') ? '#a78bfa' : '#00fc40'}; margin-bottom: 4px;">{tool.name}</div>
+          <div style="color: var(--color-on-surface-dim);">{tool.algorithm}</div>
+          <div style="margin-top: 4px;">
+            <span style="font-size: 8px; padding: 1px 4px; background: {tool.type?.includes('LLM') ? '#6b21a8' : '#007518'}; color: white; font-weight: 700;">{tool.type}</span>
+            <span style="margin-left: 6px; color: var(--color-on-surface-dim);">{tool.cost}</span>
+          </div>
+        </div>
+      {/each}
+    </div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; font-size: 9px; color: var(--color-on-surface-dim);">
+      <div>
+        <div style="font-weight: 700; color: var(--color-on-surface); margin-bottom: 4px;">PREPROCESSING</div>
+        {#each arch.ml?.preprocessing || [] as p}<div>› {p}</div>{/each}
+      </div>
+      <div>
+        <div style="font-weight: 700; color: var(--color-on-surface); margin-bottom: 4px;">EVALUATION</div>
+        {#each arch.ml?.evaluation || [] as e}<div>› {e}</div>{/each}
+      </div>
+      <div>
+        <div style="font-weight: 700; color: var(--color-on-surface); margin-bottom: 4px;">ML WORKER</div>
+        <div>Row limit: {arch.ml?.worker?.row_limit?.toLocaleString()}</div>
+        <div>Timeout: {arch.ml?.worker?.timeout_sec}s</div>
+        <div>Retrain: {arch.ml?.worker?.retrain_interval}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- KNOWLEDGE + AI MODELS -->
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+    <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright);">
+      <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 0.08em;">KNOWLEDGE ({arch.knowledge?.layers} layers)</div>
+      <div style="font-size: 9px; line-height: 1.7; color: var(--color-on-surface-dim);">
+        <div>Search: {arch.knowledge?.search}</div>
+        <div style="margin-top: 6px; font-weight: 700; color: var(--color-on-surface);">EMBEDDING CASCADE</div>
+        {#each arch.knowledge?.embedding_cascade || [] as e, i}<div>{i+1}. {e}</div>{/each}
+        <div style="margin-top: 6px; font-weight: 700; color: var(--color-on-surface);">RERANK CASCADE</div>
+        {#each arch.knowledge?.rerank_cascade || [] as r, i}<div>{i+1}. {r}</div>{/each}
+      </div>
+    </div>
+
+    <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright);">
+      <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 0.08em;">AI MODELS (from env)</div>
+      <div style="font-size: 9px; line-height: 1.8; color: var(--color-on-surface-dim);">
+        <div><span style="color: #00fc40; font-weight: 700;">CHAT:</span> <code style="background: #222; color: #0f0; padding: 1px 4px; font-size: 8px;">{arch.models?.chat}</code></div>
+        <div><span style="color: #fbbf24; font-weight: 700;">DEEP:</span> <code style="background: #222; color: #0f0; padding: 1px 4px; font-size: 8px;">{arch.models?.deep}</code></div>
+        <div><span style="color: #60a5fa; font-weight: 700;">LITE:</span> <code style="background: #222; color: #0f0; padding: 1px 4px; font-size: 8px;">{arch.models?.lite}</code></div>
+        <div><span style="color: #a78bfa; font-weight: 700;">EMBED:</span> <code style="background: #222; color: #0f0; padding: 1px 4px; font-size: 8px;">{arch.models?.embedding}</code></div>
+        <div style="margin-top: 8px; color: var(--color-on-surface);">Provider: <span style="font-weight: 700;">{arch.models?.provider}</span> — single API key</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DATA PIPELINE + SECURITY -->
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+    <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright);">
+      <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 0.08em;">DATA PIPELINE</div>
+      <div style="font-size: 9px; line-height: 1.7; color: var(--color-on-surface-dim);">
+        <div style="font-weight: 700; color: var(--color-on-surface);">INGESTION ({arch.pipeline?.formats} formats)</div>
+        <div>{(arch.pipeline?.format_list || []).join(', ')}</div>
+        <div style="margin-top: 6px; font-weight: 700; color: var(--color-on-surface);">TRAINING ({arch.pipeline?.training_steps} steps)</div>
+        <div>Drift → Analysis → Q&A → Persona → Workflows → Relationships → KB Index → Brain → Domain → Seed → Enrich → Facts → KG → ML</div>
+        <div style="margin-top: 6px; font-weight: 700; color: var(--color-on-surface);">CONNECTORS</div>
+        <div>{(arch.pipeline?.connectors || []).join(' │ ')}</div>
+        <div style="margin-top: 6px; font-weight: 700; color: var(--color-on-surface);">EXPORT</div>
+        <div>{(arch.pipeline?.export || []).join(' │ ')}</div>
+      </div>
+    </div>
+
+    <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright);">
+      <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 0.08em;">SECURITY</div>
+      <div style="font-size: 9px; line-height: 1.6; color: var(--color-on-surface-dim);">
+        {#each Object.entries(arch.security || {}) as [category, items]}
+          <div style="font-weight: 700; color: var(--color-on-surface); text-transform: uppercase; margin-top: 6px; margin-bottom: 2px;">{category}</div>
+          {#each items as item}<div style="padding-left: 8px;">› {item}</div>{/each}
+        {/each}
+      </div>
+    </div>
+  </div>
+
+  <!-- SELF-LEARNING -->
+  <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright); margin-bottom: 16px;">
+    <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 0.08em;">SELF-LEARNING LOOP</div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; font-size: 9px; color: var(--color-on-surface-dim);">
+      <div>
+        <div style="font-weight: 700; color: #00fc40; margin-bottom: 4px;">EVERY CHAT</div>
+        <div>11 background agents run:</div>
+        <div>Quality score │ Extract rules │ KG triples</div>
+        <div>Auto-memory │ User prefs │ Episodic</div>
+        <div>Query plans │ Follow-ups │ Insights</div>
+      </div>
+      <div>
+        <div style="font-weight: 700; color: #fbbf24; margin-bottom: 4px;">PERIODIC</div>
+        <div>Every 20 chats: Auto-evolve instructions</div>
+        <div>Every 24 hours: Retrain all ML models</div>
+        <div>On upload: Full 14-step training</div>
+        <div>Last retrain: {arch.ml_retrain?.last_run || 'Never'}</div>
+      </div>
+      <div>
+        <div style="font-weight: 700; color: #60a5fa; margin-bottom: 4px;">FEEDBACK LOOP</div>
+        <div>&#128077; → Proven pattern + auto-VIEW (3+ uses)</div>
+        <div>&#128078; → Anti-pattern (agent avoids next time)</div>
+        <div>Self-correction: 3 attempts with diagnosis</div>
+        <div>Meta-learning tracks strategy success rates</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- INFRASTRUCTURE -->
+  <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright); margin-bottom: 16px;">
+    <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 10px; letter-spacing: 0.08em;">INFRASTRUCTURE</div>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">
+      {#each arch.infra?.containers || [] as c}
+        <div style="border: 1px solid var(--color-on-surface); padding: 6px 12px; font-size: 9px; font-weight: 700;">{c}</div>
+      {/each}
+    </div>
+  </div>
+
+  <!-- LIVE METRICS -->
+  <div class="ink-border" style="padding: 14px; background: var(--color-surface-bright);">
+    <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.08em;">LIVE METRICS</div>
+    <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px;">
+      {#each [
+        { v: arch.metrics?.projects, l: 'Projects' },
+        { v: arch.metrics?.users, l: 'Users' },
+        { v: arch.metrics?.chats, l: 'Chats' },
+        { v: arch.metrics?.ml_models, l: 'ML Models' },
+        { v: arch.metrics?.experiments, l: 'Experiments' },
+        { v: arch.metrics?.brain_entries, l: 'Brain Entries' },
+        { v: arch.metrics?.memories, l: 'Memories' },
+        { v: arch.metrics?.feedback, l: 'Feedback' },
+        { v: arch.metrics?.kg_triples, l: 'KG Triples' },
+        { v: arch.metrics?.quality_avg ? arch.metrics.quality_avg + '★' : '—', l: 'Avg Quality' },
+      ] as m}
+        <div style="text-align: center; border: 1px solid var(--color-on-surface); padding: 8px 4px;">
+          <div style="font-size: 18px; font-weight: 900;">{m.v ?? 0}</div>
+          <div style="font-size: 8px; text-transform: uppercase; color: var(--color-on-surface-dim); letter-spacing: 0.05em;">{m.l}</div>
+        </div>
+      {/each}
+    </div>
+  </div>
+
+  {:else}
+    <div style="font-size: 12px; color: var(--color-on-surface-dim);">Loading architecture...</div>
+  {/if}
 
 {/if}
 
