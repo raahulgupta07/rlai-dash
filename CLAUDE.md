@@ -196,29 +196,34 @@ Q&A Eval Pairs → Generation (LLM generates SQL from question)
 **Auto-Training Pipeline (on upload/retrain — 10+ steps):**
 ```
 1. Drift Check — detect schema/data changes from previous training
-2. Deep Analysis — LLM column analysis, Codex-enriched knowledge
-3. Q&A Generation — LLM generates question/SQL pairs for eval
-4. Persona — LLM generates project persona from data shape
-5. Workflows + Synthesis — auto workflows, multi-file synthesis
-6. Relationships — LLM discovers hidden joins across tables
-7. Knowledge Index — PgVector re-index all knowledge
-8. Brain Fill (7 sub-steps) — populate agent memory layers
-9. Domain Knowledge (6 sub-steps):
+2. SQL Profiling — profile ALL columns via PostgreSQL (COUNT, DISTINCT, MIN, MAX, AVG, STDDEV, percentiles). Classify dimension/measure/id. Zero RAM
+3. Dimension Catalog — SELECT DISTINCT + COUNT for categorical columns (unique < 500). Save values + frequencies to knowledge/{slug}/dimensions/{table}.json
+4. Hierarchy Detection — find parent-child relationships between dimension columns (e.g., region → city)
+5. Smart Sampling — 20 diverse rows: 3 start + 3 middle + 3 end + outlier rows + null pattern rows
+6. Deep Analysis — LLM column analysis, Codex-enriched knowledge, dimension injection
+7. Q&A Generation — LLM generates question/SQL pairs for eval
+8. Persona — LLM generates project persona from data shape
+9. Workflows + Synthesis — auto workflows, multi-file synthesis
+10. Relationships — LLM discovers hidden joins across tables
+11. Knowledge Index — PgVector re-index all knowledge
+12. Brain Fill (7 sub-steps) — populate agent memory layers
+13. Domain Knowledge (6 sub-steps):
    ├── Glossary (business terms)
    ├── Calculations (formulas, derived metrics)
    ├── Value Mappings (code → meaning)
    ├── KPIs (key performance indicators)
    ├── Data Quality (known issues, caveats)
    └── Negative Examples (common mistakes to avoid)
-10. AI Seed — bad feedback, insights, drift baseline, evolution
-11. Persona Enrich — re-generates persona with domain knowledge
-12. LangExtract — grounded fact extraction (KPIs, metrics, decisions, risks with source positions)
-13. Knowledge Graph — SPO triple extraction, entity standardization, cross-source inference
+14. AI Seed — bad feedback, insights, drift baseline, evolution
+15. Persona Enrich — re-generates persona with domain knowledge
+16. LangExtract — grounded fact extraction (KPIs, metrics, decisions, risks with source positions)
+17. Knowledge Graph — SPO triple extraction, entity standardization, cross-source inference
 → Training Run Tracking (success/fail/duration)
 ```
 
 **Doc-Only Training (PPTX/PDF/DOCX without data tables):**
-16 steps: knowledge index → memories → persona → workflows → evals →
+18 steps: structure extraction → section-aware chunking → hierarchical summarization →
+knowledge index → memories → persona → workflows → evals →
 feedback → business rules → domain knowledge → proactive insights →
 negative examples → training Q&A → multi-doc synthesis →
 cross-document relationships → langextract → knowledge graph → complete
@@ -589,6 +594,66 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 181. **Discover Tables Tool** — introspect_schema renamed to discover_tables for Data Scientist (less SQL-like). Instructions say "call FIRST before choosing ML tool."
 
+182. **Currency/Comma/% Stripping** — `_clean_dataframe()` now strips $, EUR, ¥, £, commas from numbers, % signs (divides by 100), auto-coerces text columns that are >50% numeric. Runs on every DataFrame.
+
+183. **Multi-Level Header Flatten** — `_rules_analyze_sheet()` detects 2-3 row headers, flattens by concatenating parent→child (e.g., "Region__East__Revenue"). `data_start_row` set after headers.
+
+184. **Hidden Row/Column Filter** — openpyxl scan extracts `ws.row_dimensions[].hidden` and `ws.column_dimensions[].hidden`. Hidden rows excluded from preview. Metadata logged.
+
+185. **Multi-Sheet Similarity Detection** — Jaccard >0.8 column overlap across sheets → auto-concat with `_source_sheet` column. Runs before per-sheet processing.
+
+186. **Cell Comments Extraction** — `cell.comment.text` extracted (max 50 per sheet), stored in sheet metadata for LLM context.
+
+187. **SheetCompressor** — Before LLM call: skip blank rows, sparse rows use inverse index format `{col:value}`, include hidden/comment counts. ~50% token reduction.
+
+188. **Calamine Fast Path** — Clean sheets (no merges) use `pd.read_excel(engine='calamine')` for 5-10x faster loading. Falls back to openpyxl.
+
+189. **Ghost Row Detection** — Scans for actual data rows when `max_row > 10000`. Stops after 50 consecutive empty rows. Reports: "Excel says 1M but only 1.8K have data".
+
+190. **Row Cap on read_excel** — `nrows=min(actual_rows, 100000)` prevents OOM on large/ghost-row sheets.
+
+191. **AI Structure Validator** — After rules load, checks: >30 cols? cols>>rows? repeating column names? >60% NaN? If suspicious, asks LLM if table should be unpivoted. Auto-reshapes wide→long. Saves learning to `dash_memories` for next time.
+
+192. **Source Tracking Columns** — Every uploaded table gets `_source_file` and `_source_sheet` columns for data lineage.
+
+193. **Single-Sheet Excel Pipeline** — Changed `len(tables) > 1` to `>= 1` so single-sheet Excel files also go through the full pipeline (rules + AI validator).
+
+194. **Parquet File Support** — `pd.read_parquet()`, fastest columnar format. Added to upload pipeline.
+
+195. **ODS File Support** — `pd.read_excel(engine='odf')`, LibreOffice/OpenDocument spreadsheets.
+
+196. **XML File Support** — `pd.read_xml()`, fallback to text indexing.
+
+197. **HTML File Support** — `pd.read_html()` for tables + text extraction.
+
+198. **ZIP File Support** — Extract and recursively process each file inside (CSV, Excel, PDF, etc., max 20 files).
+
+199. **Email (.eml) File Support** — Extract subject/from/date + body text.
+
+200. **SQL Profiling** — `_sql_profile_columns()` profiles ALL columns via PostgreSQL queries (not pandas). COUNT, DISTINCT, MIN, MAX, AVG, STDDEV, percentiles. Classifies as dimension/measure/id. Zero RAM.
+
+201. **Dimension Catalog** — `_build_dimension_catalog()` runs SELECT DISTINCT + COUNT for all categorical columns (unique < 500). Saves exact values + frequencies to `knowledge/{slug}/dimensions/{table}.json`.
+
+202. **Hierarchy Detection** — `_detect_hierarchies()` finds parent-child relationships between dimension columns. If every child maps to 1 parent → hierarchy (e.g., region → city).
+
+203. **Smart Sampling** — `_smart_sample_rows()` gets 20 diverse rows: 3 start + 3 middle + 3 end + outlier rows + null pattern rows. Replaces first 8 rows.
+
+204. **Dimension Injection** — Analyst semantic model now includes dimension values, column classifications (dimension/measure), and hierarchies for every table.
+
+205. **Document Structure Extraction** — `_extract_document_structure()` extracts TOC/headings from PDF (pymupdf), PPTX (slide titles), DOCX (heading styles), MD (# headers). Saved as `doc_structure/{name}.json`.
+
+206. **Section-Aware Chunking** — `_section_aware_chunks()` splits text at heading boundaries. Each chunk tagged with `{section, page, heading_path}`. Better retrieval accuracy.
+
+207. **Hierarchical Summarization** — `_hierarchical_summarize()` for docs with 5+ sections: summarizes each section (1 LLM call each), then summarizes all summaries. 77% cheaper than enriching every chunk.
+
+208. **Page Citations** — Enriched text includes `[Section: X] [Page Y]` markers so agent can cite "per page 4..."
+
+209. **Table Download API** — `GET /api/tables/{name}/download` downloads any table as CSV or Excel. `format=csv` or `format=excel`, `project=slug`. Full table export with source tracking columns.
+
+210. **Table Download UI** — CSV and EXCEL download buttons on Settings → DATASETS for every table.
+
+211. **Architecture Page** — `GET /api/architecture` returns full system info: AI models from env, live metrics from DB, security layers, agent teams, ML tools, knowledge layers, data pipeline, infrastructure. Command Center ARCHITECTURE tab: interactive ECharts flow diagram (35 nodes, 30+ edges, 8 categories), hover tooltips with live data, drag/zoom, detailed cards for every system component.
+
 ## Self-Evolution Architecture
 
 ```
@@ -692,10 +757,11 @@ PHASE 4: ENGINEER RELATIONSHIPS
 - `POST /api/upload` — Standard data file upload (CSV/Excel/JSON)
 - `POST /api/upload-doc` — Document upload (PDF/PPTX/DOCX/TXT/MD/SQL). Supports SSE streaming with `Accept: text/event-stream` header for real-time progress
 - `POST /api/upload-agent` — Agent-powered upload (full team: Conductor → Parser → Inspector → Engineer)
+- `GET /api/tables/{name}/download` — Download any table as CSV or Excel (`format=csv|excel`, `project=slug`)
 
 ### Key Features
 
-- **18 File formats:** CSV, Excel (.xlsx/.xls), JSON, SQL, PPTX, DOCX, PDF, JPG, JPEG, PNG, TIFF, BMP, GIF, WEBP, MD, TXT, PY + auto encoding detection (chardet)
+- **24 File formats:** CSV, Excel (.xlsx/.xls), JSON, SQL, PPTX, DOCX, PDF, JPG, JPEG, PNG, TIFF, BMP, GIF, WEBP, MD, TXT, PY, Parquet, ODS, XML, HTML, ZIP, EML + auto encoding detection (chardet)
 - **Excel AI multi-sheet** — GPT-5.4-mini analyzes structure, detects headers, unpivots months→rows, splits multi-table sheets, merges related sheets. Fallback: reads all sheets with rule-based header detection
 - **Excel unpivot** — Wide format (months as columns) → long format (months as rows). AI-powered 2-stage: structure analysis + conversion plan. Date parsing via LLM (Jul'21 → 2021-07-01)
 - **Clean/messy master decision** — `_is_clean_sheet()` checks in <1s: clean → direct load (0 AI calls), messy → AI analysis
@@ -876,7 +942,7 @@ docker compose up -d --build
 
 ## Key Dependencies (non-obvious)
 
-`pymupdf4llm` (PDF→Markdown), `langextract` (grounded facts), `msal` (Microsoft Entra ID / SharePoint OAuth), `google-auth` + `google-auth-oauthlib` + `google-api-python-client` (Google Drive OAuth + API), `pymysql` (MySQL connector), `python-pptx` + `Pillow` (PPTX slide rendering), `pdfplumber` (PDF table extraction), `chardet` (encoding detection), `xlsxwriter` (Excel export), `shap` (SHAP explanations), `statsmodels` (time series decomposition), `google/gemini-embedding-2-preview` via OpenRouter (embedding), `cohere/rerank-4-pro` via OpenRouter (reranking)
+`pymupdf4llm` (PDF→Markdown), `langextract` (grounded facts), `msal` (Microsoft Entra ID / SharePoint OAuth), `google-auth` + `google-auth-oauthlib` + `google-api-python-client` (Google Drive OAuth + API), `pymysql` (MySQL connector), `python-pptx` + `Pillow` (PPTX slide rendering), `pdfplumber` (PDF table extraction), `chardet` (encoding detection), `xlsxwriter` (Excel export), `shap` (SHAP explanations), `statsmodels` (time series decomposition), `python-calamine` (fast Excel reading), `pyarrow` (Parquet support), `odfpy` (ODS support), `lxml` (XML/HTML parsing), `google/gemini-embedding-2-preview` via OpenRouter (embedding), `cohere/rerank-4-pro` via OpenRouter (reranking)
 
 ## Build & Deploy Troubleshooting
 

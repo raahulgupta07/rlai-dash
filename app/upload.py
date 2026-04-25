@@ -611,6 +611,206 @@ def _filter_junk_chunks(chunks: list[str]) -> list[str]:
     return filtered
 
 
+def _extract_document_structure(file_path: str, ext: str, text: str = "") -> dict:
+    """Extract document structure: TOC, headings, sections, page ranges.
+    Works for PDF (pymupdf headings), PPTX (slide titles), DOCX (heading styles), MD (# headings)."""
+    structure = {"sections": [], "total_pages": 0, "has_toc": False}
+
+    try:
+        if ext == ".pdf":
+            import fitz
+            doc = fitz.open(file_path)
+            structure["total_pages"] = len(doc)
+            # Extract TOC if available
+            toc = doc.get_toc()
+            if toc:
+                structure["has_toc"] = True
+                for level, title, page in toc:
+                    structure["sections"].append({"title": title.strip(), "level": level, "page": page, "type": "heading"})
+            else:
+                # Fallback: detect headings from text formatting
+                for pi, page in enumerate(doc):
+                    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks", [])
+                    for block in blocks:
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                # Large font or bold = likely heading
+                                if span.get("size", 0) > 14 or (span.get("flags", 0) & 2**4):  # bold flag
+                                    txt = span.get("text", "").strip()
+                                    if txt and len(txt) > 3 and len(txt) < 200:
+                                        level = 1 if span.get("size", 0) > 18 else (2 if span.get("size", 0) > 14 else 3)
+                                        structure["sections"].append({"title": txt, "level": level, "page": pi + 1, "type": "detected"})
+            doc.close()
+
+        elif ext == ".pptx":
+            from pptx import Presentation
+            prs = Presentation(file_path)
+            structure["total_pages"] = len(prs.slides)
+            for si, slide in enumerate(prs.slides):
+                title = ""
+                if slide.shapes.title:
+                    title = slide.shapes.title.text.strip()
+                if not title:
+                    for shape in slide.shapes:
+                        if shape.has_text_frame and shape.text.strip():
+                            title = shape.text.strip()[:100]
+                            break
+                structure["sections"].append({"title": title or f"Slide {si+1}", "level": 1, "page": si + 1, "type": "slide"})
+
+        elif ext == ".docx":
+            from docx import Document
+            doc = Document(file_path)
+            for pi, para in enumerate(doc.paragraphs):
+                style = para.style.name.lower() if para.style else ""
+                if "heading" in style and para.text.strip():
+                    level = int(style.replace("heading ", "").strip()) if style.replace("heading ", "").strip().isdigit() else 1
+                    structure["sections"].append({"title": para.text.strip(), "level": level, "page": pi, "type": "heading"})
+
+        elif ext == ".md" and text:
+            for li, line in enumerate(text.split("\n")):
+                line = line.strip()
+                if line.startswith("#"):
+                    level = len(line) - len(line.lstrip("#"))
+                    title = line.lstrip("#").strip()
+                    if title:
+                        structure["sections"].append({"title": title, "level": level, "page": li, "type": "heading"})
+
+    except Exception:
+        pass
+
+    # Deduplicate consecutive same-title sections
+    if structure["sections"]:
+        deduped = [structure["sections"][0]]
+        for s in structure["sections"][1:]:
+            if s["title"] != deduped[-1]["title"]:
+                deduped.append(s)
+        structure["sections"] = deduped[:100]  # Cap at 100 sections
+
+    return structure
+
+
+def _section_aware_chunks(text: str, structure: dict, max_chunk_size: int = 1500) -> list[dict]:
+    """Split text at section/heading boundaries. Each chunk tagged with section + page.
+    Returns [{text, section, page, heading_path}]."""
+    sections = structure.get("sections", [])
+    if not sections or not text:
+        # Fallback: fixed-size chunks with page markers
+        chunks = []
+        lines = text.split("\n")
+        current = []
+        current_size = 0
+        for line in lines:
+            current.append(line)
+            current_size += len(line)
+            if current_size >= max_chunk_size:
+                chunks.append({"text": "\n".join(current), "section": "", "page": 0, "heading_path": ""})
+                current = []
+                current_size = 0
+        if current:
+            chunks.append({"text": "\n".join(current), "section": "", "page": 0, "heading_path": ""})
+        return chunks
+
+    # Split text at heading boundaries
+    lines = text.split("\n")
+    chunks = []
+    current_section = sections[0]["title"] if sections else ""
+    current_page = sections[0].get("page", 0) if sections else 0
+    heading_path = [current_section]
+    current_lines = []
+    section_idx = 0
+
+    for line in lines:
+        stripped = line.strip()
+        # Check if this line matches a section heading
+        matched = False
+        for si, sec in enumerate(sections[section_idx:], section_idx):
+            if stripped and sec["title"] in stripped and len(stripped) < len(sec["title"]) + 20:
+                # Found a heading — save current chunk, start new one
+                if current_lines:
+                    chunk_text = "\n".join(current_lines).strip()
+                    if len(chunk_text) > 20:
+                        chunks.append({"text": chunk_text, "section": current_section, "page": current_page, "heading_path": " > ".join(heading_path)})
+                current_section = sec["title"]
+                current_page = sec.get("page", current_page)
+                # Update heading path based on level
+                level = sec.get("level", 1)
+                heading_path = heading_path[:level-1] + [current_section]
+                current_lines = [line]
+                section_idx = si + 1
+                matched = True
+                break
+
+        if not matched:
+            current_lines.append(line)
+
+        # Split if chunk too large
+        if sum(len(l) for l in current_lines) > max_chunk_size:
+            chunk_text = "\n".join(current_lines).strip()
+            if len(chunk_text) > 20:
+                chunks.append({"text": chunk_text, "section": current_section, "page": current_page, "heading_path": " > ".join(heading_path)})
+            current_lines = []
+
+    # Last chunk
+    if current_lines:
+        chunk_text = "\n".join(current_lines).strip()
+        if len(chunk_text) > 20:
+            chunks.append({"text": chunk_text, "section": current_section, "page": current_page, "heading_path": " > ".join(heading_path)})
+
+    return chunks
+
+
+def _hierarchical_summarize(chunks: list[dict], filename: str) -> dict:
+    """Summarize document hierarchically: section summaries → doc summary.
+    For big docs (5+ sections), 77% cheaper than enriching every chunk."""
+    if not chunks:
+        return {"doc_summary": "", "section_summaries": []}
+
+    # Group chunks by section
+    sections = {}
+    for c in chunks:
+        sec = c.get("section") or "Main"
+        if sec not in sections:
+            sections[sec] = []
+        sections[sec].append(c["text"])
+
+    if len(sections) < 3:
+        # Small doc — just concatenate and summarize once
+        all_text = "\n".join(c["text"][:500] for c in chunks[:20])
+        try:
+            from dash.settings import training_llm_call
+            summary = training_llm_call(f"Summarize this document in 200 words:\n\n{all_text[:4000]}", "extraction")
+            return {"doc_summary": summary or "", "section_summaries": []}
+        except Exception:
+            return {"doc_summary": all_text[:500], "section_summaries": []}
+
+    # Big doc — summarize each section, then summarize summaries
+    section_summaries = []
+    try:
+        from dash.settings import training_llm_call
+
+        for sec_name, sec_chunks in list(sections.items())[:20]:  # Cap at 20 sections
+            sec_text = "\n".join(sec_chunks)[:3000]
+            if len(sec_text) < 50:
+                continue
+            summary = training_llm_call(
+                f"Summarize this section '{sec_name}' in 100 words. Include key numbers, dates, decisions:\n\n{sec_text}",
+                "extraction"
+            )
+            if summary:
+                section_summaries.append({"section": sec_name, "summary": summary.strip()})
+
+        # Final: summarize all section summaries
+        combined = "\n\n".join(f"**{s['section']}:** {s['summary']}" for s in section_summaries)
+        doc_summary = training_llm_call(
+            f"Create a 300-word executive summary of this document '{filename}' from these section summaries:\n\n{combined[:4000]}",
+            "extraction"
+        ) or ""
+
+        return {"doc_summary": doc_summary.strip(), "section_summaries": section_summaries}
+    except Exception:
+        return {"doc_summary": "", "section_summaries": section_summaries}
+
+
 def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Smart cleanup: normalize nulls, drop empty rows/columns, rename unnamed, clean column names."""
     # 0. Normalize null representations → NaN
@@ -659,6 +859,24 @@ def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     if renamed:
         df = df.rename(columns=renamed)
+
+    # 4b. Currency/comma/percentage cleanup — coerce text columns to numeric
+    _CURRENCY_RE = re.compile(r'^[\s$€£¥₹]*([-+]?[\d,]+\.?\d*)\s*%?\s*$')
+    for col in df.columns:
+        if df[col].dtype != object:
+            continue
+        non_null = df[col].dropna()
+        if len(non_null) == 0:
+            continue
+        # Check if >50% of values look like numbers with currency/comma/percent
+        sample = non_null.head(20)
+        matches = sum(1 for v in sample if _CURRENCY_RE.match(str(v).strip()))
+        if matches >= len(sample) * 0.5:
+            is_pct = any('%' in str(v) for v in sample.head(10))
+            cleaned = df[col].apply(lambda x: re.sub(r'[$€£¥₹,\s]', '', str(x)).rstrip('%') if pd.notna(x) else x)
+            df[col] = pd.to_numeric(cleaned, errors='coerce')
+            if is_pct:
+                df[col] = df[col] / 100.0
 
     # 5. Clean ALL column names (after smart rename)
     df.columns = [re.sub(r"[^a-z0-9_]", "_", str(c).lower().strip()).strip("_") or f"col_{i}" for i, c in enumerate(df.columns)]
@@ -866,6 +1084,233 @@ def _profile_table(df: pd.DataFrame, project_slug: str, table_name: str) -> dict
     except Exception:
         pass
     return profile_data
+
+
+def _sql_profile_columns(project_slug: str, table_name: str, engine=None) -> list[dict]:
+    """Profile ALL columns via SQL — zero RAM, works on 1M+ rows in <10s.
+    Classifies each column as: dimension (categorical), measure (numeric), id, or text."""
+    schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+    qualified = f'"{schema}"."{table_name}"'
+    if not engine:
+        engine = create_engine(db_url)
+
+    profiles = []
+    try:
+        with engine.connect() as conn:
+            # Get column list + types
+            cols = conn.execute(text(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = :s AND table_name = :t ORDER BY ordinal_position"
+            ), {"s": schema, "t": table_name}).fetchall()
+
+            total_rows = conn.execute(text(f"SELECT COUNT(*) FROM {qualified}")).scalar() or 0
+
+            for col_name, col_type in cols:
+                if col_name.startswith('_source_'):
+                    continue  # Skip our tracking columns
+                safe_col = f'"{col_name}"'
+                p = {"name": col_name, "pg_type": col_type, "total_rows": total_rows}
+
+                try:
+                    # Universal stats
+                    stats = conn.execute(text(f"""
+                        SELECT COUNT({safe_col}) as non_null,
+                               COUNT(DISTINCT {safe_col}) as unique_count
+                        FROM {qualified}
+                    """)).fetchone()
+                    p["non_null"] = stats[0]
+                    p["null_count"] = total_rows - stats[0]
+                    p["null_pct"] = round((total_rows - stats[0]) / max(total_rows, 1) * 100, 1)
+                    p["unique_count"] = stats[1]
+
+                    is_numeric = col_type in ('integer', 'bigint', 'smallint', 'numeric', 'double precision', 'real')
+                    is_date = col_type in ('timestamp with time zone', 'timestamp without time zone', 'date')
+
+                    if is_numeric and stats[0] > 0:
+                        num_stats = conn.execute(text(f"""
+                            SELECT MIN({safe_col}), MAX({safe_col}),
+                                   AVG({safe_col}::numeric), STDDEV({safe_col}::numeric),
+                                   PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {safe_col}::numeric),
+                                   PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY {safe_col}::numeric),
+                                   PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {safe_col}::numeric)
+                            FROM {qualified} WHERE {safe_col} IS NOT NULL
+                        """)).fetchone()
+                        p.update({"type": "numeric", "min": float(num_stats[0]) if num_stats[0] is not None else None,
+                                  "max": float(num_stats[1]) if num_stats[1] is not None else None,
+                                  "mean": round(float(num_stats[2]), 2) if num_stats[2] is not None else None,
+                                  "stddev": round(float(num_stats[3]), 2) if num_stats[3] is not None else None,
+                                  "p25": float(num_stats[4]) if num_stats[4] is not None else None,
+                                  "median": float(num_stats[5]) if num_stats[5] is not None else None,
+                                  "p75": float(num_stats[6]) if num_stats[6] is not None else None})
+                    elif is_date and stats[0] > 0:
+                        date_stats = conn.execute(text(f"SELECT MIN({safe_col}), MAX({safe_col}) FROM {qualified} WHERE {safe_col} IS NOT NULL")).fetchone()
+                        p.update({"type": "datetime", "min_date": str(date_stats[0])[:10], "max_date": str(date_stats[1])[:10]})
+                    else:
+                        p["type"] = "text"
+
+                    # Classify: dimension vs measure vs id
+                    if p["unique_count"] <= 500 and p["type"] != "datetime":
+                        p["classification"] = "dimension"
+                    elif p["unique_count"] >= total_rows * 0.9 and total_rows > 10:
+                        p["classification"] = "id"
+                    elif p["type"] == "numeric":
+                        p["classification"] = "measure"
+                    else:
+                        p["classification"] = "text"
+
+                except Exception:
+                    p["type"] = "unknown"
+                    p["classification"] = "unknown"
+
+                profiles.append(p)
+    except Exception as e:
+        logger.warning(f"SQL profiling failed for {table_name}: {e}")
+
+    return profiles
+
+
+def _build_dimension_catalog(project_slug: str, table_name: str, profiles: list[dict], engine=None) -> dict:
+    """Build catalog of exact values for all dimension columns via SQL.
+    Returns {col_name: [{value, count, pct}, ...]}."""
+    schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+    qualified = f'"{schema}"."{table_name}"'
+    if not engine:
+        engine = create_engine(db_url)
+
+    catalog = {}
+    total_rows = profiles[0]["total_rows"] if profiles else 0
+
+    for p in profiles:
+        if p.get("classification") != "dimension":
+            continue
+        col = p["name"]
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(f"""
+                    SELECT "{col}", COUNT(*) as freq
+                    FROM {qualified}
+                    WHERE "{col}" IS NOT NULL
+                    GROUP BY "{col}"
+                    ORDER BY freq DESC
+                    LIMIT 100
+                """)).fetchall()
+                catalog[col] = [{"value": str(r[0]), "count": int(r[1]), "pct": round(int(r[1]) / max(total_rows, 1) * 100, 1)} for r in rows]
+        except Exception:
+            pass
+
+    # Save to knowledge dir
+    try:
+        dim_dir = KNOWLEDGE_DIR / project_slug / "dimensions"
+        dim_dir.mkdir(parents=True, exist_ok=True)
+        _safe_write_json(dim_dir / f"{table_name}.json", catalog)
+    except Exception:
+        pass
+
+    return catalog
+
+
+def _detect_hierarchies(project_slug: str, table_name: str, catalog: dict, engine=None) -> list[dict]:
+    """Detect parent-child hierarchies between dimension columns.
+    If every child value maps to exactly 1 parent → hierarchy."""
+    schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+    qualified = f'"{schema}"."{table_name}"'
+    if not engine:
+        engine = create_engine(db_url)
+
+    dim_cols = list(catalog.keys())
+    hierarchies = []
+
+    for parent in dim_cols:
+        parent_unique = len(catalog.get(parent, []))
+        for child in dim_cols:
+            if child == parent:
+                continue
+            child_unique = len(catalog.get(child, []))
+            if child_unique <= parent_unique:
+                continue  # Child should have MORE unique values than parent
+            # Check: does each child have exactly 1 parent?
+            try:
+                with engine.connect() as conn:
+                    check = conn.execute(text(f"""
+                        SELECT COUNT(*) FROM (
+                            SELECT "{child}", COUNT(DISTINCT "{parent}") as parent_count
+                            FROM {qualified}
+                            WHERE "{child}" IS NOT NULL AND "{parent}" IS NOT NULL
+                            GROUP BY "{child}"
+                            HAVING COUNT(DISTINCT "{parent}") > 1
+                        ) multi_parent
+                    """)).scalar()
+                    if check == 0:  # Every child has exactly 1 parent
+                        hierarchies.append({"parent": parent, "child": child,
+                                            "parent_count": parent_unique, "child_count": child_unique})
+            except Exception:
+                pass
+
+    return hierarchies
+
+
+def _smart_sample_rows(project_slug: str, table_name: str, profiles: list[dict], engine=None) -> list[dict]:
+    """Get 20 diverse sample rows: start + middle + end + outliers + nulls + per-category.
+    Much more representative than first 8 rows."""
+    schema = re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+    qualified = f'"{schema}"."{table_name}"'
+    if not engine:
+        engine = create_engine(db_url)
+
+    samples = []
+    total_rows = profiles[0]["total_rows"] if profiles else 0
+    if total_rows == 0:
+        return samples
+
+    try:
+        with engine.connect() as conn:
+            # Start rows
+            rows = conn.execute(text(f"SELECT * FROM {qualified} LIMIT 3")).fetchall()
+            cols = [c.name for c in conn.execute(text(f"SELECT * FROM {qualified} LIMIT 0")).cursor.description] if rows else []
+            for r in rows:
+                samples.append(dict(zip(cols, [str(v)[:50] if v is not None else None for v in r])))
+
+            # Middle rows
+            mid = max(0, total_rows // 2 - 1)
+            rows = conn.execute(text(f"SELECT * FROM {qualified} OFFSET {mid} LIMIT 3")).fetchall()
+            for r in rows:
+                samples.append(dict(zip(cols, [str(v)[:50] if v is not None else None for v in r])))
+
+            # End rows
+            rows = conn.execute(text(f"SELECT * FROM {qualified} OFFSET {max(0, total_rows - 3)} LIMIT 3")).fetchall()
+            for r in rows:
+                samples.append(dict(zip(cols, [str(v)[:50] if v is not None else None for v in r])))
+
+            # Outlier rows (max/min of first numeric column)
+            num_cols = [p["name"] for p in profiles if p.get("type") == "numeric" and p.get("classification") == "measure"]
+            if num_cols:
+                nc = f'"{num_cols[0]}"'
+                for order in ["DESC", "ASC"]:
+                    rows = conn.execute(text(f"SELECT * FROM {qualified} WHERE {nc} IS NOT NULL ORDER BY {nc} {order} LIMIT 2")).fetchall()
+                    for r in rows:
+                        samples.append(dict(zip(cols, [str(v)[:50] if v is not None else None for v in r])))
+
+            # Null pattern rows
+            null_cols = [p["name"] for p in profiles if p.get("null_pct", 0) > 5 and p.get("null_pct", 0) < 90]
+            if null_cols:
+                nc = f'"{null_cols[0]}"'
+                rows = conn.execute(text(f"SELECT * FROM {qualified} WHERE {nc} IS NULL LIMIT 2")).fetchall()
+                for r in rows:
+                    samples.append(dict(zip(cols, [str(v)[:50] if v is not None else None for v in r])))
+
+    except Exception as e:
+        logger.warning(f"Smart sampling failed for {table_name}: {e}")
+
+    # Deduplicate
+    seen = set()
+    unique_samples = []
+    for s in samples:
+        key = str(sorted(s.items()))
+        if key not in seen:
+            seen.add(key)
+            unique_samples.append(s)
+
+    return unique_samples[:20]
 
 
 def _generate_metadata(table_name: str, df: pd.DataFrame, col_analyses: list[dict]) -> dict:
@@ -1633,7 +2078,60 @@ def _run_auto_training(project_slug: str, table_name: str, col_analyses: list[di
     _detect_data_drift(project_slug, table_name, col_analyses)
     _log("✓ drift check complete")
 
-    # Step 1: LLM Deep Analysis
+    # Step 1a: SQL Profiling — stats via PostgreSQL ($0, <10s even for 1M rows)
+    if _cancelled():
+        _update_run("failed", "cancelled"); _log("⊘ training cancelled by user"); return
+    _update_run("running", "sql_profiling")
+    _log(f"profiling columns via SQL (no RAM usage)...")
+    sql_profiles = _sql_profile_columns(project_slug, table_name)
+    dimensions = [p for p in sql_profiles if p.get("classification") == "dimension"]
+    measures = [p for p in sql_profiles if p.get("classification") == "measure"]
+    _log(f"✓ profiled {len(sql_profiles)} columns: {len(dimensions)} dimensions, {len(measures)} measures")
+
+    # Step 1b: Dimension Catalog — exact values for categorical columns ($0)
+    dim_catalog = {}
+    if dimensions:
+        _update_run("running", "dimension_catalog")
+        _log(f"building dimension catalog ({len(dimensions)} categorical columns)...")
+        dim_catalog = _build_dimension_catalog(project_slug, table_name, sql_profiles)
+        total_values = sum(len(v) for v in dim_catalog.values())
+        _log(f"✓ dimension catalog: {total_values} unique values across {len(dim_catalog)} columns")
+
+    # Step 1c: Hierarchy Detection ($0)
+    hierarchies = []
+    if len(dim_catalog) >= 2:
+        _update_run("running", "hierarchy_detection")
+        _log("detecting column hierarchies...")
+        hierarchies = _detect_hierarchies(project_slug, table_name, dim_catalog)
+        if hierarchies:
+            _log(f"✓ found {len(hierarchies)} hierarchies: {', '.join(h['parent'] + ' → ' + h['child'] for h in hierarchies)}")
+            # Save to table metadata
+            metadata["hierarchies"] = hierarchies
+        else:
+            _log("· no hierarchies detected")
+
+    # Step 1d: Smart Sampling — 20 diverse rows (replaces first 8)
+    _update_run("running", "smart_sampling")
+    _log("collecting diverse sample rows...")
+    smart_samples = _smart_sample_rows(project_slug, table_name, sql_profiles)
+    _log(f"✓ sampled {len(smart_samples)} diverse rows (start/mid/end/outlier/null)")
+
+    # Save dimension info to table metadata for prompt injection
+    if dim_catalog:
+        metadata["dimensions"] = {col: vals[:20] for col, vals in dim_catalog.items()}  # Top 20 per column
+    if sql_profiles:
+        metadata["column_profiles"] = {p["name"]: {k: v for k, v in p.items() if k != "name"} for p in sql_profiles}
+
+    # Save updated metadata
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    with open(tables_dir / f"{table_name}.json", "w") as f:
+        json.dump(metadata, f, indent=2, default=str)
+
+    # Use smart samples for LLM analysis (instead of first 8 rows)
+    if smart_samples:
+        sample_rows = smart_samples
+
+    # Step 1: LLM Deep Analysis (now uses profiles + smart samples, not raw data)
     if _cancelled():
         _update_run("failed", "cancelled"); _log("⊘ training cancelled by user"); return
     _update_run("running", "deep_analysis")
@@ -1641,7 +2139,7 @@ def _run_auto_training(project_slug: str, table_name: str, col_analyses: list[di
         _log(f"⊘ skipping deep analysis — table unchanged ({num_rows} rows)")
         analysis = None
     else:
-        _log(f"running LLM deep analysis on {table_name}...")
+        _log(f"running LLM deep analysis on {table_name} (with {len(smart_samples)} diverse samples)...")
         analysis = _llm_deep_analysis(table_name, col_analyses, sample_rows)
         if analysis:
             _log(f"✓ deep analysis complete — purpose: {(analysis.get('table_purpose') or '')[:60]}")
@@ -3298,6 +3796,55 @@ def _rules_analyze_sheet(rows: list[list[str]], merged_cells: list = None) -> di
     if merged_cells:
         plan["has_merges"] = True
 
+    # Step 6: Multi-level header detection (2-3 rows of text that are headers)
+    if plan["action"] == "load" and len(rows) >= 4:
+        hdr = plan["header_row"]
+        # Check if rows hdr, hdr+1 (and optionally hdr+2) are all text-heavy (headers)
+        def _is_header_like(row):
+            non_empty = [v for v in row if v and str(v).strip()]
+            if not non_empty:
+                return False
+            text_count = sum(1 for v in non_empty if not re.match(r'^[\d.,\-+$€£¥%]+$', str(v).strip()))
+            return text_count >= len(non_empty) * 0.6
+
+        multi_level = 1
+        for offset in [1, 2]:
+            if hdr + offset < len(rows) and _is_header_like(rows[hdr + offset]):
+                # Check if the row after candidate headers has numeric data
+                data_row_idx = hdr + offset + 1
+                if data_row_idx < len(rows):
+                    data_row = rows[data_row_idx]
+                    nums = sum(1 for v in data_row if v and re.match(r'^[\d.,\-+$€£¥%]+$', str(v).strip()))
+                    if nums >= len([v for v in data_row if v and str(v).strip()]) * 0.3:
+                        multi_level = offset + 1
+                    else:
+                        break
+                else:
+                    break
+            else:
+                break
+
+        if multi_level >= 2:
+            plan["multi_level_header"] = multi_level
+            plan["header_rows"] = list(range(hdr, hdr + multi_level))
+            # Build flattened header: concatenate parent > child
+            flat_headers = []
+            max_cols = max(len(r) for r in rows[hdr:hdr + multi_level])
+            for ci in range(max_cols):
+                parts = []
+                for ri in range(hdr, hdr + multi_level):
+                    if ci < len(rows[ri]) and rows[ri][ci] and str(rows[ri][ci]).strip():
+                        parts.append(str(rows[ri][ci]).strip())
+                flat_headers.append("__".join(parts) if parts else f"col_{ci}")
+            plan["flat_headers"] = flat_headers
+            plan["data_start_row"] = hdr + multi_level
+            plan["confidence"] = max(plan["confidence"], 0.85)
+
+    # Step 7: Bold-based header/summary boost (if formatting info available)
+    # Bold rows in first 5 rows boost header confidence
+    # Bold rows with summary keywords boost skip confidence
+    # (formatting info passed via merged_cells metadata when available)
+
     return plan
 
 
@@ -3569,12 +4116,37 @@ def _handle_excel(file_path: str, filename: str) -> dict:
             import openpyxl
             # First pass: read merged cells (needs non-read-only mode)
             merged_info = {}
+            hidden_rows_info = {}  # sheet → set of hidden row numbers
+            hidden_cols_info = {}  # sheet → set of hidden column letters
+            comments_info = {}    # sheet → list of {row, col, text}
             try:
                 wb_full = openpyxl.load_workbook(file_path, data_only=True)
                 for sname in wb_full.sheetnames:
                     ws = wb_full[sname]
                     if ws.merged_cells.ranges:
                         merged_info[sname] = [str(r) for r in ws.merged_cells.ranges]
+                    # Hidden rows
+                    h_rows = set()
+                    for r_idx, rd in ws.row_dimensions.items():
+                        if rd.hidden:
+                            h_rows.add(r_idx)
+                    if h_rows:
+                        hidden_rows_info[sname] = h_rows
+                    # Hidden columns
+                    h_cols = set()
+                    for c_letter, cd in ws.column_dimensions.items():
+                        if cd.hidden:
+                            h_cols.add(c_letter)
+                    if h_cols:
+                        hidden_cols_info[sname] = h_cols
+                    # Cell comments (first 50 cells with comments)
+                    sheet_comments = []
+                    for row in ws.iter_rows(max_row=min(200, ws.max_row or 200)):
+                        for cell in row:
+                            if cell.comment and len(sheet_comments) < 50:
+                                sheet_comments.append({"row": cell.row, "col": cell.column, "text": str(cell.comment.text)[:200]})
+                    if sheet_comments:
+                        comments_info[sname] = sheet_comments
                 wb_full.close()
             except Exception:
                 pass
@@ -3588,7 +4160,33 @@ def _handle_excel(file_path: str, filename: str) -> dict:
                     if ri >= 25:
                         break
                     rows.append([str(v)[:60] if v is not None else "" for v in row[:15]])
-                sheet_previews[sname] = {"rows": rows, "max_row": ws.max_row, "max_col": ws.max_column, "merged_cells": merged_info.get(sname, [])}
+                # Filter out hidden rows from preview
+                h_rows = hidden_rows_info.get(sname, set())
+                if h_rows:
+                    rows = [r for i, r in enumerate(rows, 1) if i not in h_rows]
+
+                # Accurate row count: if max_row is suspiciously large, estimate actual data rows
+                reported_max = ws.max_row or 0
+                actual_max = reported_max
+                if reported_max > 10000:
+                    # Scan for actual last data row (ghost rows detection)
+                    actual_max = 0
+                    empty_streak = 0
+                    for ri, row in enumerate(ws.iter_rows(values_only=True)):
+                        vals = [v for v in row if v is not None and str(v).strip()]
+                        if vals:
+                            actual_max = ri + 1
+                            empty_streak = 0
+                        else:
+                            empty_streak += 1
+                        if empty_streak > 50:
+                            break
+                    if actual_max < reported_max:
+                        result["warnings"].append(f"Sheet '{sname}': Excel reports {reported_max:,} rows but only {actual_max:,} have data (ghost rows)")
+
+                sheet_previews[sname] = {"rows": rows, "max_row": actual_max, "max_col": ws.max_column, "merged_cells": merged_info.get(sname, []),
+                                         "hidden_rows": len(h_rows), "hidden_cols": len(hidden_cols_info.get(sname, set())), "comments": comments_info.get(sname, []),
+                                         "reported_max_row": reported_max}
             wb.close()
         elif ext == ".xls":
             import xlrd
@@ -3615,6 +4213,39 @@ def _handle_excel(file_path: str, filename: str) -> dict:
     if not sheet_names:
         result["warnings"].append("No sheets found in Excel file")
         return result
+
+    # Step 1.5: Multi-sheet similarity detection — find same-structure sheets for auto-concat
+    _similar_sheet_groups = {}  # group_id → [sheet_names]
+    if len(sheet_names) > 1:
+        sheet_cols = {}
+        for sname in sheet_names:
+            info = sheet_previews.get(sname, {})
+            rows = info.get("rows", [])
+            if rows and len(rows) > 1:
+                # Use first non-empty row as header proxy
+                hdr = [c.strip().lower() for c in rows[0] if c.strip()]
+                if hdr:
+                    sheet_cols[sname] = set(hdr)
+        # Jaccard similarity: >0.8 = same structure
+        matched = set()
+        group_id = 0
+        for s1 in sheet_cols:
+            if s1 in matched:
+                continue
+            group = [s1]
+            for s2 in sheet_cols:
+                if s2 == s1 or s2 in matched:
+                    continue
+                c1, c2 = sheet_cols[s1], sheet_cols[s2]
+                jaccard = len(c1 & c2) / len(c1 | c2) if (c1 | c2) else 0
+                if jaccard > 0.8:
+                    group.append(s2)
+                    matched.add(s2)
+            if len(group) > 1:
+                _similar_sheet_groups[group_id] = group
+                matched.update(group)
+                group_id += 1
+                result["warnings"].append(f"Sheets {group} have similar structure — will auto-concat")
 
     # Step 2: RULES ENGINE — deterministic structure detection (no LLM)
     file_slug = _sanitize_table_name(Path(filename).stem)
@@ -3652,7 +4283,33 @@ def _handle_excel(file_path: str, filename: str) -> dict:
             try:
                 hrow = plan.get("header_row", 0)
                 skip = plan.get("skip_rows", [])
-                df = pd.read_excel(file_path, sheet_name=sname, header=hrow, skiprows=[s for s in skip if s != hrow])
+
+                # Multi-level header: read with header=None, apply flattened headers
+                if plan.get("multi_level_header") and plan.get("flat_headers"):
+                    data_start = plan.get("data_start_row", hrow + plan["multi_level_header"])
+                    df = pd.read_excel(file_path, sheet_name=sname, header=None,
+                                       skiprows=list(range(0, data_start)) + [s for s in skip if s >= data_start])
+                    flat = plan["flat_headers"]
+                    if len(flat) == len(df.columns):
+                        df.columns = flat
+                    result["warnings"].append(f"Sheet '{sname}': flattened {plan['multi_level_header']}-level header")
+                else:
+                    # Large sheet protection: limit rows read to actual data (not ghost rows)
+                    sheet_info = sheet_previews.get(sname, {})
+                    actual_rows = sheet_info.get("max_row", 0)
+                    nrows_limit = min(actual_rows, 100000) if actual_rows > 0 else None  # Cap at 100K
+
+                    # Try calamine for speed (5-10x faster), fall back to openpyxl
+                    _excel_engine = 'calamine' if not plan.get("has_merges") else None
+                    try:
+                        df = pd.read_excel(file_path, sheet_name=sname, header=hrow,
+                                           skiprows=[s for s in skip if s != hrow],
+                                           nrows=nrows_limit,
+                                           engine=_excel_engine)
+                    except Exception:
+                        df = pd.read_excel(file_path, sheet_name=sname, header=hrow,
+                                           skiprows=[s for s in skip if s != hrow],
+                                           nrows=nrows_limit)
                 df = _clean_dataframe(df)
                 if len(df) == 0:
                     continue
@@ -3797,6 +4454,119 @@ def _handle_excel(file_path: str, filename: str) -> dict:
     if rules_processed > 0:
         result["warnings"].append(f"{rules_processed} sheet(s) processed by rules engine (no LLM, $0)")
 
+    # ── AI STRUCTURE VALIDATOR — runs on ALL tables, even those loaded by rules ──
+    # Catches: pivot tables loaded as wide (142 cols), wrong structure from confident rules
+    _ai_validated = []
+    for tbl in result["tables"]:
+        df = tbl.get("df")
+        if df is None or len(df) == 0:
+            _ai_validated.append(tbl)
+            continue
+
+        n_rows, n_cols = len(df), len(df.columns)
+        suspicious = False
+        sus_reason = ""
+
+        if n_cols > 30:
+            suspicious = True
+            sus_reason = f"wide table ({n_cols} cols)"
+        if n_cols > max(n_rows * 3, 20):
+            suspicious = True
+            sus_reason = f"cols ({n_cols}) >> rows ({n_rows})"
+
+        base_names = [re.sub(r'_\d+$', '', str(c)) for c in df.columns]
+        from collections import Counter as _Ctr
+        repeats = {name: count for name, count in _Ctr(base_names).items() if count >= 3 and name}
+        if repeats:
+            suspicious = True
+            sus_reason = f"repeating columns: {', '.join(f'{k}×{v}' for k, v in list(repeats.items())[:3])}"
+
+        if not suspicious:
+            _ai_validated.append(tbl)
+            continue
+
+        result["warnings"].append(f"Table '{tbl.get('name','')}': suspicious shape ({sus_reason}) — asking AI")
+        try:
+            from dash.settings import training_llm_call as _val_llm
+            col_sample = list(df.columns[:20])
+            repeat_info = ", ".join(f"{k} repeats {v} times" for k, v in repeats.items()) if repeats else "none"
+
+            val_prompt = f"""I loaded an Excel and got this DataFrame:
+Shape: {n_rows} rows × {n_cols} columns
+Suspicious: {sus_reason}
+First 20 columns: {col_sample}
+Repeating patterns: {repeat_info}
+
+Is this correct? Return ONLY JSON:
+If needs reshaping: {{"action": "unpivot", "reason": "brief", "id_columns": ["col1","col2"], "repeating_group": ["metric1","metric2"]}}
+If correct as-is: {{"action": "keep", "reason": "brief"}}"""
+
+            raw = _val_llm(val_prompt, "excel_analysis")
+            if raw:
+                clean = raw.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                if clean.startswith("json"):
+                    clean = clean[4:].strip()
+                val_result = json.loads(clean)
+
+                if val_result.get("action") == "unpivot":
+                    id_cols = val_result.get("id_columns", [])
+                    id_existing = [c for c in id_cols if c in df.columns]
+                    if not id_existing:
+                        id_existing = [c for c in df.columns if base_names[list(df.columns).index(c)] not in repeats]
+
+                    value_cols = [c for c in df.columns if c not in id_existing]
+
+                    if value_cols and id_existing:
+                        df_long = pd.melt(df, id_vars=id_existing, value_vars=value_cols, var_name='metric_period', value_name='value')
+                        df_long = df_long.dropna(subset=['value'])
+
+                        # Split metric_period into metric + period index
+                        if repeats:
+                            def _parse_col(col_name):
+                                base = re.sub(r'_\d+$', '', str(col_name))
+                                suffix = re.search(r'_(\d+)$', str(col_name))
+                                return base, int(suffix.group(1)) if suffix else 0
+                            df_long['_metric'] = df_long['metric_period'].apply(lambda x: _parse_col(x)[0])
+                            df_long['_period_idx'] = df_long['metric_period'].apply(lambda x: _parse_col(x)[1])
+                            try:
+                                df_pivoted = df_long.pivot_table(index=id_existing + ['_period_idx'], columns='_metric', values='value', aggfunc='first').reset_index()
+                                df_pivoted.columns = [str(c) for c in df_pivoted.columns]
+                                if len(df_pivoted) > 0 and len(df_pivoted.columns) < n_cols:
+                                    df_long = df_pivoted
+                            except Exception:
+                                pass
+
+                        df_long = _clean_dataframe(df_long)
+                        tbl["df"] = df_long
+                        tbl["source"] = tbl.get("source", "") + " [ai-unpivot]"
+                        tbl["description"] = f"AI restructured: {n_rows}×{n_cols} → {len(df_long)}×{len(df_long.columns)} ({val_result.get('reason','')})"
+                        result["warnings"].append(f"AI Validator: unpivoted '{tbl.get('name','')}' from {n_cols} → {len(df_long.columns)} cols")
+
+                        # Save learning
+                        try:
+                            from sqlalchemy import text as _slt
+                            from db import get_sql_engine as _sle
+                            _eng = _sle()
+                            with _eng.connect() as _lc:
+                                _lc.execute(_slt(
+                                    "INSERT INTO public.dash_memories (project_slug, content, source, category) "
+                                    "VALUES ('_global', :content, 'structure_learning', 'data_pattern') "
+                                    "ON CONFLICT DO NOTHING"
+                                ), {"content": f"Excel pattern: repeating column groups ({repeat_info}) = pivot table. Auto-unpivot applied. Source: {tbl.get('name','')}"})
+                                _lc.commit()
+                        except Exception:
+                            pass
+                else:
+                    result["warnings"].append(f"AI Validator: '{tbl.get('name','')}' is correct (wide format)")
+        except Exception as e:
+            result["warnings"].append(f"AI Validator error: {str(e)[:100]}")
+
+        _ai_validated.append(tbl)
+
+    result["tables"] = _ai_validated
+
     # LLM PATH: Only for uncertain sheets (low confidence or unpivot)
     ai_sheet_names = list(set(needs_llm))
     if not ai_sheet_names:
@@ -3815,9 +4585,22 @@ def _handle_excel(file_path: str, filename: str) -> dict:
             info = sheet_previews[sname]
             merged = info.get("merged_cells", [])
             merged_note = f" | Merged cells: {', '.join(merged[:10])}" if merged else ""
-            preview_text += f"\n\nSheet: '{sname}' ({info['max_row']} rows × {info['max_col']} cols{merged_note})\n"
-            for ri, row in enumerate(info["rows"][:max_preview_rows]):
-                preview_text += f"  Row {ri}: {row}\n"
+            hidden_note = f" | Hidden: {info.get('hidden_rows', 0)} rows, {info.get('hidden_cols', 0)} cols" if info.get("hidden_rows") or info.get("hidden_cols") else ""
+            comments_note = f" | {len(info.get('comments', []))} cell comments" if info.get("comments") else ""
+            preview_text += f"\n\nSheet: '{sname}' ({info['max_row']} rows × {info['max_col']} cols{merged_note}{hidden_note}{comments_note})\n"
+
+            # SheetCompressor: deduplicate repeated values, compress sparse rows
+            rows_data = info["rows"][:max_preview_rows]
+            for ri, row in enumerate(rows_data):
+                # Compress: skip fully empty rows, collapse repeated values
+                non_empty = [(ci, v) for ci, v in enumerate(row) if v and str(v).strip()]
+                if not non_empty:
+                    continue  # Skip blank rows entirely (saves tokens)
+                # If row is sparse (>60% empty), use inverse index format
+                if len(non_empty) < len(row) * 0.4 and len(row) > 5:
+                    preview_text += f"  Row {ri}: {{{', '.join(f'{ci}:{v}' for ci, v in non_empty)}}}\n"
+                else:
+                    preview_text += f"  Row {ri}: {row}\n"
 
         prompt = f"""Analyze {len(ai_sheet_names)} messy Excel sheets that need intelligent processing. For each sheet I show the first rows as raw cell values. Empty cells are ''.
 
@@ -4160,6 +4943,29 @@ Return ONLY a JSON object mapping each period to its date:
                 result["tables"].append({"name": tname, "df": df, "source": str(sname), "sheet_number": sheet_idx, "description": ""})
         except Exception as e:
             result["errors"].append(f"Fallback read all sheets failed: {e}")
+
+    # ── AUTO-CONCAT similar sheets ────────────────────────────────────
+    if _similar_sheet_groups:
+        for gid, group_sheets in _similar_sheet_groups.items():
+            # Find tables from these sheets
+            group_tables = [t for t in result["tables"] if any(s in str(t.get("source", "")) for s in group_sheets)]
+            if len(group_tables) >= 2:
+                # Check column overlap in actual DataFrames
+                ref_cols = set(group_tables[0]["df"].columns)
+                compatible = [group_tables[0]]
+                for gt in group_tables[1:]:
+                    overlap = len(ref_cols & set(gt["df"].columns)) / max(len(ref_cols | set(gt["df"].columns)), 1)
+                    if overlap > 0.8:
+                        compatible.append(gt)
+                if len(compatible) >= 2:
+                    merged_df = pd.concat([t["df"].assign(_source_sheet=t.get("source", "")) for t in compatible], ignore_index=True)
+                    merged_name = compatible[0]["name"]
+                    # Remove individual tables, add merged
+                    for t in compatible:
+                        if t in result["tables"]:
+                            result["tables"].remove(t)
+                    result["tables"].append({"name": merged_name, "df": merged_df, "source": f"merged:{','.join(group_sheets)}", "description": f"Auto-merged {len(compatible)} similar sheets"})
+                    result["warnings"].append(f"Merged {len(compatible)} sheets into '{merged_name}' ({len(merged_df)} rows)")
 
     # ── LAYER 3+4: Validate → Auto-fix → Vision fallback ──────────────
     # Run on all extracted tables — catch subtotals, bad headers, high NaN
@@ -4668,6 +5474,137 @@ def _handle_text(file_path: str, filename: str, raw_content: bytes = b"") -> dic
     return result
 
 
+def _handle_parquet(file_path: str, filename: str) -> dict:
+    """Handle Parquet file — fastest columnar format."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        df = pd.read_parquet(file_path)
+        df = _clean_dataframe(df)
+        tname = _sanitize_table_name(Path(filename).stem)
+        result["tables"].append({"name": tname, "df": df, "source": "parquet"})
+        result["warnings"].append(f"Parquet: {len(df)} rows × {len(df.columns)} cols")
+    except Exception as e:
+        result["errors"].append(f"Parquet read failed: {e}")
+    return result
+
+
+def _handle_ods(file_path: str, filename: str) -> dict:
+    """Handle ODS (LibreOffice/OpenDocument Spreadsheet)."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        sheets = pd.read_excel(file_path, engine='odf', sheet_name=None)
+        for sname, df in sheets.items():
+            df = _clean_dataframe(df)
+            if len(df) > 0:
+                tname = f"{_sanitize_table_name(Path(filename).stem)}_{_sanitize_table_name(str(sname))}" if len(sheets) > 1 else _sanitize_table_name(Path(filename).stem)
+                result["tables"].append({"name": tname, "df": df, "source": f"{sname} [ods]"})
+    except Exception as e:
+        result["errors"].append(f"ODS read failed: {e}")
+    return result
+
+
+def _handle_xml(file_path: str, filename: str) -> dict:
+    """Handle XML data files."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        df = pd.read_xml(file_path)
+        df = _clean_dataframe(df)
+        tname = _sanitize_table_name(Path(filename).stem)
+        result["tables"].append({"name": tname, "df": df, "source": "xml"})
+    except Exception:
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                result["text"] = f.read()
+        except Exception as e:
+            result["errors"].append(f"XML read failed: {e}")
+    return result
+
+
+def _handle_html_file(file_path: str, filename: str) -> dict:
+    """Handle HTML files — extract tables + text."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    try:
+        tables = pd.read_html(file_path)
+        for i, df in enumerate(tables[:10]):
+            df = _clean_dataframe(df)
+            if len(df) > 0 and len(df.columns) > 1:
+                tname = f"{_sanitize_table_name(Path(filename).stem)}_table{i+1}" if len(tables) > 1 else _sanitize_table_name(Path(filename).stem)
+                result["tables"].append({"name": tname, "df": df, "source": f"html_table_{i+1}"})
+    except Exception:
+        pass
+    try:
+        from html.parser import HTMLParser
+        class _TextExtractor(HTMLParser):
+            def __init__(self): super().__init__(); self.parts = []
+            def handle_data(self, d):
+                if d.strip(): self.parts.append(d.strip())
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            p = _TextExtractor(); p.feed(f.read())
+            result["text"] = "\n".join(p.parts)
+    except Exception:
+        pass
+    return result
+
+
+def _handle_zip(file_path: str, filename: str) -> dict:
+    """Handle ZIP archives — extract and process each file inside."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    import zipfile, tempfile
+    try:
+        with zipfile.ZipFile(file_path, 'r') as zf:
+            members = [m for m in zf.namelist() if not m.startswith('__MACOSX') and not m.startswith('.')]
+            result["warnings"].append(f"ZIP: {len(members)} files inside")
+            for member in members[:20]:
+                ext = Path(member).suffix.lower()
+                if ext not in ('.csv', '.xlsx', '.xls', '.json', '.xml', '.parquet', '.txt', '.md', '.pdf', '.docx', '.pptx', '.html', '.htm', '.ods'):
+                    continue
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                        tmp.write(zf.read(member))
+                        tmp_path = tmp.name
+                    if ext == '.csv': sub = _handle_csv(tmp_path, member)
+                    elif ext in ('.xlsx', '.xls'): sub = _handle_excel(tmp_path, member)
+                    elif ext == '.json': sub = _handle_json(tmp_path, member)
+                    elif ext == '.xml': sub = _handle_xml(tmp_path, member)
+                    elif ext == '.parquet': sub = _handle_parquet(tmp_path, member)
+                    elif ext == '.ods': sub = _handle_ods(tmp_path, member)
+                    elif ext in ('.html', '.htm'): sub = _handle_html_file(tmp_path, member)
+                    elif ext in ('.txt', '.md'): sub = _handle_text(tmp_path, member)
+                    elif ext == '.pdf': sub = _handle_pdf(tmp_path, member)
+                    elif ext == '.pptx': sub = _handle_pptx(tmp_path, member)
+                    elif ext == '.docx': sub = _handle_docx(tmp_path, member)
+                    else: continue
+                    for t in sub.get("tables", []):
+                        t["source"] = f"zip:{member} → {t.get('source', '')}"
+                        result["tables"].append(t)
+                    if sub.get("text"):
+                        result["text"] += f"\n\n--- {member} ---\n{sub['text']}"
+                    result["images"].extend(sub.get("images", []))
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception as e:
+                    result["warnings"].append(f"ZIP: failed {member}: {str(e)[:60]}")
+    except Exception as e:
+        result["errors"].append(f"ZIP failed: {e}")
+    return result
+
+
+def _handle_email(file_path: str, filename: str) -> dict:
+    """Handle email files (.eml) — extract body text."""
+    result = {"tables": [], "text": "", "images": [], "metadata": {}, "errors": [], "warnings": []}
+    import email as _email_mod
+    try:
+        with open(file_path, 'rb') as f:
+            msg = _email_mod.message_from_bytes(f.read())
+        body_parts = []
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                body_parts.append(part.get_payload(decode=True).decode('utf-8', errors='ignore'))
+        result["text"] = f"Email: {msg.get('subject','')}\nFrom: {msg.get('from','')}\nDate: {msg.get('date','')}\n\n" + "\n".join(body_parts)
+    except Exception as e:
+        result["errors"].append(f"Email read failed: {e}")
+    return result
+
+
 def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_content: bytes = b"", _progress=None) -> dict:
     """Upload Conductor — routes to handler, runs vision on images, returns unified result."""
     if not _progress:
@@ -4676,6 +5613,8 @@ def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_c
     # Determine handler name for progress
     handler_map = {
         ".xlsx": "Parser", ".xls": "Parser", ".csv": "Parser", ".json": "Parser",
+        ".parquet": "Parser", ".ods": "Parser", ".xml": "Parser",
+        ".html": "Scanner", ".htm": "Scanner", ".eml": "Scanner", ".zip": "Parser",
         ".pdf": "Scanner", ".pptx": "Scanner", ".docx": "Scanner",
         ".txt": "Scanner", ".md": "Scanner", ".sql": "Scanner", ".py": "Scanner",
         ".jpg": "Vision", ".jpeg": "Vision", ".png": "Vision",
@@ -4716,6 +5655,30 @@ def _conduct_upload(file_path: str, ext: str, project: str, filename: str, raw_c
         _progress("Parser", "JSON parsing", "reading structure...")
         result = _handle_json(file_path, filename)
         _progress("Parser", "JSON parsing", f"done — {len(result.get('tables', []))} tables")
+    elif ext == ".parquet":
+        _progress("Parser", "Parquet loading", "reading columnar data...")
+        result = _handle_parquet(file_path, filename)
+        _progress("Parser", "Parquet loading", f"done — {len(result.get('tables', []))} tables")
+    elif ext == ".ods":
+        _progress("Parser", "ODS loading", "reading LibreOffice spreadsheet...")
+        result = _handle_ods(file_path, filename)
+        _progress("Parser", "ODS loading", f"done — {len(result.get('tables', []))} tables")
+    elif ext == ".xml":
+        _progress("Parser", "XML parsing", "reading structured data...")
+        result = _handle_xml(file_path, filename)
+        _progress("Parser", "XML parsing", f"done — {len(result.get('tables', []))} tables")
+    elif ext in (".html", ".htm"):
+        _progress("Scanner", "HTML parsing", "extracting tables and text...")
+        result = _handle_html_file(file_path, filename)
+        _progress("Scanner", "HTML parsing", f"done — {len(result.get('tables', []))} tables, {len(result.get('text', '')):,} chars")
+    elif ext == ".zip":
+        _progress("Parser", "ZIP extraction", "extracting and processing files...")
+        result = _handle_zip(file_path, filename)
+        _progress("Parser", "ZIP extraction", f"done — {len(result.get('tables', []))} tables from archive")
+    elif ext == ".eml":
+        _progress("Scanner", "Email parsing", "reading email content...")
+        result = _handle_email(file_path, filename)
+        _progress("Scanner", "Email parsing", f"done — {len(result.get('text', '')):,} chars")
     elif ext in (".txt", ".md", ".sql", ".py"):
         _progress("Scanner", "Text extraction", "reading content...")
         result = _handle_text(file_path, filename, raw_content)
@@ -5442,7 +6405,7 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
         content = b''  # Don't hold file content in memory
 
     # Smart routing for non-data files (SQL, MD, TXT, DOCX, PPTX, PDF, images)
-    if ext in (".sql", ".md", ".txt", ".docx", ".pptx", ".pdf", ".jpg", ".jpeg", ".png") and project:
+    if ext in (".sql", ".md", ".txt", ".docx", ".pptx", ".pdf", ".jpg", ".jpeg", ".png", ".html", ".htm", ".eml", ".xml") and project:
         try:
             conductor_result = _conduct_upload(tmp_path, ext, project, file.filename, raw_content=content)
             text_content = conductor_result.get("text", "")
@@ -5476,6 +6439,37 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                 save_name = Path(file.filename).stem + ".txt" if ext in (".pptx", ".docx", ".pdf") else file.filename
                 with open(doc_dir / save_name, "w") as f:
                     f.write(text_content)
+                # Extract document structure (TOC, headings, sections)
+                doc_structure = _extract_document_structure(tmp_path, ext, text_content)
+                if doc_structure.get("sections"):
+                    # Save structure for agent reference
+                    struct_dir = KNOWLEDGE_DIR / project / "doc_structure"
+                    struct_dir.mkdir(parents=True, exist_ok=True)
+                    _safe_write_json(struct_dir / f"{Path(file.filename).stem}.json", doc_structure)
+
+                # Section-aware chunking (respects heading boundaries)
+                section_chunks = _section_aware_chunks(text_content, doc_structure)
+
+                # Hierarchical summarization for big docs (5+ sections)
+                doc_summaries = {}
+                if len(doc_structure.get("sections", [])) >= 5:
+                    doc_summaries = _hierarchical_summarize(section_chunks, file.filename)
+                    if doc_summaries.get("doc_summary"):
+                        # Save summaries
+                        summary_dir = KNOWLEDGE_DIR / project / "doc_summaries"
+                        summary_dir.mkdir(parents=True, exist_ok=True)
+                        _safe_write_json(summary_dir / f"{Path(file.filename).stem}.json", doc_summaries)
+
+                # Build enriched text with section markers + page citations
+                enriched_parts = []
+                if doc_summaries.get("doc_summary"):
+                    enriched_parts.append(f"DOCUMENT SUMMARY: {doc_summaries['doc_summary']}\n")
+                for chunk in section_chunks:
+                    page_ref = f" [Page {chunk['page']}]" if chunk.get("page") else ""
+                    section_ref = f" [Section: {chunk['section']}]" if chunk.get("section") else ""
+                    enriched_parts.append(f"{section_ref}{page_ref}\n{chunk['text']}")
+                enriched_text = "\n\n".join(enriched_parts)
+
                 # Index into project knowledge base
                 indexed = False
                 if text_content.strip():
@@ -5483,9 +6477,11 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                         from agno.knowledge.reader.text_reader import TextReader
                         from db.session import create_project_knowledge
                         knowledge = create_project_knowledge(project)
+                        # Use enriched text with section markers instead of raw text
+                        index_text = enriched_text[:15000] if enriched_text else text_content[:10000]
                         knowledge.insert(
                             name=f"doc-{Path(file.filename).stem}",
-                            text_content=f"Document: {file.filename}\n\n{text_content[:10000]}",
+                            text_content=f"Document: {file.filename}\n\n{index_text}",
                             reader=TextReader(),
                             skip_if_exists=False,
                         )
@@ -5524,9 +6520,16 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
 
     try:
         # Excel multi-sheet: use AI handler for .xlsx/.xls
-        if ext in (".xlsx", ".xls") and not table_name:
-            excel_result = _handle_excel(tmp_path, file.filename)
-            if excel_result.get("tables") and len(excel_result["tables"]) > 1:
+        if ext in (".xlsx", ".xls", ".parquet", ".ods", ".zip") and not table_name:
+            if ext == ".parquet":
+                excel_result = _handle_parquet(tmp_path, file.filename)
+            elif ext == ".ods":
+                excel_result = _handle_ods(tmp_path, file.filename)
+            elif ext == ".zip":
+                excel_result = _handle_zip(tmp_path, file.filename)
+            else:
+                excel_result = _handle_excel(tmp_path, file.filename)
+            if excel_result.get("tables") and len(excel_result["tables"]) >= 1:
                 # Multi-sheet Excel — create each sheet as its own table
                 proj_schema = _get_project_schema(request, project)
                 if proj_schema:
@@ -5545,6 +6548,9 @@ async def upload_file(request: Request, file: UploadFile, table_name: str | None
                     if df.empty or len(df.columns) == 0:
                         continue
                     tbl_name = _sanitize_table_name(tbl_info["name"])
+                    # Add source tracking columns
+                    df["_source_file"] = file.filename
+                    df["_source_sheet"] = str(tbl_info.get("source", ""))
                     try:
                         df.to_sql(tbl_name, engine, schema=user_schema, if_exists='replace', index=False)
                         tables_created.append({"table": tbl_name, "rows": len(df), "cols": len(df.columns), "source": tbl_info.get("source", ""), "sheet_number": tbl_info.get("sheet_number", 0), "description": tbl_info.get("description", "")})
@@ -6605,6 +7611,40 @@ def list_tables():
                 tables.append({"name": tbl, "rows": 0, "columns": 0, "protected": tbl in PROTECTED_TABLES})
 
     return {"tables": tables}
+
+
+@router.get("/tables/{table_name}/download")
+def download_table(table_name: str, request: Request, format: str = "csv", project: str | None = None):
+    """Download a table as CSV or Excel. Usage: /api/tables/my_table/download?format=csv&project=my_project"""
+    from fastapi.responses import StreamingResponse
+    import io
+
+    # Determine schema
+    if project:
+        schema = re.sub(r"[^a-z0-9_]", "_", project.lower())[:63]
+    else:
+        schema = "public"
+
+    try:
+        eng = create_engine(db_url)
+        qualified = f'"{schema}"."{table_name}"'
+        df = pd.read_sql(f"SELECT * FROM {qualified}", eng)
+        eng.dispose()
+    except Exception as e:
+        raise HTTPException(404, f"Table not found: {e}")
+
+    if format == "excel" or format == "xlsx":
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False, sheet_name=table_name[:31])
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 headers={"Content-Disposition": f'attachment; filename="{table_name}.xlsx"'})
+    else:
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
+        buf.seek(0)
+        return StreamingResponse(io.BytesIO(buf.getvalue().encode()), media_type="text/csv",
+                                 headers={"Content-Disposition": f'attachment; filename="{table_name}.csv"'})
 
 
 _SCHEDULES_FILE = KNOWLEDGE_DIR / "schedules.json"

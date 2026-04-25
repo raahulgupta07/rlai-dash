@@ -22,7 +22,7 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **HTML Slide Deck Download** -- interactive HTML slide decks for offline viewing
 - **Presentations Tab** -- save, version, and recall slide decks within projects
 - **Document Table Extraction** -- tables embedded in PPTX, PDF, and DOCX files are extracted and loaded into PostgreSQL
-- **18 File Format Support** -- CSV, Excel (multi-sheet AI), JSON, SQL, PPTX (speaker notes), DOCX (headers/footers), PDF (scanned OCR + diagram detection), JPG, PNG, TIFF, BMP, GIF, WEBP, MD, TXT, PY + auto encoding detection
+- **24 File Format Support** -- CSV, Excel (multi-sheet AI), JSON, SQL, PPTX (speaker notes), DOCX (headers/footers), PDF (scanned OCR + diagram detection), JPG, PNG, TIFF, BMP, GIF, WEBP, MD, TXT, PY, Parquet, ODS, XML, HTML, ZIP, EML + auto encoding detection
 - **Proactive Insights** -- collapsible insight cards with anomaly detection after each chat
 - **INSIGHT Tab** -- badge parsing with MODE, ANALYSIS, UP/DOWN/FLAT trends, and RISK indicators
 - **Icon Picker** -- SVG Lucide icons selectable on project cards
@@ -71,7 +71,7 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **PPTX Slide Rendering for Vision** -- image-only slides composited into full images for Vision LLM analysis
 - **Semantic Search Layer** -- unified search across PgVector KB, Company Brain, Knowledge Graph, and Grounded Facts with Cohere reranking. `search_all` tool on Analyst. 3-tier rerank cascade. 67% fewer retrieval failures
 - **Gemini Embedding 2** -- upgraded to `google/gemini-embedding-2-preview` (MTEB ~68, +35% vs OpenAI). 4-model auto-cascade via OpenRouter. `EMBEDDING_MODEL` env var. Model change detection
-- **Excel Self-Correction** -- 5-layer extraction: rules → LLM plan → validate+autofix → deep cell extraction → vision fallback. Quality scoring per table
+- **Excel Self-Correction** -- 5-layer extraction: rules → LLM plan → validate+autofix → deep cell extraction → vision fallback. Quality scoring per table. Plus: currency/comma/% stripping, multi-level header flatten, hidden row/column filter, multi-sheet similarity detection, cell comments, SheetCompressor, Calamine fast path, ghost row detection, AI structure validator
 - **Project-Scoped Brain** -- 3-layer brain (Global → Project → Personal). Project entries override global. Scope filter UI in brain page
 - **Contextual Chunk Enrichment** -- Anthropic's Contextual Retrieval: LLM adds document context to each chunk before embedding. -49% retrieval failures
 - **SHAP Explanations** -- Per-row feature impact explanations via TreeExplainer. Shows which features pushed each prediction up/down
@@ -97,6 +97,19 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Leader Stuck-Agent Detection** -- auto-escalates: "zero rows" → Engineer introspect_schema, "ML question" from Analyst → re-route to Data Scientist, same error 2x → try different agent
 - **Discover Tables Tool** -- introspect_schema renamed to discover_tables for Data Scientist. Instructions say "call FIRST before choosing ML tool"
 - **Cluster Calinski-Harabasz** -- cluster tool reports Calinski-Harabasz score alongside Silhouette for better cluster quality evaluation
+- **Excel Pipeline Improvements** -- currency/comma/% stripping, multi-level header flatten (2-3 rows → "Region__East__Revenue"), hidden row/column filter, multi-sheet similarity detection (Jaccard >0.8 → auto-concat), cell comments extraction, SheetCompressor (~50% token reduction), Calamine fast path (5-10x faster), ghost row detection, row cap (100K), AI structure validator (auto-unpivot wide→long), source tracking columns (_source_file, _source_sheet), single-sheet pipeline fix
+- **6 New File Formats (18→24)** -- Parquet (pd.read_parquet), ODS (pd.read_excel engine='odf'), XML (pd.read_xml), HTML (pd.read_html for tables + text), ZIP (extract + recursive process, max 20 files), Email .eml (subject/from/date + body)
+- **SQL Profiling** -- _sql_profile_columns() profiles ALL columns via PostgreSQL queries (COUNT, DISTINCT, MIN, MAX, AVG, STDDEV, percentiles). Classifies dimension/measure/id. Zero RAM
+- **Dimension Catalog** -- _build_dimension_catalog() runs SELECT DISTINCT + COUNT for categorical columns (unique < 500). Saves values + frequencies to knowledge/{slug}/dimensions/{table}.json
+- **Hierarchy Detection** -- _detect_hierarchies() finds parent-child relationships between dimension columns (every child maps to 1 parent → hierarchy)
+- **Smart Sampling** -- _smart_sample_rows() gets 20 diverse rows: 3 start + 3 middle + 3 end + outlier rows + null pattern rows. Replaces first 8 rows
+- **Dimension Injection** -- Analyst semantic model includes dimension values, column classifications (dimension/measure), and hierarchies for every table
+- **Document Structure Extraction** -- TOC/headings extracted from PDF (pymupdf), PPTX (slide titles), DOCX (heading styles), MD (# headers). Saved as doc_structure/{name}.json
+- **Section-Aware Chunking** -- splits text at heading boundaries, each chunk tagged with {section, page, heading_path} for better retrieval accuracy
+- **Hierarchical Summarization** -- docs with 5+ sections: summarize each section then summarize summaries. 77% cheaper than enriching every chunk
+- **Page Citations** -- enriched text includes [Section: X] [Page Y] markers so agent can cite specific pages
+- **Table Download API** -- GET /api/tables/{name}/download for CSV or Excel export with source tracking columns. UI buttons on Settings → DATASETS
+- **Architecture Page** -- GET /api/architecture returns full system info (AI models, live metrics, security, agents, ML tools, knowledge layers). Command Center ARCHITECTURE tab: interactive ECharts flow diagram (35 nodes, 30+ edges, 8 categories) with hover tooltips, drag/zoom, detailed component cards
 
 ## Fresh Install
 
@@ -320,18 +333,25 @@ db/                     # Database (PostgreSQL + PgVector, 35+ tables)
 
 ## Training Pipeline
 
-When a user uploads data or triggers a retrain, the system runs a 10-step pipeline:
+When a user uploads data or triggers a retrain, the system runs a 17-step pipeline:
 
-1. **Column Analysis** -- profile every column (types, cardinality, nulls)
-2. **Codex-Enriched Knowledge** -- LLM extracts purpose, grain, PKs, FKs, usage patterns, freshness per table
-3. **Q&A Generation** -- LLM creates question-answer pairs for evaluation
-4. **Auto Rules** -- extract business rules from data patterns
-5. **Persona Creation** -- LLM generates a domain-specific agent persona
-6. **Multi-File Synthesis** -- unified understanding across all uploaded files
-7. **Relationship Discovery** -- LLM finds hidden joins and foreign keys
-8. **Workflow Generation** -- auto-create analysis workflows
-9. **Schedule Generation** -- suggest recurring report schedules
-10. **PgVector Re-index** -- embed all knowledge for semantic retrieval
+1. **Drift Check** -- detect schema/data changes from previous training
+2. **SQL Profiling** -- profile ALL columns via PostgreSQL (COUNT, DISTINCT, MIN, MAX, AVG, STDDEV, percentiles). Classify dimension/measure/id. Zero RAM
+3. **Dimension Catalog** -- SELECT DISTINCT + COUNT for categorical columns (unique < 500). Save values + frequencies
+4. **Hierarchy Detection** -- find parent-child relationships between dimension columns
+5. **Smart Sampling** -- 20 diverse rows (start + middle + end + outliers + null patterns)
+6. **Deep Analysis** -- LLM column analysis, Codex-enriched knowledge, dimension injection
+7. **Q&A Generation** -- LLM creates question-answer pairs for evaluation
+8. **Persona Creation** -- LLM generates a domain-specific agent persona
+9. **Workflows + Synthesis** -- auto workflows, multi-file synthesis
+10. **Relationship Discovery** -- LLM finds hidden joins and foreign keys
+11. **PgVector Re-index** -- embed all knowledge for semantic retrieval
+12. **Brain Fill** -- populate agent memory layers (7 sub-steps)
+13. **Domain Knowledge** -- glossary, calculations, value mappings, KPIs, data quality, negative examples
+14. **AI Seed** -- bad feedback, insights, drift baseline, evolution
+15. **Persona Enrich** -- re-generates persona with domain knowledge
+16. **LangExtract** -- grounded fact extraction (KPIs, metrics, decisions, risks with source positions)
+17. **Knowledge Graph** -- SPO triple extraction, entity standardization, cross-source inference
 
 Training runs are tracked with success/fail status and duration.
 
@@ -390,6 +410,12 @@ Thirteen context layers are injected into the analyst prompt on every query:
 - **DOCX** -- text + tables + images + headers/footers (vision-described)
 - **PDF** -- text + tables + images. Scanned pages: Tesseract OCR. Diagrams/flowcharts: auto-detected + Vision describes full flow
 - **JPG, JPEG, PNG, TIFF, BMP, GIF, WEBP** -- Tesseract OCR + Vision description, EXIF auto-rotation, all formats converted to PNG
+- **Parquet** -- fastest columnar format (pd.read_parquet)
+- **ODS** -- LibreOffice/OpenDocument spreadsheets (pd.read_excel engine='odf')
+- **XML** -- pd.read_xml(), fallback to text indexing
+- **HTML** -- pd.read_html() for tables + text extraction
+- **ZIP** -- extract and recursively process each file inside (max 20 files)
+- **EML** -- email files: subject, from, date + body text extraction
 - **SQL** -- query patterns
 - **MD, TXT, PY** -- knowledge base
 

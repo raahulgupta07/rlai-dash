@@ -1543,7 +1543,7 @@
       </div>
     </div>
 
-    <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf,.jpg,.jpeg,.png,.tiff,.bmp,.gif,.webp" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
+    <input type="file" accept=".csv,.xlsx,.xls,.json,.sql,.md,.txt,.py,.pptx,.docx,.pdf,.jpg,.jpeg,.png,.tiff,.bmp,.gif,.webp,.parquet,.ods,.xml,.html,.htm,.zip,.eml" multiple onchange={(e) => { const files = (e.target as HTMLInputElement).files; if (files && files.length > 0) { showUpload = true; files.length === 1 ? setFile(files[0]) : setFiles(files); } }} bind:this={fileInputEl} style="display: none;" />
 
     <!-- Drop zone + Select button -->
     {#if canEdit}
@@ -2014,14 +2014,14 @@
                 <div class="flex gap-2" style="padding-top: 10px; border-top: 1px solid var(--color-surface-dim);">
                   <button class="feedback-btn" style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px; {trainingTable === t.name ? 'opacity: 0.5;' : ''}" onclick={() => trainTable(t.name)} disabled={!!trainingTable}>{isTrained ? 'RETRAIN' : 'TRAIN'}</button>
                   <button class="feedback-btn" style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;" onclick={() => openInspect(t)}>FULL INSPECT</button>
-                  {#if inspData?.sample?.length}
-                    <button class="feedback-btn" style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;" onclick={() => {
-                      const headers = Object.keys(inspData.sample[0] || {});
-                      const csv = [headers.join(','), ...inspData.sample.map((r: any) => headers.map(h => JSON.stringify(r[h] ?? '')).join(','))].join('\n');
-                      const blob = new Blob([csv], { type: 'text/csv' });
-                      const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `${t.name}.csv`; a.click(); URL.revokeObjectURL(url);
-                    }}>EXPORT CSV</button>
-                  {/if}
+                  <button class="feedback-btn" style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;" onclick={async () => {
+                    const r = await fetch(`/api/tables/${t.name}/download?format=csv&project=${slug}`, { headers: _h() });
+                    if (r.ok) { const blob = await r.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `${t.name}.csv`; a.click(); URL.revokeObjectURL(url); }
+                  }}>CSV</button>
+                  <button class="feedback-btn" style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 4px 10px;" onclick={async () => {
+                    const r = await fetch(`/api/tables/${t.name}/download?format=excel&project=${slug}`, { headers: _h() });
+                    if (r.ok) { const blob = await r.blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `${t.name}.xlsx`; a.click(); URL.revokeObjectURL(url); }
+                  }}>EXCEL</button>
                 </div>
               </div>
             {/if}

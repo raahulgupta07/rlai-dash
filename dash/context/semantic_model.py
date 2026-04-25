@@ -94,6 +94,25 @@ def format_semantic_model(model: dict[str, Any]) -> str:
             lines.append("**Data quality:**")
             for note in table["data_quality_notes"]:
                 lines.append(f"  - {note}")
+        # Dimension values — exact values for WHERE clauses
+        if table.get("dimensions"):
+            lines.append("**DIMENSION VALUES (use exact case in WHERE):**")
+            for col, vals in table["dimensions"].items():
+                if isinstance(vals, list) and vals:
+                    val_str = ", ".join(f"{v['value']}({v['pct']}%)" if isinstance(v, dict) else str(v) for v in vals[:15])
+                    lines.append(f"  - `{col}`: {val_str}")
+        # Column profiles — type classification
+        if table.get("column_profiles"):
+            dim_cols = [n for n, p in table["column_profiles"].items() if p.get("classification") == "dimension"]
+            meas_cols = [n for n, p in table["column_profiles"].items() if p.get("classification") == "measure"]
+            if dim_cols:
+                lines.append(f"**Dimensions (GROUP BY):** {', '.join(dim_cols)}")
+            if meas_cols:
+                lines.append(f"**Measures (SUM/AVG):** {', '.join(meas_cols)}")
+        # Hierarchies
+        if table.get("hierarchies"):
+            hier_strs = [f"{h['parent']}({h['parent_count']}) → {h['child']}({h['child_count']})" for h in table["hierarchies"]]
+            lines.append(f"**Hierarchies (drill-down):** {', '.join(hier_strs)}")
         lines.append("")
 
     return "\n".join(lines).rstrip()
