@@ -8,6 +8,9 @@ Dash is a **production-ready, multi-tenant, self-learning data notebook** — li
 
 ```
 App (8 workers) → PgBouncer (transaction pooling, NullPool) → PostgreSQL 18
+                                                              ↑
+ML Worker (dash-ml, 1GB cap) ─────────────────────────────────┘
+4 containers: dash-app, dash-pgbouncer, dash-db, dash-ml
 ```
 
 ## Connection Architecture (Production-Hardened)
@@ -57,7 +60,8 @@ dash/
 │   ├── analyst.py         # Analyst (read-only SQL, reasoning, self-correction loop)
 │   ├── engineer.py        # Engineer (views, computed data)
 │   ├── researcher.py      # Document RAG specialist
-│   └── router.py          # Router Agent (smart project routing)
+│   ├── router.py          # Router Agent (smart project routing)
+│   └── data_scientist.py  # Data Scientist (ML-only: predict, classify, cluster, decompose, anomaly, importance, llm_predict)
 ├── context/
 │   ├── semantic_model.py  # Table metadata (Codex-enriched: purpose, grain, PKs, FKs, usage patterns, freshness)
 │   └── business_rules.py  # Business rules + user rules
@@ -119,7 +123,7 @@ frontend/src/routes/
 
 ## Agent System
 
-**28 Agents Total:** 4 core (Leader, Analyst, Engineer, Researcher) + 10 specialist (Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor) + 7 background (Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector) + 1 visualizer + 1 router (Router Agent — smart project routing with Brain lookup)
+**30 Agents Total:** 4 core (Leader, Analyst, Engineer, Researcher) + 1 data scientist (Data Scientist — ML experiments with 7 tools) + 10 specialist (Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor) + 7 background (Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector) + 1 visualizer + 1 router (Router Agent — smart project routing with Brain lookup)
 **Team:** Leader → Analyst (SQL + forecasting, 31 tools) + Engineer (views + dashboards) + Researcher (document RAG)
 **Modes:** FAST (direct SQL) / DEEP (think + analyze, auto-selected based on query complexity)
 
@@ -496,6 +500,18 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 138. **Smart Router Agent** — `dash/agents/router.py` + `dash/tools/router_tools.py`. Replaces keyword-only `_smart_route()` with 2-tier routing: Tier 1 instant keyword scoring (7 signals, $0), Tier 2 Router Agent with 4 tools (LITE_MODEL, < 1.5s). Tools: `inspect_catalog` (pre-built, 0ms), `inspect_project_detail` (Codex metadata), `search_brain` (project-scoped Brain lookup), `check_session_context` (continuity). Tie detection falls through to Router Agent. Session slug saved for continuity.
 
+139. **SHAP Explanations** — `shap.TreeExplainer` added to `feature_importance()` tool. Computes per-row SHAP values for top 5 rows, saved to experiment `result_data.shap_values`. Shows which features pushed each prediction up/down. Added `shap` to requirements.txt.
+
+140. **Anomaly-to-SQL Bridge** — After `detect_anomalies_ml()` runs, auto-creates `CREATE VIEW {table}_anomalies` with `is_anomaly` boolean column. Analyst can query: `SELECT * FROM sales_data_anomalies WHERE is_anomaly = true`.
+
+141. **Scheduled ML Retraining** — Background daemon thread in `app/main.py` retrains all active project ML models every 24 hours. Polls `dash_ml_models` for active projects, calls `auto_create_models()` per project.
+
+142. **Batch Prediction API** — `POST /api/ml-predict` endpoint. Accepts `project_slug`, `model_name`/`model_type`, `data` array or `periods`. Supports forecast (returns predicted values) and anomaly (returns is_anomaly + score per row).
+
+143. **Model Comparison UI** — Compare tab in ML Insights detail view. Shows 2 experiments side-by-side with metrics (R², MAPE, accuracy, CV score, anomaly count, top factor). Only visible when 2+ experiments exist.
+
+144. **ML Worker Container** — `ml_worker/main.py` + `ml_worker/Dockerfile` + `compose.yaml` service `dash-ml`. Separate container (1GB RAM cap) that polls `dash_ml_jobs` table and trains heavy models (>1000 rows) in isolation. Never blocks chat. `auto_create_models()` auto-queues large tables to worker instead of training in-process.
+
 ## Self-Evolution Architecture
 
 ```
@@ -774,7 +790,7 @@ docker compose up -d --build
 
 ## Key Dependencies (non-obvious)
 
-`pymupdf4llm` (PDF→Markdown), `langextract` (grounded facts), `msal` (Microsoft Entra ID / SharePoint OAuth), `google-auth` + `google-auth-oauthlib` + `google-api-python-client` (Google Drive OAuth + API), `pymysql` (MySQL connector), `python-pptx` + `Pillow` (PPTX slide rendering), `pdfplumber` (PDF table extraction), `chardet` (encoding detection), `xlsxwriter` (Excel export), `google/gemini-embedding-2-preview` via OpenRouter (embedding), `cohere/rerank-4-pro` via OpenRouter (reranking)
+`pymupdf4llm` (PDF→Markdown), `langextract` (grounded facts), `msal` (Microsoft Entra ID / SharePoint OAuth), `google-auth` + `google-auth-oauthlib` + `google-api-python-client` (Google Drive OAuth + API), `pymysql` (MySQL connector), `python-pptx` + `Pillow` (PPTX slide rendering), `pdfplumber` (PDF table extraction), `chardet` (encoding detection), `xlsxwriter` (Excel export), `shap` (SHAP explanations), `statsmodels` (time series decomposition), `google/gemini-embedding-2-preview` via OpenRouter (embedding), `cohere/rerank-4-pro` via OpenRouter (reranking)
 
 ## Build & Deploy Troubleshooting
 

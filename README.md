@@ -74,6 +74,12 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Excel Self-Correction** -- 5-layer extraction: rules → LLM plan → validate+autofix → deep cell extraction → vision fallback. Quality scoring per table
 - **Project-Scoped Brain** -- 3-layer brain (Global → Project → Personal). Project entries override global. Scope filter UI in brain page
 - **Contextual Chunk Enrichment** -- Anthropic's Contextual Retrieval: LLM adds document context to each chunk before embedding. -49% retrieval failures
+- **SHAP Explanations** -- Per-row feature impact explanations via TreeExplainer. Shows which features pushed each prediction up/down
+- **Anomaly-to-SQL Bridge** -- Auto-creates SQL view with is_anomaly column after anomaly detection. Queryable by Analyst
+- **Scheduled ML Retraining** -- Background thread retrains all models every 24h automatically
+- **Batch Prediction API** -- POST /api/ml-predict for forecast and anomaly scoring on custom data
+- **Model Comparison** -- Side-by-side experiment comparison in ML Insights detail view
+- **ML Worker Container** -- Separate Docker service for training heavy models (>1000 rows) without blocking chat. Auto-queued from training pipeline
 
 ## Fresh Install
 
