@@ -9,6 +9,10 @@
   let graphData = $state<any>({ nodes: [], edges: [] });
   let loading = $state(false);
 
+  /* ─── scope filter ─── */
+  let scopeFilter = $state('all'); // 'all' | 'global' | 'personal' | project slug
+  let userProjects = $state<any[]>([]); // [{slug, name, agent_name}]
+
   /* ─── add form state ─── */
   let showAdd = $state(false);
   let addCategory = $state('glossary');
@@ -17,6 +21,7 @@
   let addMetadata = $state('{}');
   let addError = $state('');
   let saving = $state(false);
+  let newEntryScope = $state('global');
 
   /* ─── alias builder (for alias tab form) ─── */
   let aliasInput = $state('');
@@ -87,7 +92,19 @@
 
   async function loadEntries() {
     try {
-      const res = await fetch('/api/brain/entries', { headers: _h() });
+      let url = '/api/brain/entries';
+      if (activeTab !== 'log') {
+        if (scopeFilter !== 'all') {
+          if (scopeFilter === 'global') url += '?scope=global';
+          else if (scopeFilter === 'personal') url += '?scope=personal';
+          else url += `?project_slug=${scopeFilter}`;
+        }
+        const selectedCategory = tabCategoryMap[activeTab];
+        if (selectedCategory) {
+          url += (url.includes('?') ? '&' : '?') + `category=${selectedCategory}`;
+        }
+      }
+      const res = await fetch(url, { headers: _h() });
       if (res.ok) { const d = await res.json(); entries = d.entries || d || []; }
     } catch {}
   }
@@ -113,6 +130,25 @@
     } catch {}
   }
 
+  async function loadProjects() {
+    try {
+      const res = await fetch('/api/user-projects-brief', { headers: _h() });
+      if (res.ok) {
+        const d = await res.json();
+        const all = d.projects || [];
+        // Only show projects that have brain entries
+        try {
+          const br = await fetch('/api/brain', { headers: _h() });
+          if (br.ok) {
+            const bd = await br.json();
+            const slugs = new Set((bd.entries || []).filter((e: any) => e.project_slug).map((e: any) => e.project_slug));
+            userProjects = slugs.size > 0 ? all.filter((p: any) => slugs.has(p.slug)) : [];
+          } else { userProjects = []; }
+        } catch { userProjects = []; }
+      }
+    } catch {}
+  }
+
   /* ═══════════════════════════════════════════════════════════ */
   /*  CRUD                                                      */
   /* ═══════════════════════════════════════════════════════════ */
@@ -128,6 +164,7 @@
     threshAlertAbove = '';
     formulaExpr = '';
     formulaUnit = '';
+    newEntryScope = 'global';
     editId = null;
     showAdd = false;
   }
@@ -184,12 +221,17 @@
     saving = true;
     addError = '';
     try {
-      const body = {
+      const body: any = {
         category: addCategory,
         name: addName.trim(),
         definition: addDefinition.trim(),
         metadata: buildMetadata(),
       };
+      if (newEntryScope === 'personal') {
+        body.scope = 'personal';
+      } else if (newEntryScope !== 'global') {
+        body.project_slug = newEntryScope;
+      }
       const res = await fetch('/api/brain/entries', {
         method: 'POST',
         headers: { ..._h(), 'Content-Type': 'application/json' },
@@ -364,6 +406,7 @@
       window.location.href = '/ui/home';
       return;
     }
+    loadProjects();
     await loadStats();
     await switchTab('glossary');
   });
@@ -409,6 +452,29 @@
 
 <div style="font-size: 18px; font-weight: 900; text-transform: uppercase; margin-bottom: 12px; font-family: var(--font-family-display);">Company Brain</div>
 
+<!-- ═══ SCOPE FILTER ═══ -->
+<div style="display: flex; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; align-items: center;">
+  <span style="font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.1em; color: var(--color-on-surface-dim); margin-right: 8px;">SCOPE</span>
+  <button
+    style="font-size: 9px; font-weight: 700; padding: 3px 10px; cursor: pointer; text-transform: uppercase; font-family: var(--font-family-display); border: 2px solid {scopeFilter === 'all' ? 'var(--color-on-surface)' : 'var(--color-on-surface-dim)'}; background: {scopeFilter === 'all' ? 'var(--color-on-surface)' : 'transparent'}; color: {scopeFilter === 'all' ? 'var(--color-surface)' : 'var(--color-on-surface-dim)'};"
+    onclick={() => { scopeFilter = 'all'; tabLoaded = {}; loadEntries(); }}
+  >ALL</button>
+  <button
+    style="font-size: 9px; font-weight: 700; padding: 3px 10px; cursor: pointer; text-transform: uppercase; font-family: var(--font-family-display); border: 2px solid {scopeFilter === 'global' ? 'var(--color-on-surface)' : 'var(--color-on-surface-dim)'}; background: {scopeFilter === 'global' ? 'var(--color-on-surface)' : 'transparent'}; color: {scopeFilter === 'global' ? 'var(--color-surface)' : 'var(--color-on-surface-dim)'};"
+    onclick={() => { scopeFilter = 'global'; tabLoaded = {}; loadEntries(); }}
+  >🌐 GLOBAL</button>
+  {#each userProjects as proj}
+    <button
+      style="font-size: 9px; font-weight: 700; padding: 3px 10px; cursor: pointer; text-transform: uppercase; font-family: var(--font-family-display); border: 2px solid {scopeFilter === proj.slug ? 'var(--color-on-surface)' : 'var(--color-on-surface-dim)'}; background: {scopeFilter === proj.slug ? 'var(--color-on-surface)' : 'transparent'}; color: {scopeFilter === proj.slug ? 'var(--color-surface)' : 'var(--color-on-surface-dim)'};"
+      onclick={() => { scopeFilter = proj.slug; tabLoaded = {}; loadEntries(); }}
+    >📊 {proj.agent_name || proj.name}</button>
+  {/each}
+  <button
+    style="font-size: 9px; font-weight: 700; padding: 3px 10px; cursor: pointer; text-transform: uppercase; font-family: var(--font-family-display); border: 2px solid {scopeFilter === 'personal' ? 'var(--color-on-surface)' : 'var(--color-on-surface-dim)'}; background: {scopeFilter === 'personal' ? 'var(--color-on-surface)' : 'transparent'}; color: {scopeFilter === 'personal' ? 'var(--color-surface)' : 'var(--color-on-surface-dim)'};"
+    onclick={() => { scopeFilter = 'personal'; tabLoaded = {}; loadEntries(); }}
+  >👤 PERSONAL</button>
+</div>
+
 <!-- ═══ TABS ═══ -->
 <div style="display: flex; flex-direction: column; flex: 1; min-height: 0;">
 <div class="dash-tabs" style="flex-shrink: 0; flex-wrap: wrap;">
@@ -445,6 +511,13 @@
           <div class="flex items-center gap-2">
             <span style="font-weight: 900; font-size: 13px;">{entry.name}</span>
             <span style="font-size: 8px; font-weight: 700; padding: 1px 6px; background: {categoryColor(entry.category)}; color: #1a1a1a; text-transform: uppercase;">{entry.category}</span>
+            {#if entry.scope === 'global'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #007518; color: white;">🌐 GLOBAL</span>
+            {:else if entry.scope === 'personal'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #6366f1; color: white;">👤 PERSONAL</span>
+            {:else if entry.project_slug}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #d97706; color: white;">📊 {entry.project_slug}</span>
+            {/if}
           </div>
           <div class="flex gap-1">
             <button class="feedback-btn" style="font-size: 9px; padding: 2px 6px; cursor: pointer;" onclick={() => openEdit(entry)}>&#9998;</button>
@@ -475,6 +548,13 @@
           <div class="flex items-center gap-2">
             <span style="font-weight: 900; font-size: 13px;">{entry.name}</span>
             <span style="font-size: 8px; font-weight: 700; padding: 1px 6px; background: {categoryColor(entry.category)}; color: #1a1a1a; text-transform: uppercase;">FORMULA</span>
+            {#if entry.scope === 'global'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #007518; color: white;">🌐 GLOBAL</span>
+            {:else if entry.scope === 'personal'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #6366f1; color: white;">👤 PERSONAL</span>
+            {:else if entry.project_slug}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #d97706; color: white;">📊 {entry.project_slug}</span>
+            {/if}
             {#if entry.metadata?.unit}
               <span style="font-size: 9px; color: var(--color-on-surface-dim); font-style: italic;">({entry.metadata.unit})</span>
             {/if}
@@ -513,6 +593,13 @@
           <div class="flex items-center gap-2">
             <span style="font-weight: 900; font-size: 13px;">{entry.name}</span>
             <span style="font-size: 8px; font-weight: 700; padding: 1px 6px; background: {categoryColor(entry.category)}; color: #1a1a1a; text-transform: uppercase;">ALIAS</span>
+            {#if entry.scope === 'global'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #007518; color: white;">🌐 GLOBAL</span>
+            {:else if entry.scope === 'personal'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #6366f1; color: white;">👤 PERSONAL</span>
+            {:else if entry.project_slug}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #d97706; color: white;">📊 {entry.project_slug}</span>
+            {/if}
           </div>
           <div class="flex gap-1">
             <button class="feedback-btn" style="font-size: 9px; padding: 2px 6px; cursor: pointer;" onclick={() => openEdit(entry)}>&#9998;</button>
@@ -550,6 +637,13 @@
           <div class="flex items-center gap-2">
             <span style="font-weight: 900; font-size: 13px;">{entry.name}</span>
             <span style="font-size: 8px; font-weight: 700; padding: 1px 6px; background: {categoryColor(entry.category)}; color: #1a1a1a; text-transform: uppercase;">PATTERN</span>
+            {#if entry.scope === 'global'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #007518; color: white;">🌐 GLOBAL</span>
+            {:else if entry.scope === 'personal'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #6366f1; color: white;">👤 PERSONAL</span>
+            {:else if entry.project_slug}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #d97706; color: white;">📊 {entry.project_slug}</span>
+            {/if}
           </div>
           <div class="flex gap-1">
             <button class="feedback-btn" style="font-size: 9px; padding: 2px 6px; cursor: pointer;" onclick={() => openEdit(entry)}>&#9998;</button>
@@ -580,6 +674,13 @@
           <div class="flex items-center gap-2">
             <span style="font-weight: 900; font-size: 13px;">{entry.name}</span>
             <span style="font-size: 8px; font-weight: 700; padding: 1px 6px; background: {categoryColor(entry.category)}; color: #1a1a1a; text-transform: uppercase;">ORG</span>
+            {#if entry.scope === 'global'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #007518; color: white;">🌐 GLOBAL</span>
+            {:else if entry.scope === 'personal'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #6366f1; color: white;">👤 PERSONAL</span>
+            {:else if entry.project_slug}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #d97706; color: white;">📊 {entry.project_slug}</span>
+            {/if}
           </div>
           <div class="flex gap-1">
             <button class="feedback-btn" style="font-size: 9px; padding: 2px 6px; cursor: pointer;" onclick={() => openEdit(entry)}>&#9998;</button>
@@ -624,6 +725,13 @@
           <div class="flex items-center gap-2">
             <span style="font-weight: 900; font-size: 13px;">{entry.name}</span>
             <span style="font-size: 8px; font-weight: 700; padding: 1px 6px; background: {categoryColor(entry.category)}; color: #1a1a1a; text-transform: uppercase;">RULE</span>
+            {#if entry.scope === 'global'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #007518; color: white;">🌐 GLOBAL</span>
+            {:else if entry.scope === 'personal'}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #6366f1; color: white;">👤 PERSONAL</span>
+            {:else if entry.project_slug}
+              <span style="font-size: 8px; font-weight: 900; padding: 1px 6px; background: #d97706; color: white;">📊 {entry.project_slug}</span>
+            {/if}
           </div>
           <div class="flex gap-1">
             <button class="feedback-btn" style="font-size: 9px; padding: 2px 6px; cursor: pointer;" onclick={() => openEdit(entry)}>&#9998;</button>
@@ -749,6 +857,18 @@
           <option value="pattern">PATTERN</option>
           <option value="org">ORG MAP</option>
           <option value="threshold">RULE / THRESHOLD</option>
+        </select>
+      </div>
+
+      <!-- Scope -->
+      <div style="margin-bottom: 10px;">
+        <div style="font-size: 9px; font-weight: 700; text-transform: uppercase; margin-bottom: 3px;">SCOPE</div>
+        <select bind:value={newEntryScope} style="width: 100%; border: 2px solid var(--color-on-surface); padding: 6px 10px; font-family: var(--font-family-display); font-size: 11px; background: var(--color-surface);">
+          <option value="global">🌐 Global</option>
+          {#each userProjects as proj}
+            <option value={proj.slug}>📊 {proj.agent_name || proj.name}</option>
+          {/each}
+          <option value="personal">👤 Personal</option>
         </select>
       </div>
 

@@ -77,7 +77,8 @@ dash/
     ├── visualizer.py          # Visualization Agent — auto-detect chart type + ECharts config generation (rules engine + LLM fallback, 8 chart types)
     ├── analysis_types.py      # 11 analysis type tools (diagnostic, comparative, trend, predictive, prescriptive, anomaly, root cause, pareto, scenario, benchmark)
     ├── context_loader.py      # Context Loader — on-demand deep context for Analyst (10 topics: formulas, aliases, thresholds, patterns, domain, quality, relationships, documents, corrections, org)
-    └── router_tools.py        # 4 router tools (catalog, detail, brain, session)
+    ├── router_tools.py        # 4 router tools (catalog, detail, brain, session)
+    └── semantic_search.py     # Unified search (KB+Brain+KG+Facts) with Cohere reranking
 
 frontend/src/routes/
 ├── +layout.svelte         # Root layout (nav, notifications, search, CLI footer terminal)
@@ -119,7 +120,7 @@ frontend/src/routes/
 ## Agent System
 
 **28 Agents Total:** 4 core (Leader, Analyst, Engineer, Researcher) + 10 specialist (Comparator, Diagnostician, Narrator, Validator, Planner, Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor) + 7 background (Judge, Rule Suggester, Proactive Insights, Query Plan Extractor, Meta Learner, Auto Evolver, Chat Triple Extractor) + 5 upload (Conductor, Parser, Scanner, Vision, Inspector) + 1 visualizer + 1 router (Router Agent — smart project routing with Brain lookup)
-**Team:** Leader → Analyst (SQL + forecasting, 30 tools) + Engineer (views + dashboards) + Researcher (document RAG)
+**Team:** Leader → Analyst (SQL + forecasting, 31 tools) + Engineer (views + dashboards) + Researcher (document RAG)
 **Modes:** FAST (direct SQL) / DEEP (think + analyze, auto-selected based on query complexity)
 
 **Self-Correction Loop (Analyst):**
@@ -483,6 +484,18 @@ All steps tracked in dash_training_runs for UI progress bar.
 
 132. **Dash Agent Chat Sync** — All features from project chat synced to Dash Agent chat: merged ANALYSIS tab (was separate INSIGHT+ANALYSIS), KPI metric cards, confidence bar, impact summary, related questions, clarifying questions, inline charts, formatCell, multi-table DATA with sub-tabs, SOURCES tab, card-style QUERY tab, CHART renamed from GRAPH. Both pages now 100% feature-parity.
 
+133. **Semantic Search Layer** — `dash/tools/semantic_search.py`. Unified search across 4 knowledge sources (PgVector KB, Company Brain, Knowledge Graph, Grounded Facts) with Cohere reranking via OpenRouter. `search_all(query)` tool registered on Analyst (now 31 tools). 3-tier reranking: `cohere/rerank-4-pro` → `cohere/rerank-4-fast` → `cohere/rerank-v3.5` → keyword overlap fallback (pure Python). Results filtered by relevance score > 0.1. Agent instructed to call `search_all` BEFORE writing SQL for context (targets, thresholds, aliases, formulas). Tested: agent correctly uses Brain context (e.g., "IRR target = 15%") in responses.
+
+134. **Contextual Chunk Enrichment** — `_contextual_enrich_chunks()` in `app/upload.py`. Anthropic's Contextual Retrieval pattern: LLM prepends 1-2 sentences of document context to each chunk before embedding. "From Fund III Q3 2025 report, financial section. Revenue grew 15%." Reduces retrieval failures by 49% (Anthropic benchmark). Batch processing (10 chunks per LLM call). `_filter_junk_chunks()` removes chunks < 20 char, near-duplicates, pure formatting.
+
+135. **Gemini Embedding 2** — Upgraded from `openai/text-embedding-3-small` (MTEB ~62) to `google/gemini-embedding-2-preview` (MTEB ~68, +35% higher similarity scores). Both via OpenRouter, same API key. 4-model automatic cascade: Gemini 2 → OpenAI large → OpenAI small → Cohere embed-v4.0. Model change detection with logging. All 1536 dimensions (Gemini truncated from 3072 to fit existing PgVector). Override via `EMBEDDING_MODEL` env var. `db/session.py`: `_create_embedder()`, `_get_embedder()`, `get_active_embedding_model()`.
+
+136. **Excel Self-Correction Pipeline** — 5-layer extraction in `app/upload.py`: Layer 1 Rules Engine ($0) → Layer 2 LLM Structure Plan → Layer 3 `_validate_dataframe()` quality scoring (NaN%, subtotals, unnamed cols, dupes, score 0-100) + `_auto_fix_dataframe()` (ffill, drop subtotals, dedup) → Layer 4 `_deep_extract_cells()` (openpyxl unmerge all cells + bold/color formatting metadata → LLM re-plans) → Layer 5 `_vision_extract_sheet()` (render sheet as image → Vision LLM extracts JSON table). Each table tagged with quality_score and source trail.
+
+137. **Project-Scoped Brain** — `dash_company_brain` table now has `project_slug` and `user_id` columns. 3-layer brain: Global (project_slug=NULL, everyone sees), Project (project_slug='fund3', team sees), Personal (user_id=42, Dash Agent only). Merge logic: project overrides global on same name. API: `GET/POST /api/projects/{slug}/brain`, `POST /api/brain/personal`, scope filter on `GET /api/brain/entries?scope=global|personal&project_slug=slug`. UI: `/ui/brain` page has scope filter tabs (ALL, GLOBAL, per-project, PERSONAL) with colored badges. Only projects with brain entries shown as tabs.
+
+138. **Smart Router Agent** — `dash/agents/router.py` + `dash/tools/router_tools.py`. Replaces keyword-only `_smart_route()` with 2-tier routing: Tier 1 instant keyword scoring (7 signals, $0), Tier 2 Router Agent with 4 tools (LITE_MODEL, < 1.5s). Tools: `inspect_catalog` (pre-built, 0ms), `inspect_project_detail` (Codex metadata), `search_brain` (project-scoped Brain lookup), `check_session_context` (continuity). Tie detection falls through to Router Agent. Session slug saved for continuity.
+
 ## Self-Evolution Architecture
 
 ```
@@ -534,7 +547,7 @@ Three teams of agents work together. Chat Team handles user queries, Upload Team
 
 ```
 CHAT TEAM (user-facing, 4 core + 10 specialist + 1 visualizer):
-  Leader → Analyst (SQL, 30 tools) + Engineer (schema) + Researcher (docs)
+  Leader → Analyst (SQL, 31 tools) + Engineer (schema) + Researcher (docs)
   Specialist agents: Comparator, Diagnostician, Narrator, Validator, Planner,
     Trend Analyst, Pareto Analyst, Anomaly Detector, Benchmarker, Prescriptor
   Visualizer: auto_visualize tool on Analyst
@@ -684,7 +697,7 @@ Training pipeline now verifies with real data (was 28% real, now 100%):
 
 ## Settings Tabs (15)
 
-DATASETS · SOURCES · KNOWLEDGE · RULES · TRAINING · DOCS · QUERIES · LINEAGE · AGENTS (API-driven, 27 agents: 4 core + 10 specialist + 7 background + 5 upload + 1 visualizer, with status badges, 30 tools on Analyst) · WORKFLOWS · SCHEDULES · EVALS · USERS · CONFIG · INTEGRATIONS (Command Center) · SOURCES (chat response tab)
+DATASETS · SOURCES · KNOWLEDGE · RULES · TRAINING · DOCS · QUERIES · LINEAGE · AGENTS (API-driven, 27 agents: 4 core + 10 specialist + 7 background + 5 upload + 1 visualizer, with status badges, 31 tools on Analyst) · WORKFLOWS · SCHEDULES · EVALS · USERS · CONFIG · INTEGRATIONS (Command Center) · SOURCES (chat response tab)
 
 ## Commands
 
@@ -717,6 +730,7 @@ docker compose up -d --build
 | `MS_TENANT_ID` | No | — | Microsoft Entra ID tenant ID (SharePoint connector) |
 | `GOOGLE_CLIENT_ID` | No | — | Google OAuth client ID (Google Drive connector) |
 | `GOOGLE_CLIENT_SECRET` | No | — | Google OAuth client secret (Google Drive connector) |
+| `EMBEDDING_MODEL` | No | `google/gemini-embedding-2-preview` | Embedding model (auto-cascade: Gemini → OpenAI large → OpenAI small → Cohere) |
 | `SLACK_TOKEN` / `SLACK_SIGNING_SECRET` | No | — | Slack notifications (optional) |
 
 ## Production Security
@@ -760,7 +774,7 @@ docker compose up -d --build
 
 ## Key Dependencies (non-obvious)
 
-`pymupdf4llm` (PDF→Markdown), `langextract` (grounded facts), `msal` (Microsoft Entra ID / SharePoint OAuth), `google-auth` + `google-auth-oauthlib` + `google-api-python-client` (Google Drive OAuth + API), `pymysql` (MySQL connector), `python-pptx` + `Pillow` (PPTX slide rendering), `pdfplumber` (PDF table extraction), `chardet` (encoding detection), `xlsxwriter` (Excel export)
+`pymupdf4llm` (PDF→Markdown), `langextract` (grounded facts), `msal` (Microsoft Entra ID / SharePoint OAuth), `google-auth` + `google-auth-oauthlib` + `google-api-python-client` (Google Drive OAuth + API), `pymysql` (MySQL connector), `python-pptx` + `Pillow` (PPTX slide rendering), `pdfplumber` (PDF table extraction), `chardet` (encoding detection), `xlsxwriter` (Excel export), `google/gemini-embedding-2-preview` via OpenRouter (embedding), `cohere/rerank-4-pro` via OpenRouter (reranking)
 
 ## Build & Deploy Troubleshooting
 

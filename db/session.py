@@ -307,19 +307,108 @@ def create_project_learnings(slug: str) -> Knowledge:
     return create_knowledge(f"Learnings ({slug})", f"{safe}_learnings")
 
 
+import logging as _logging
+_embed_logger = _logging.getLogger("embedding")
+
+# Embedding model cascade — try in order, first success wins.
+# All via OpenRouter (same API key). Add/remove/reorder as needed.
+_EMBEDDING_MODELS = [
+    "google/gemini-embedding-2-preview",    # MTEB ~68, best quality
+    "openai/text-embedding-3-large",        # MTEB ~64, premium fallback
+    "openai/text-embedding-3-small",        # MTEB ~62, always available
+    "cohere/embed-v4.0",                    # backup option
+]
+
+# Track which model is active (for model-change detection)
+_active_embedding_model: str = ""
+
+
+def _create_embedder() -> OpenAIEmbedder:
+    """Create embedder with automatic model cascade.
+
+    Tries each model in _EMBEDDING_MODELS until one works.
+    User can override with EMBEDDING_MODEL env var (tried first).
+    All models via OpenRouter — same API key, same endpoint.
+
+    On model change: logs warning so admin knows to retrain projects.
+    """
+    global _active_embedding_model
+    api_key = _getenv("OPENROUTER_API_KEY")
+    user_model = _getenv("EMBEDDING_MODEL")
+
+    # Build cascade: user override first, then defaults
+    cascade = []
+    if user_model:
+        cascade.append(user_model)
+    cascade.extend(m for m in _EMBEDDING_MODELS if m not in cascade)
+
+    # Try each model
+    for model in cascade:
+        try:
+            embedder = OpenAIEmbedder(
+                id=model,
+                api_key=api_key,
+                base_url="https://openrouter.ai/api/v1",
+                dimensions=1536,
+            )
+            # Validate: embed a single token
+            embedder.get_embedding("test")
+
+            # Model change detection
+            if _active_embedding_model and _active_embedding_model != model:
+                _embed_logger.warning(
+                    f"Embedding model changed: {_active_embedding_model} → {model}. "
+                    f"Retrain projects for optimal search quality."
+                )
+            _active_embedding_model = model
+            _embed_logger.info(f"Embedding model: {model} (1536 dims)")
+            return embedder
+        except Exception as e:
+            _embed_logger.warning(f"Embedding model {model} failed: {e}, trying next...")
+            continue
+
+    # All failed — return last model without validation (will error on use)
+    _embed_logger.error(f"All embedding models failed! Using {cascade[-1]} without validation.")
+    _active_embedding_model = cascade[-1]
+    return OpenAIEmbedder(
+        id=cascade[-1],
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        dimensions=1536,
+    )
+
+
+# Cache the embedder — created once, reused for all knowledge bases
+_cached_embedder: OpenAIEmbedder | None = None
+
+
+def _get_embedder() -> OpenAIEmbedder:
+    """Get or create the cached embedder instance."""
+    global _cached_embedder
+    if _cached_embedder is None:
+        _cached_embedder = _create_embedder()
+    return _cached_embedder
+
+
+def get_active_embedding_model() -> str:
+    """Return the currently active embedding model ID."""
+    _get_embedder()  # ensure initialized
+    return _active_embedding_model
+
+
 def create_knowledge(name: str, table_name: str) -> Knowledge:
-    """Create a Knowledge instance with PgVector hybrid search."""
+    """Create a Knowledge instance with PgVector hybrid search.
+
+    Uses Gemini Embedding 2 (primary) with OpenAI fallback.
+    Both via OpenRouter — single API key.
+    """
     return Knowledge(
         name=name,
         vector_db=PgVector(
             db_url=db_url,
             table_name=table_name,
             search_type=SearchType.hybrid,
-            embedder=OpenAIEmbedder(
-                id="openai/text-embedding-3-small",
-                api_key=_getenv("OPENROUTER_API_KEY"),
-                base_url="https://openrouter.ai/api/v1",
-            ),
+            embedder=_get_embedder(),
         ),
         contents_db=get_postgres_db(contents_table=f"{table_name}_contents"),
     )

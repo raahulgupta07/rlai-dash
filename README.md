@@ -69,6 +69,11 @@ A production-ready, multi-tenant data agent that turns uploaded files into conve
 - **Context Loader Tool** -- on-demand deep context for Analyst across 10 topics (formulas, aliases, thresholds, patterns, domain, quality, relationships, documents, corrections, org). Queries live data from Company Brain, KG, DB schema, memories. 30th tool on Analyst
 - **Slide Agent Design System** -- 8 design themes (Midnight Executive, Forest & Moss, Coral Energy, Ocean Gradient, Charcoal Minimal, Teal Trust, Berry & Cream, Cherry Bold) with auto-selection by topic, Visual QA via Vision LLM, style picker API, full sentence titles, no repeated layouts
 - **PPTX Slide Rendering for Vision** -- image-only slides composited into full images for Vision LLM analysis
+- **Semantic Search Layer** -- unified search across PgVector KB, Company Brain, Knowledge Graph, and Grounded Facts with Cohere reranking. `search_all` tool on Analyst. 3-tier rerank cascade. 67% fewer retrieval failures
+- **Gemini Embedding 2** -- upgraded to `google/gemini-embedding-2-preview` (MTEB ~68, +35% vs OpenAI). 4-model auto-cascade via OpenRouter. `EMBEDDING_MODEL` env var. Model change detection
+- **Excel Self-Correction** -- 5-layer extraction: rules → LLM plan → validate+autofix → deep cell extraction → vision fallback. Quality scoring per table
+- **Project-Scoped Brain** -- 3-layer brain (Global → Project → Personal). Project entries override global. Scope filter UI in brain page
+- **Contextual Chunk Enrichment** -- Anthropic's Contextual Retrieval: LLM adds document context to each chunk before embedding. -49% retrieval failures
 
 ## Fresh Install
 

@@ -518,6 +518,10 @@
             <svg width="12" height="12" viewBox="0 0 24 24"><defs><linearGradient id="navpg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#D24726"/><stop offset="100%" stop-color="#F0A030"/></linearGradient></defs><rect x="2" y="2" width="20" height="20" rx="3" fill="url(#navpg)"/><text x="12" y="16" text-anchor="middle" fill="#fff" font-size="11" font-weight="900" font-family="Arial">P</text></svg>
             PRESENTATIONS
           </button>
+          <button onclick={() => window.location.href = '/ui/ml-insights'} class="nav-btn" class:nav-btn-active={page.url.pathname.includes('/ml-insights')} style="cursor: pointer;">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 20h20"/><path d="M5 20V10"/><path d="M9 20V4"/><path d="M13 20v-8"/><path d="M17 20V8"/><path d="M21 20v-4"/></svg>
+            ML INSIGHTS
+          </button>
           {#if isSuper}
             <button onclick={() => window.location.href = '/ui/brain'} class="nav-btn" class:nav-btn-active={page.url.pathname.includes('/brain')} style="cursor: pointer;">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a8 8 0 0 1 0 16"/><path d="M12 2a8 8 0 0 0 0 16"/><path d="M2 12h20"/></svg>

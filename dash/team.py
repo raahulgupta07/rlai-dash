@@ -170,7 +170,7 @@ def create_project_team(
     # Company Brain context for Researcher
     try:
         from app.brain import get_brain_context
-        brain_ctx = get_brain_context(for_agent="researcher")
+        brain_ctx = get_brain_context(for_agent="researcher", project_slug=project_slug)
         if brain_ctx:
             doc_instructions += "\n\n" + brain_ctx
     except Exception:

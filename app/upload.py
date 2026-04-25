@@ -529,6 +529,81 @@ def _find_header_row(file_path: str, ext: str) -> int:
         return 0
 
 
+def _contextual_enrich_chunks(chunks: list[str], filename: str, doc_summary: str = "") -> list[str]:
+    """Enrich chunks with document context before embedding (Anthropic's Contextual Retrieval).
+    Prepends 1-2 sentences of context to each chunk for better retrieval."""
+    if not chunks or len(chunks) <= 1:
+        return chunks
+
+    try:
+        from dash.settings import training_llm_call
+
+        # Build document summary from first chunk if not provided
+        if not doc_summary:
+            doc_summary = chunks[0][:300]
+
+        enriched = []
+        # Process in batches to reduce LLM calls
+        batch_size = 10
+        for batch_start in range(0, len(chunks), batch_size):
+            batch = chunks[batch_start:batch_start + batch_size]
+            numbered = "\n".join(f"{i+1}. {c[:200]}" for i, c in enumerate(batch))
+
+            prompt = f"""Add brief context (1 sentence, max 20 words) to each chunk from this document.
+Document: {filename}
+Summary: {doc_summary[:300]}
+
+Chunks:
+{numbered}
+
+Return JSON array of context strings (same order, same count):
+["Context for chunk 1...", "Context for chunk 2...", ...]"""
+
+            raw = training_llm_call(prompt, "extraction")
+            if raw:
+                try:
+                    contexts = json.loads(raw.strip().strip("`").lstrip("json").strip())
+                    for i, chunk in enumerate(batch):
+                        ctx = contexts[i] if i < len(contexts) else ""
+                        if ctx and len(ctx) > 5:
+                            enriched.append(f"{ctx} — {chunk}")
+                        else:
+                            enriched.append(chunk)
+                except Exception:
+                    enriched.extend(batch)
+            else:
+                enriched.extend(batch)
+
+        return enriched
+    except Exception:
+        return chunks  # fallback: return original chunks unchanged
+
+
+def _filter_junk_chunks(chunks: list[str]) -> list[str]:
+    """Remove junk chunks: too short, pure formatting, near-duplicates."""
+    if not chunks:
+        return chunks
+
+    filtered = []
+    seen = set()
+    for chunk in chunks:
+        text = chunk.strip()
+        # Skip too short
+        if len(text) < 20:
+            continue
+        # Skip pure formatting/headers
+        if text.count('\n') > len(text) / 10:  # mostly newlines
+            continue
+        # Skip near-duplicates (first 50 chars as key)
+        key = text[:50].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(text)
+
+    return filtered
+
+
 def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Smart cleanup: normalize nulls, drop empty rows/columns, rename unnamed, clean column names."""
     # 0. Normalize null representations → NaN
@@ -2644,6 +2719,18 @@ Return ONLY valid JSON (no markdown):
         logging.error(f"Knowledge graph failed for {project_slug}: {e}")
         _log(f"⚠ knowledge graph skipped: {str(e)[:80]}")
 
+    # Step 14: Auto ML Models
+    try:
+        from dash.tools.ml_models import auto_create_models, init_ml_tables
+        init_ml_tables()
+        import re as _re
+        _ml_schema = _re.sub(r"[^a-z0-9_]", "_", project_slug.lower())[:63]
+        ml_result = auto_create_models(project_slug, schema=_ml_schema)
+        if ml_result.get("models_created", 0) > 0:
+            logger.info(f"ML: Created {ml_result['models_created']} models for {project_slug}")
+    except Exception as e:
+        logger.debug(f"ML auto-create skipped: {e}")
+
     # Save fingerprint for delta detection on next retrain
     save_fingerprint(project_slug, table_name, num_rows, [c.get("name", "") for c in (metadata.get("table_columns") or [])])
 
@@ -3231,6 +3318,235 @@ def _is_clean_sheet(df_preview: pd.DataFrame, merged_cells: list = []) -> bool:
         return False  # Months as columns = needs unpivot
     # Clean: proper headers, no merges, no months as columns
     return True
+
+
+def _deep_extract_cells(file_path: str, sheet_name: str) -> dict:
+    """Deep cell extraction using openpyxl — unmerge cells, extract formatting metadata.
+    Returns rich cell grid with values, merge info, and formatting signals."""
+    import openpyxl
+    result = {"cells": [], "merged_ranges": [], "formatting": {}, "max_row": 0, "max_col": 0}
+    try:
+        wb = openpyxl.load_workbook(file_path, data_only=True)
+        ws = wb[sheet_name]
+        result["max_row"] = ws.max_row or 0
+        result["max_col"] = ws.max_column or 0
+
+        # Collect merged ranges and their values
+        merge_map = {}  # (row, col) → value from top-left cell
+        for mr in ws.merged_cells.ranges:
+            result["merged_ranges"].append(str(mr))
+            top_left = ws.cell(mr.min_row, mr.min_col).value
+            for row in range(mr.min_row, mr.max_row + 1):
+                for col in range(mr.min_col, mr.max_col + 1):
+                    merge_map[(row, col)] = top_left
+
+        # Extract cells with formatting (first 50 rows for analysis)
+        max_scan = min(ws.max_row or 0, 50)
+        max_cols = min(ws.max_column or 0, 20)
+        bold_rows = set()
+        colored_cells = {}
+
+        for ri in range(1, max_scan + 1):
+            row_data = []
+            row_has_bold = False
+            for ci in range(1, max_cols + 1):
+                cell = ws.cell(ri, ci)
+                val = merge_map.get((ri, ci), cell.value)
+                val_str = str(val)[:80] if val is not None else ""
+                row_data.append(val_str)
+                # Check formatting
+                try:
+                    if cell.font and cell.font.bold:
+                        row_has_bold = True
+                    if cell.fill and cell.fill.fgColor and cell.fill.fgColor.rgb and cell.fill.fgColor.rgb != "00000000":
+                        colored_cells[f"{ri},{ci}"] = str(cell.fill.fgColor.rgb)[-6:]
+                except Exception:
+                    pass
+            if row_has_bold:
+                bold_rows.add(ri - 1)  # 0-indexed
+            result["cells"].append(row_data)
+
+        result["formatting"] = {
+            "bold_rows": sorted(bold_rows),
+            "colored_cells_count": len(colored_cells),
+            "has_colors": len(colored_cells) > 5,
+        }
+        wb.close()
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+def _validate_dataframe(df: pd.DataFrame) -> dict:
+    """Validate extracted DataFrame quality. Returns issues dict."""
+    issues = {"score": 100, "problems": [], "fixes": []}
+    if df is None or len(df) == 0:
+        issues["score"] = 0
+        issues["problems"].append("empty_dataframe")
+        return issues
+
+    n_rows, n_cols = df.shape
+
+    # Check NaN percentage per column
+    for col in df.columns:
+        nan_pct = df[col].isna().sum() / n_rows * 100
+        if nan_pct > 60:
+            issues["score"] -= 10
+            issues["problems"].append(f"high_nan:{col}:{nan_pct:.0f}%")
+            issues["fixes"].append(f"drop_column:{col}")
+        elif nan_pct > 30:
+            issues["score"] -= 5
+            issues["problems"].append(f"moderate_nan:{col}:{nan_pct:.0f}%")
+            issues["fixes"].append(f"ffill:{col}")
+
+    # Check unnamed columns
+    unnamed = [c for c in df.columns if "unnamed" in str(c).lower() or str(c).startswith("col_")]
+    if unnamed:
+        pct = len(unnamed) / n_cols * 100
+        if pct > 50:
+            issues["score"] -= 20
+            issues["problems"].append(f"bad_headers:{len(unnamed)}_unnamed")
+            issues["fixes"].append("redetect_header")
+        elif pct > 20:
+            issues["score"] -= 10
+            issues["problems"].append(f"some_unnamed:{len(unnamed)}")
+            issues["fixes"].append("drop_unnamed")
+
+    # Check subtotal/total rows
+    subtotal_count = 0
+    for idx, row in df.iterrows():
+        row_str = " ".join(str(v).lower() for v in row.dropna())
+        if re.search(r'\b(total|subtotal|grand total|sum|average)\b', row_str):
+            subtotal_count += 1
+    if subtotal_count > 0:
+        issues["score"] -= 5
+        issues["problems"].append(f"subtotal_rows:{subtotal_count}")
+        issues["fixes"].append("drop_subtotals")
+
+    # Check duplicate rows
+    dup_count = df.duplicated().sum()
+    if dup_count > n_rows * 0.1:
+        issues["score"] -= 10
+        issues["problems"].append(f"duplicates:{dup_count}")
+        issues["fixes"].append("drop_duplicates")
+
+    # Check if too few data rows (might have read metadata as data)
+    if n_rows < 3 and n_cols > 3:
+        issues["score"] -= 15
+        issues["problems"].append("too_few_rows")
+        issues["fixes"].append("redetect_header")
+
+    issues["score"] = max(0, issues["score"])
+    return issues
+
+
+def _auto_fix_dataframe(df: pd.DataFrame, fixes: list[str]) -> pd.DataFrame:
+    """Apply auto-fixes to a DataFrame based on validation issues."""
+    if df is None or len(df) == 0:
+        return df
+
+    for fix in fixes:
+        try:
+            if fix.startswith("ffill:"):
+                col = fix.split(":", 1)[1]
+                if col in df.columns:
+                    df[col] = df[col].ffill()
+            elif fix.startswith("drop_column:"):
+                col = fix.split(":", 1)[1]
+                if col in df.columns:
+                    df = df.drop(columns=[col])
+            elif fix == "drop_unnamed":
+                unnamed = [c for c in df.columns if "unnamed" in str(c).lower()]
+                # Only drop if all values in column are NaN
+                for c in unnamed:
+                    if df[c].isna().sum() > len(df) * 0.8:
+                        df = df.drop(columns=[c])
+            elif fix == "drop_subtotals":
+                mask = df.apply(
+                    lambda row: not bool(re.search(
+                        r'\b(total|subtotal|grand total)\b',
+                        " ".join(str(v).lower() for v in row.dropna())
+                    )), axis=1
+                )
+                df = df[mask]
+            elif fix == "drop_duplicates":
+                df = df.drop_duplicates()
+        except Exception:
+            pass
+    return df
+
+
+def _vision_extract_sheet(file_path: str, sheet_name: str) -> str:
+    """Render Excel sheet as image and use Vision LLM to extract data.
+    Last resort for sheets that can't be parsed programmatically."""
+    try:
+        import openpyxl
+        from PIL import Image, ImageDraw, ImageFont
+
+        wb = openpyxl.load_workbook(file_path, data_only=True)
+        ws = wb[sheet_name]
+
+        # Render cells to image (simple grid)
+        max_rows = min(ws.max_row or 0, 40)
+        max_cols = min(ws.max_column or 0, 15)
+        if max_rows < 2 or max_cols < 1:
+            wb.close()
+            return ""
+
+        cell_w, cell_h = 120, 22
+        img_w = max_cols * cell_w + 20
+        img_h = max_rows * cell_h + 20
+        img = Image.new("RGB", (img_w, img_h), "white")
+        draw = ImageDraw.Draw(img)
+
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Collect merged ranges for fill
+        merge_map = {}
+        for mr in ws.merged_cells.ranges:
+            top_val = ws.cell(mr.min_row, mr.min_col).value
+            for r in range(mr.min_row, mr.max_row + 1):
+                for c in range(mr.min_col, mr.max_col + 1):
+                    merge_map[(r, c)] = top_val
+
+        for ri in range(1, max_rows + 1):
+            for ci in range(1, max_cols + 1):
+                x = (ci - 1) * cell_w + 10
+                y = (ri - 1) * cell_h + 10
+                val = merge_map.get((ri, ci), ws.cell(ri, ci).value)
+                text = str(val)[:15] if val is not None else ""
+                # Draw cell border
+                draw.rectangle([x, y, x + cell_w - 1, y + cell_h - 1], outline="#ccc")
+                # Bold for header rows
+                try:
+                    if ws.cell(ri, ci).font and ws.cell(ri, ci).font.bold:
+                        draw.rectangle([x, y, x + cell_w - 1, y + cell_h - 1], fill="#e8e8e0")
+                except Exception:
+                    pass
+                draw.text((x + 3, y + 3), text, fill="black", font=font)
+        wb.close()
+
+        # Convert to base64 for vision
+        import io, base64
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        # Call vision LLM
+        from dash.settings import training_vision_call
+        vision_result = training_vision_call(
+            "Extract ALL data from this spreadsheet image as a JSON table.\n"
+            "Return: {\"headers\": [\"col1\", \"col2\", ...], \"rows\": [[\"val1\", \"val2\", ...], ...]}\n"
+            "Include ALL rows. Ignore empty rows. If merged cells span multiple rows, repeat the value.",
+            [{"b64": b64, "mime": "image/png", "source": f"sheet_{sheet_name}"}],
+            "extraction"
+        )
+        return vision_result or ""
+    except Exception as e:
+        return f"Vision extraction failed: {e}"
 
 
 def _handle_excel(file_path: str, filename: str) -> dict:
@@ -3838,6 +4154,144 @@ Return ONLY a JSON object mapping each period to its date:
         except Exception as e:
             result["errors"].append(f"Fallback read all sheets failed: {e}")
 
+    # ── LAYER 3+4: Validate → Auto-fix → Vision fallback ──────────────
+    # Run on all extracted tables — catch subtotals, bad headers, high NaN
+    validated_tables = []
+    for tbl in result["tables"]:
+        df = tbl.get("df")
+        if df is None or len(df) == 0:
+            validated_tables.append(tbl)
+            continue
+
+        issues = _validate_dataframe(df)
+        tbl["quality_score"] = issues["score"]
+
+        if issues["score"] >= 70:
+            # Good enough — minor fixes only
+            if issues["fixes"]:
+                df = _auto_fix_dataframe(df, issues["fixes"])
+                tbl["df"] = df
+                tbl["source"] = tbl.get("source", "") + " [auto-fixed]"
+            validated_tables.append(tbl)
+        elif issues["score"] >= 40:
+            # Moderate issues — apply fixes and re-validate
+            df = _auto_fix_dataframe(df, issues["fixes"])
+            issues2 = _validate_dataframe(df)
+            if issues2["score"] >= 60:
+                tbl["df"] = df
+                tbl["source"] = tbl.get("source", "") + " [corrected]"
+                tbl["quality_score"] = issues2["score"]
+                validated_tables.append(tbl)
+            else:
+                # Try re-reading with deep cell extraction
+                sheet = tbl.get("source", "").split("[")[0].strip().split("+")[0].strip()
+                if sheet and ext == ".xlsx":
+                    try:
+                        deep = _deep_extract_cells(file_path, sheet)
+                        if deep.get("cells") and len(deep["cells"]) > 2:
+                            # Build better preview with unmerged cells for LLM
+                            from dash.settings import training_llm_call
+                            cell_text = "\n".join(
+                                f"  Row {i}: {row}" for i, row in enumerate(deep["cells"][:30])
+                            )
+                            fmt_info = f"Bold rows (likely headers): {deep['formatting'].get('bold_rows', [])}"
+                            if deep["merged_ranges"]:
+                                fmt_info += f"\nMerged ranges (already unmerged in data): {deep['merged_ranges'][:10]}"
+
+                            fix_prompt = f"""This Excel sheet was parsed but has quality issues: {issues["problems"]}
+
+Cell data (merged cells already expanded):
+{cell_text}
+
+{fmt_info}
+
+Return JSON: {{"header_row": <0-indexed>, "skip_rows": [<0-indexed rows to skip>], "data_start": <0-indexed>}}
+Pick the BEST header row (bold rows are headers). Skip metadata, subtotals, unit rows."""
+
+                            raw = training_llm_call(fix_prompt, "extraction")
+                            if raw:
+                                import json as _json2
+                                fix_plan = _json2.loads(raw.strip().strip("`").lstrip("json").strip())
+                                hrow = fix_plan.get("header_row", 0)
+                                skip = fix_plan.get("skip_rows", [])
+                                df2 = pd.read_excel(file_path, sheet_name=sheet, header=hrow, skiprows=[s for s in skip if s != hrow])
+                                df2 = _clean_dataframe(df2)
+                                # Forward fill columns that had merged cells
+                                if deep["merged_ranges"]:
+                                    for ci in range(min(3, len(df2.columns))):
+                                        if df2.iloc[:, ci].isna().sum() > len(df2) * 0.2:
+                                            df2.iloc[:, ci] = df2.iloc[:, ci].ffill()
+                                df2 = _auto_fix_dataframe(df2, ["drop_subtotals", "drop_unnamed"])
+                                issues3 = _validate_dataframe(df2)
+                                if issues3["score"] > issues["score"]:
+                                    tbl["df"] = df2
+                                    tbl["quality_score"] = issues3["score"]
+                                    tbl["source"] = tbl.get("source", "") + " [deep-corrected]"
+                                    validated_tables.append(tbl)
+                                    continue
+                    except Exception:
+                        pass
+
+                # VISION FALLBACK — render sheet as image, extract with Vision LLM
+                if sheet and ext == ".xlsx":
+                    try:
+                        vision_raw = _vision_extract_sheet(file_path, sheet)
+                        if vision_raw and "{" in vision_raw:
+                            import json as _json3
+                            clean = vision_raw.strip()
+                            if clean.startswith("```"):
+                                clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                            parsed = _json3.loads(clean)
+                            headers = parsed.get("headers", [])
+                            rows = parsed.get("rows", [])
+                            if headers and rows:
+                                df_vision = pd.DataFrame(rows, columns=headers[:len(rows[0])] if rows else headers)
+                                df_vision = _clean_dataframe(df_vision)
+                                if len(df_vision) > len(df) * 0.5:  # Vision got reasonable data
+                                    tbl["df"] = df_vision
+                                    tbl["quality_score"] = 75
+                                    tbl["source"] = tbl.get("source", "") + " [vision-extracted]"
+                                    validated_tables.append(tbl)
+                                    result["warnings"].append(f"Sheet '{sheet}': used Vision LLM for extraction")
+                                    continue
+                    except Exception:
+                        pass
+
+                # Keep original (bad quality) with warning
+                tbl["source"] = tbl.get("source", "") + " [low-quality]"
+                validated_tables.append(tbl)
+                result["warnings"].append(f"Table '{tbl['name']}' has quality issues: {', '.join(issues['problems'][:3])}")
+        else:
+            # Very bad — try vision or skip
+            sheet = tbl.get("source", "").split("[")[0].strip().split("+")[0].strip()
+            if sheet and ext == ".xlsx":
+                try:
+                    vision_raw = _vision_extract_sheet(file_path, sheet)
+                    if vision_raw and "{" in vision_raw:
+                        import json as _json4
+                        clean = vision_raw.strip()
+                        if clean.startswith("```"):
+                            clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                        parsed = _json4.loads(clean)
+                        headers = parsed.get("headers", [])
+                        rows = parsed.get("rows", [])
+                        if headers and rows:
+                            df_vision = pd.DataFrame(rows, columns=headers[:len(rows[0])] if rows else headers)
+                            df_vision = _clean_dataframe(df_vision)
+                            if len(df_vision) >= 2:
+                                tbl["df"] = df_vision
+                                tbl["quality_score"] = 70
+                                tbl["source"] = tbl.get("source", "") + " [vision-rescued]"
+                                validated_tables.append(tbl)
+                                result["warnings"].append(f"Sheet '{sheet}': rescued by Vision LLM")
+                                continue
+                except Exception:
+                    pass
+            # Keep with warning
+            validated_tables.append(tbl)
+            result["warnings"].append(f"Table '{tbl['name']}' has severe quality issues (score: {issues['score']})")
+
+    result["tables"] = validated_tables
     return result
 
 
@@ -7238,6 +7692,19 @@ def retrain_project(slug: str, request: Request):
             import logging
             logging.error(f"Knowledge graph failed for {slug}: {e}")
             _master_log(f"⚠ knowledge graph skipped: {str(e)[:80]}", "", total_tables)
+
+        # Step 14: Auto ML Models
+        try:
+            from dash.tools.ml_models import auto_create_models, init_ml_tables
+            init_ml_tables()
+            import re as _re
+            _ml_schema = _re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
+            ml_result = auto_create_models(slug, schema=_ml_schema)
+            if ml_result.get("models_created", 0) > 0:
+                _master_log(f"✓ ML: {ml_result['models_created']} models created", "", total_tables)
+        except Exception as e:
+            import logging
+            logging.debug(f"ML auto-create skipped for {slug}: {e}")
 
         # Mark master run as done
         if master_run_id:

@@ -1027,6 +1027,138 @@ async def list_all_dashboards(request: Request):
     return {"dashboards": dashboards}
 
 
+# ---------------------------------------------------------------------------
+# ML Experiments API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/ml-experiments")
+async def list_ml_experiments(request: Request, project: str | None = None):
+    """List ML experiments (models + results) for the ML Insights page."""
+    user = getattr(getattr(request, 'state', None), 'user', None)
+    if not user:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+
+    from sqlalchemy import text as sa_text
+    from db import get_sql_engine
+    engine = get_sql_engine()
+
+    try:
+        with engine.connect() as conn:
+            # Get models
+            q = "SELECT id, project_slug, name, model_type, algorithm, target_column, features, accuracy, row_count, created_at FROM public.dash_ml_models"
+            params = {}
+            if project:
+                q += " WHERE project_slug = :slug"
+                params["slug"] = project
+            q += " ORDER BY created_at DESC"
+
+            models = []
+            rows = conn.execute(sa_text(q), params).fetchall()
+            for r in rows:
+                import json
+                acc = r[7] if isinstance(r[7], dict) else (json.loads(r[7]) if r[7] else {})
+                models.append({
+                    "id": r[0], "project_slug": r[1], "name": r[2], "model_type": r[3],
+                    "algorithm": r[4], "target_column": r[5], "features": r[6],
+                    "accuracy": acc, "row_count": r[8],
+                    "created_at": str(r[9]) if r[9] else None,
+                })
+
+            # Get experiments
+            q2 = "SELECT id, project_slug, experiment_type, model_name, algorithm, tier, question, input_summary, result_data, accuracy, status, created_at FROM public.dash_ml_experiments"
+            if project:
+                q2 += " WHERE project_slug = :slug"
+            q2 += " ORDER BY created_at DESC LIMIT 50"
+
+            experiments = []
+            try:
+                rows2 = conn.execute(sa_text(q2), params).fetchall()
+                for r in rows2:
+                    experiments.append({
+                        "id": r[0], "project_slug": r[1], "experiment_type": r[2],
+                        "model_name": r[3], "algorithm": r[4], "tier": r[5],
+                        "question": r[6],
+                        "input_summary": r[7] if isinstance(r[7], dict) else (json.loads(r[7]) if r[7] else {}),
+                        "result_data": r[8] if isinstance(r[8], dict) else (json.loads(r[8]) if r[8] else {}),
+                        "accuracy": r[9] if isinstance(r[9], dict) else (json.loads(r[9]) if r[9] else {}),
+                        "status": r[10],
+                        "created_at": str(r[11]) if r[11] else None,
+                    })
+            except Exception:
+                pass  # Table might not exist yet
+
+        return {"models": models, "experiments": experiments, "total_models": len(models), "total_experiments": len(experiments)}
+    except Exception as e:
+        return {"models": [], "experiments": [], "error": str(e)}
+
+
+@app.post("/api/ml-experiments/{model_id}/retrain")
+async def retrain_ml_model(model_id: int, request: Request):
+    """Retrain a specific ML model."""
+    user = getattr(getattr(request, 'state', None), 'user', None)
+    if not user:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+
+    from sqlalchemy import text as sa_text
+    from db import get_sql_engine
+    engine = get_sql_engine()
+
+    with engine.connect() as conn:
+        row = conn.execute(sa_text(
+            "SELECT project_slug FROM public.dash_ml_models WHERE id = :id"
+        ), {"id": model_id}).fetchone()
+
+    if not row:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Model not found"}, status_code=404)
+
+    import re
+    slug = row[0]
+    schema = re.sub(r"[^a-z0-9_]", "_", slug.lower())[:63]
+
+    from dash.tools.ml_models import auto_create_models
+    result = auto_create_models(slug, schema=schema)
+    return {"status": "ok", "retrained": result}
+
+
+@app.get("/api/ml-experiments/{experiment_id}")
+async def get_ml_experiment(experiment_id: int, request: Request):
+    """Get detailed ML experiment."""
+    user = getattr(getattr(request, 'state', None), 'user', None)
+    if not user:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+
+    from sqlalchemy import text as sa_text
+    from db import get_sql_engine
+    engine = get_sql_engine()
+
+    with engine.connect() as conn:
+        row = conn.execute(sa_text(
+            "SELECT id, project_slug, experiment_type, model_name, algorithm, tier, question, "
+            "input_summary, result_data, accuracy, status, created_at "
+            "FROM public.dash_ml_experiments WHERE id = :id"
+        ), {"id": experiment_id}).fetchone()
+
+    if not row:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Experiment not found"}, status_code=404)
+
+    import json
+    return {
+        "id": row[0], "project_slug": row[1], "experiment_type": row[2],
+        "model_name": row[3], "algorithm": row[4], "tier": row[5],
+        "question": row[6],
+        "input_summary": row[7] if isinstance(row[7], dict) else (json.loads(row[7]) if row[7] else {}),
+        "result_data": row[8] if isinstance(row[8], dict) else (json.loads(row[8]) if row[8] else {}),
+        "accuracy": row[9] if isinstance(row[9], dict) else (json.loads(row[9]) if row[9] else {}),
+        "status": row[10],
+        "created_at": str(row[11]) if row[11] else None,
+    }
+
+
 @app.get("/health")
 def health_check():
     try:

@@ -37,6 +37,8 @@ class BrainEntryCreate(BaseModel):
     name: str
     definition: str
     metadata: dict = {}
+    project_slug: str | None = None
+    user_id: int | None = None
 
 
 class BrainEntryUpdate(BaseModel):
@@ -91,6 +93,23 @@ def _require_super_admin(request: Request) -> dict:
     return user
 
 
+def _get_user_project_slugs(user_id: int | None) -> list[str]:
+    """Return project slugs the user owns or has been shared access to."""
+    if not user_id:
+        return []
+    try:
+        with _engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT slug FROM public.dash_projects WHERE owner_id = :uid "
+                "UNION "
+                "SELECT project_slug FROM public.dash_project_shares WHERE user_id = :uid"
+            ), {"uid": user_id}).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        logger.warning(f"Failed to get user project slugs: {e}")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------------
@@ -105,10 +124,19 @@ def _bootstrap_brain_tables():
                 name TEXT NOT NULL,
                 definition TEXT NOT NULL,
                 metadata JSONB DEFAULT '{}',
+                project_slug TEXT DEFAULT NULL,
+                user_id INTEGER DEFAULT NULL,
                 created_by TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
+        """))
+        # Add columns if they don't exist (migration)
+        conn.execute(text("""
+            ALTER TABLE public.dash_company_brain ADD COLUMN IF NOT EXISTS project_slug TEXT DEFAULT NULL
+        """))
+        conn.execute(text("""
+            ALTER TABLE public.dash_company_brain ADD COLUMN IF NOT EXISTS user_id INTEGER DEFAULT NULL
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS public.dash_brain_access_log (
@@ -128,17 +156,47 @@ def _bootstrap_brain_tables():
 # ---------------------------------------------------------------------------
 
 @router.get("/entries")
-def list_entries(request: Request, category: str = ""):
-    """List all brain entries, optionally filter by category."""
-    _get_user(request)
+def list_entries(request: Request, category: str = "", project_slug: str | None = None, scope: str | None = None):
+    """List brain entries, optionally filter by category, project_slug, and/or scope."""
+    user = _get_user(request)
+    uid = user.get("user_id") or user.get("id")
 
-    q = "SELECT id, category, name, definition, metadata, created_by, created_at, updated_at FROM public.dash_company_brain"
+    q = "SELECT id, category, name, definition, metadata, created_by, created_at, updated_at, project_slug, user_id FROM public.dash_company_brain"
+    conditions = []
     params = {}
+
     if category:
         if category not in VALID_CATEGORIES:
             raise HTTPException(400, f"Invalid category. Must be one of: {', '.join(sorted(VALID_CATEGORIES))}")
-        q += " WHERE category = :cat"
+        conditions.append("category = :cat")
         params["cat"] = category
+
+    # Scope filtering: global, personal, or project
+    if scope == "global":
+        conditions.append("project_slug IS NULL AND user_id IS NULL")
+    elif scope == "personal":
+        conditions.append("user_id = :uid")
+        params["uid"] = uid
+    elif project_slug:
+        # Return project-scoped + global entries
+        conditions.append("(project_slug = :slug OR project_slug IS NULL)")
+        params["slug"] = project_slug
+    else:
+        # No scope filter — return all accessible
+        from app.auth import SUPER_ADMIN
+        if user.get("username") != SUPER_ADMIN:
+            user_projects = _get_user_project_slugs(uid)
+            if user_projects:
+                placeholders = ", ".join(f":proj_{i}" for i in range(len(user_projects)))
+                for i, p in enumerate(user_projects):
+                    params[f"proj_{i}"] = p
+                conditions.append(f"(user_id = :uid OR project_slug IN ({placeholders}) OR project_slug IS NULL)")
+            else:
+                conditions.append("(user_id = :uid OR project_slug IS NULL)")
+            params["uid"] = uid
+
+    if conditions:
+        q += " WHERE " + " AND ".join(conditions)
     q += " ORDER BY category, name"
 
     with _engine.connect() as conn:
@@ -147,11 +205,20 @@ def list_entries(request: Request, category: str = ""):
     entries = []
     for r in rows:
         meta = r[4] if isinstance(r[4], dict) else json.loads(r[4]) if r[4] else {}
+        ps = r[8]
+        uid = r[9]
+        if ps is not None:
+            scope = "project"
+        elif uid is not None:
+            scope = "personal"
+        else:
+            scope = "global"
         entries.append({
             "id": r[0], "category": r[1], "name": r[2], "definition": r[3],
             "metadata": meta, "created_by": r[5],
             "created_at": str(r[6]) if r[6] else None,
             "updated_at": str(r[7]) if r[7] else None,
+            "project_slug": ps, "user_id": uid, "scope": scope,
         })
 
     return {"entries": entries, "total": len(entries)}
@@ -202,11 +269,12 @@ def create_entry(req: BrainEntryCreate, request: Request):
 
     with _engine.connect() as conn:
         row = conn.execute(text(
-            "INSERT INTO public.dash_company_brain (category, name, definition, metadata, created_by) "
-            "VALUES (:cat, :name, :def, :meta, :by) RETURNING id"
+            "INSERT INTO public.dash_company_brain (category, name, definition, metadata, created_by, project_slug, user_id) "
+            "VALUES (:cat, :name, :def, :meta, :by, :project_slug, :user_id) RETURNING id"
         ), {
             "cat": req.category, "name": req.name, "def": req.definition,
             "meta": json.dumps(req.metadata), "by": user.get("username", ""),
+            "project_slug": req.project_slug, "user_id": req.user_id,
         }).fetchone()
         conn.commit()
 
@@ -396,19 +464,71 @@ def brain_graph(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Project-scoped brain endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/projects/{slug}/brain")
+def list_project_brain(request: Request, slug: str, category: str = ""):
+    """List brain entries for a specific project + inherited global."""
+    return list_entries(request, category=category, project_slug=slug)
+
+
+@router.post("/projects/{slug}/brain")
+def create_project_brain_entry(request: Request, slug: str, req: BrainEntryCreate):
+    """Create a brain entry scoped to a project."""
+    req.project_slug = slug
+    req.user_id = None
+    return create_entry(req, request)
+
+
+# ---------------------------------------------------------------------------
+# Personal brain endpoint
+# ---------------------------------------------------------------------------
+
+@router.post("/brain/personal")
+def create_personal_brain_entry(request: Request, req: BrainEntryCreate):
+    """Create a personal brain entry for Dash Agent."""
+    user = _get_user(request)
+    req.user_id = user.get("id")
+    req.project_slug = None
+    return create_entry(req, request)
+
+
+# ---------------------------------------------------------------------------
 # Context builder — called by instructions.py
 # ---------------------------------------------------------------------------
 
-def get_brain_context(for_agent: str = "analyst", project_slug: str = "") -> str:
+def get_brain_context(for_agent: str = "analyst", project_slug: str = "", user_id: int | None = None) -> str:
     """Build formatted brain context for injection into agent prompts.
     Also logs the access to dash_brain_access_log.
+
+    Scoping:
+    - If project_slug: return project-scoped + global entries (project wins on name conflict).
+    - If user_id (Dash Agent): return personal + user's projects + global entries.
+    - Otherwise: return all entries.
     """
     try:
         with _engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT category, name, definition, metadata "
-                "FROM public.dash_company_brain ORDER BY category, name"
-            )).fetchall()
+            q = ("SELECT category, name, definition, metadata, project_slug, user_id "
+                 "FROM public.dash_company_brain")
+            params: dict = {}
+
+            if project_slug:
+                q += " WHERE (project_slug = :slug OR project_slug IS NULL)"
+                params["slug"] = project_slug
+            elif user_id:
+                user_projects = _get_user_project_slugs(user_id)
+                if user_projects:
+                    placeholders = ", ".join(f":proj_{i}" for i in range(len(user_projects)))
+                    for i, p in enumerate(user_projects):
+                        params[f"proj_{i}"] = p
+                    q += f" WHERE (user_id = :uid OR project_slug IN ({placeholders}) OR project_slug IS NULL)"
+                else:
+                    q += " WHERE (user_id = :uid OR project_slug IS NULL)"
+                params["uid"] = user_id
+
+            q += " ORDER BY category, name"
+            rows = conn.execute(text(q), params).fetchall()
     except Exception as e:
         logger.warning(f"Brain context load failed: {e}")
         return ""
@@ -416,12 +536,46 @@ def get_brain_context(for_agent: str = "analyst", project_slug: str = "") -> str
     if not rows:
         return ""
 
-    # Group by category
-    grouped: dict[str, list] = {}
+    # Merge: if same name exists in project AND global, project wins
+    seen_names: dict[str, dict] = {}
+    all_entries: list[dict] = []
     for r in rows:
         cat = r[0]
+        name = r[1]
         meta = r[3] if isinstance(r[3], dict) else json.loads(r[3]) if r[3] else {}
-        grouped.setdefault(cat, []).append({"name": r[1], "definition": r[2], "metadata": meta})
+        ps = r[4]
+        uid_val = r[5]
+
+        if ps is not None:
+            scope = "project"
+        elif uid_val is not None:
+            scope = "personal"
+        else:
+            scope = "global"
+
+        entry = {"name": name, "definition": r[2], "metadata": meta, "category": cat, "scope": scope}
+        key = f"{cat}:{name.lower()}"
+
+        if key in seen_names:
+            # Project/personal overrides global
+            if scope in ("project", "personal") and seen_names[key]["scope"] == "global":
+                # Replace the global entry
+                idx = seen_names[key]["idx"]
+                all_entries[idx] = entry
+                seen_names[key] = {"scope": scope, "idx": idx}
+            # else keep existing (first project/personal wins)
+        else:
+            seen_names[key] = {"scope": scope, "idx": len(all_entries)}
+            all_entries.append(entry)
+
+    # Group by category
+    grouped: dict[str, list] = {}
+    for e in all_entries:
+        grouped.setdefault(e["category"], []).append(e)
+
+    def _scope_tag(entry: dict) -> str:
+        s = entry.get("scope", "global").upper()
+        return f"[{s}]"
 
     parts = ["COMPANY KNOWLEDGE (Central Brain):"]
 
@@ -429,14 +583,14 @@ def get_brain_context(for_agent: str = "analyst", project_slug: str = "") -> str
     if "glossary" in grouped:
         parts.append("\nGLOSSARY:")
         for e in grouped["glossary"]:
-            parts.append(f"  {e['name']} = {e['definition']}")
+            parts.append(f"  {_scope_tag(e)} {e['name']} = {e['definition']}")
 
     # Formulas
     if "formula" in grouped:
         parts.append("\nFORMULAS:")
         for e in grouped["formula"]:
             formula = e["metadata"].get("formula", e["definition"])
-            parts.append(f"  {e['name']} = {formula}")
+            parts.append(f"  {_scope_tag(e)} {e['name']} = {formula}")
 
     # Aliases
     if "alias" in grouped:
@@ -444,9 +598,9 @@ def get_brain_context(for_agent: str = "analyst", project_slug: str = "") -> str
         for e in grouped["alias"]:
             aliases = e["metadata"].get("aliases", [])
             if aliases:
-                parts.append(f'  "{e["name"]}" = {", ".join(aliases)}')
+                parts.append(f'  {_scope_tag(e)} "{e["name"]}" = {", ".join(aliases)}')
             else:
-                parts.append(f'  "{e["name"]}" = {e["definition"]}')
+                parts.append(f'  {_scope_tag(e)} "{e["name"]}" = {e["definition"]}')
 
     # Thresholds
     if "threshold" in grouped:
@@ -456,7 +610,7 @@ def get_brain_context(for_agent: str = "analyst", project_slug: str = "") -> str
             target = meta.get("target", "")
             alert_below = meta.get("alert_below")
             alert_above = meta.get("alert_above")
-            line = f"  {e['name']} target: {target}"
+            line = f"  {_scope_tag(e)} {e['name']} target: {target}"
             if alert_below:
                 line += f", alert if < {alert_below}"
             if alert_above:
@@ -467,13 +621,13 @@ def get_brain_context(for_agent: str = "analyst", project_slug: str = "") -> str
     if "pattern" in grouped:
         parts.append("\nRULES:")
         for e in grouped["pattern"]:
-            parts.append(f"  - {e['definition']}")
+            parts.append(f"  {_scope_tag(e)} - {e['definition']}")
 
     # Calendar
     if "calendar" in grouped:
         parts.append("\nCALENDAR:")
         for e in grouped["calendar"]:
-            parts.append(f"  {e['name']}: {e['definition']}")
+            parts.append(f"  {_scope_tag(e)} {e['name']}: {e['definition']}")
 
     # Org
     if "org" in grouped:
@@ -482,15 +636,15 @@ def get_brain_context(for_agent: str = "analyst", project_slug: str = "") -> str
             meta = e["metadata"]
             children = meta.get("children", [])
             if children:
-                parts.append(f"  {e['name']} -> {' + '.join(children)}")
+                parts.append(f"  {_scope_tag(e)} {e['name']} -> {' + '.join(children)}")
             else:
                 parent = meta.get("parent", "")
-                parts.append(f"  {e['name']} (part of {parent})" if parent else f"  {e['name']}")
+                parts.append(f"  {_scope_tag(e)} {e['name']} (part of {parent})" if parent else f"  {_scope_tag(e)} {e['name']}")
 
     context = "\n".join(parts)
 
     # Log the access
-    total_items = len(rows)
+    total_items = len(all_entries)
     try:
         with _engine.connect() as conn:
             conn.execute(text(

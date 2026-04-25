@@ -131,7 +131,7 @@ def create_inspect_detail_tool():
 # Tool 3: Search Brain
 # ---------------------------------------------------------------------------
 
-def create_search_brain_tool():
+def create_search_brain_tool(project_slugs: list[str] | None = None):
     """Return a tool that searches the Company Brain for business terms."""
 
     @tool(
@@ -144,7 +144,6 @@ def create_search_brain_tool():
     def search_brain(terms: str) -> str:
         from db import get_sql_engine
         from sqlalchemy import text
-        from sqlalchemy.pool import NullPool
 
         term_list = [t.strip() for t in terms.split(",") if t.strip()]
         if not term_list:
@@ -152,17 +151,20 @@ def create_search_brain_tool():
 
         patterns = [f"%{t}%" for t in term_list]
 
+        slugs = project_slugs or []
+
         query = text(
-            "SELECT category, name, definition "
+            "SELECT category, name, definition, project_slug "
             "FROM public.dash_company_brain "
-            "WHERE name ILIKE ANY(:patterns) OR definition ILIKE ANY(:patterns) "
+            "WHERE (project_slug IS NULL OR project_slug = ANY(:slugs)) "
+            "AND (name ILIKE ANY(:patterns) OR definition ILIKE ANY(:patterns)) "
             "LIMIT 15"
         )
 
         try:
             engine = get_sql_engine()
             with engine.connect() as conn:
-                rows = conn.execute(query, {"patterns": patterns}).fetchall()
+                rows = conn.execute(query, {"patterns": patterns, "slugs": slugs}).fetchall()
         except Exception as e:
             logger.warning("search_brain failed: %s", e)
             return f"Brain search failed: {e}"
@@ -175,7 +177,8 @@ def create_search_brain_tool():
             cat = row[0] or "GENERAL"
             name = row[1] or ""
             defn = row[2] or ""
-            lines.append(f"[{cat.upper()}] **{name}**: {defn}")
+            scope = f" [{row[3]}]" if row[3] else ""
+            lines.append(f"[{cat.upper()}] **{name}**: {defn}{scope}")
 
         return "\n".join(lines)
 

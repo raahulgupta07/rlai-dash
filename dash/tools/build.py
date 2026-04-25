@@ -20,8 +20,13 @@ from dash.tools.specialist import (
     root_cause_drill, scenario_model, benchmark_check, correlation_matrix,
 )
 from dash.tools.introspect import create_introspect_schema_tool
+from dash.tools.semantic_search import create_search_all_tool
 from dash.tools.save_query import create_save_validated_query_tool
 from dash.tools.update_knowledge import create_update_knowledge_tool
+from dash.tools.ml_models import (
+    create_predict_tool, create_feature_importance_tool,
+    create_anomaly_ml_tool, create_llm_predict_tool,
+)
 from db import db_url, get_readonly_engine, get_sql_engine, get_user_engine, get_user_readonly_engine
 from db.session import _sanitize_user_id
 
@@ -122,6 +127,21 @@ def build_analyst_tools(knowledge: Knowledge, user_id: str | None = None, projec
     try:
         from dash.tools.context_loader import load_context
         tools.append(load_context)
+    except ImportError:
+        pass
+
+    # Unified semantic search (KB + Brain + KG + Facts with reranking)
+    try:
+        tools.append(create_search_all_tool(project_slug=project_slug))
+    except ImportError:
+        pass
+
+    # ML prediction tools (forecast, feature importance, anomaly, LLM fallback)
+    try:
+        tools.append(create_predict_tool(project_slug=project_slug))
+        tools.append(create_feature_importance_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
+        tools.append(create_anomaly_ml_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
+        tools.append(create_llm_predict_tool(project_slug=project_slug, engine=ro_engine, schema=user_schema))
     except ImportError:
         pass
 

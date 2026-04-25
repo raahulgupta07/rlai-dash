@@ -1512,6 +1512,38 @@
                       {@const currentTab = msg.activeTab || 'analysis'}
 
                       {@const totalTableRows = tables.reduce((sum: number, t: any) => sum + (t.rows?.length || 0), 0)}
+
+                      <!-- ML Cards -->
+                      {@const mlMatches = msg.content.match(/\[ML:([^\]]+)\]/g) || []}
+                      {#if mlMatches.length > 0}
+                        <div style="margin: 8px 0; border: 2px solid var(--color-on-surface); background: var(--color-surface-bright);">
+                          <div style="padding: 6px 12px; background: var(--color-on-surface); color: var(--color-surface); font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em;">MACHINE LEARNING &middot; {mlMatches.length} {mlMatches.length === 1 ? 'MODEL' : 'MODELS'} USED</div>
+                          <div style="padding: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
+                            {#each mlMatches as mlTag}
+                              {@const mlParts = Object.fromEntries(mlTag.replace('[ML:', '').replace(']', '').split('|').map(p => { const [k, ...v] = p.split('='); return [k, v.join('=')]; }))}
+                              {@const mlType = mlParts[''] || mlParts['FORECAST'] ? 'FORECAST' : mlParts['ANOMALY'] ? 'ANOMALY' : mlParts['DRIVERS'] ? 'DRIVERS' : Object.keys(mlParts)[0] || '?'}
+                              <div style="flex: 1; min-width: 180px; max-width: 280px; border: 2px solid var(--color-on-surface); background: var(--color-surface-bright); padding: 10px;">
+                                <div style="font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; color: {mlType === 'FORECAST' ? '#007518' : mlType === 'ANOMALY' ? '#dc2626' : '#d97706'};">
+                                  {mlType === 'FORECAST' ? '📊' : mlType === 'ANOMALY' ? '🔍' : '🎯'} {mlType}
+                                </div>
+                                <div style="font-size: 11px; font-weight: 700; margin-bottom: 4px;">{mlParts.algorithm || '?'}</div>
+                                {#if mlParts.target}<div style="font-size: 10px; color: var(--color-on-surface-dim);">Target: {mlParts.target}</div>{/if}
+                                {#if mlParts.data}<div style="font-size: 10px; color: var(--color-on-surface-dim);">Data: {mlParts.data}</div>{/if}
+                                {#if mlParts.accuracy}<div style="font-size: 10px; color: var(--color-on-surface-dim);">Accuracy: {mlParts.accuracy}</div>{/if}
+                                {#if mlParts.r2}<div style="font-size: 10px; color: var(--color-on-surface-dim);">R²: {mlParts.r2}</div>{/if}
+                                {#if mlParts.found}<div style="font-size: 10px; color: #dc2626; font-weight: 700; margin-top: 4px;">Found: {mlParts.found} anomalies</div>{/if}
+                                {#if mlParts.high && mlParts.high !== '0'}<div style="font-size: 10px; color: #dc2626;">⚠ {mlParts.high} HIGH severity</div>{/if}
+                                {#if mlParts.top}<div style="font-size: 10px; margin-top: 4px; font-weight: 600;">{mlParts.top}</div>{/if}
+                                {#if mlParts.trend}<div style="font-size: 10px; color: var(--color-on-surface-dim);">Trend: {mlParts.trend}</div>{/if}
+                                <div style="font-size: 9px; color: var(--color-on-surface-dim); margin-top: 6px; text-transform: uppercase;">
+                                  {mlParts.tier === 'instant' ? '⚡ Pre-trained ($0)' : mlParts.tier === 'llm' ? '🧠 LLM Analysis' : mlParts.tier || ''}
+                                </div>
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+
                       <div class="response-tabs">
                         <button class="response-tab" class:response-tab-active={currentTab === 'analysis'} onclick={() => { trackPreference('tab_click', 'analysis'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'analysis' }, ...messages.slice(i + 1)]; }}>Analysis</button>
                         <button class="response-tab" class:response-tab-active={currentTab === 'data'} class:response-tab-dim={!hasTables} onclick={() => { if (hasTables) { trackPreference('tab_click', 'data'); messages = [...messages.slice(0, i), { ...msg, activeTab: 'data' }, ...messages.slice(i + 1)]; } }}>Data{#if hasTables}<span class="tab-badge">{totalTableRows}</span>{/if}</button>
@@ -1535,6 +1567,7 @@
                           .replace(/\[CONFIDENCE:[^\]]+\]/g, '')
                           .replace(/\[IMPACT:[^\]]+\]/g, '')
                           .replace(/\[RELATED:[^\]]+\]/g, '')
+                          .replace(/\[ML:[^\]]+\]/g, '')
                           .replace(/---\s*\n\s*SOURCES:[\s\S]*$/, '')
                           .replace(/```sql[\s\S]*?```/g, '')
                           .trim()}

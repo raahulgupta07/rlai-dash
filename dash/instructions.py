@@ -159,12 +159,15 @@ If no tables exist, answer from documents and memories only.
 ## Workflow
 
 1. **CHECK your context FIRST** — look at the UPLOADED DOCUMENTS, AGENT MEMORIES, and TRAINING EXAMPLES sections below. The answer is likely already there.
-2. **Search knowledge base** — use `search_knowledge_base` tool for additional context from uploaded files.
-3. **If data tables exist** → Write SQL, LIMIT 50 by default, no SELECT *, ORDER BY for rankings.
-4. **If NO data tables exist** → Answer from context + knowledge search. You have enough information.
-5. **Execute** via SQLTools (only if tables exist).
-6. **On error** → use `introspect_schema` to inspect the actual schema → fix → `save_learning`.
-7. **On success** → provide **insights**, not just data. Offer `save_validated_query` if reusable.
+2. **ALWAYS call `search_all`** BEFORE writing SQL — this searches documents, brain (glossary, formulas, thresholds, aliases), knowledge graph, and grounded facts. It tells you: what targets/benchmarks to compare against, what aliases/abbreviations mean, what formulas to use, and relationships between entities. Results are ranked by relevance. Skip ONLY for simple "show me the table" queries.
+3. **If data tables exist** → Write SQL using context from search_all. LIMIT 50 by default, no SELECT *, ORDER BY for rankings.
+4. **For predictions/forecasts** → use `predict` tool (pre-trained ML model, instant). If no model exists, use `llm_predict` (LLM fallback). Always mention the algorithm used.
+5. **For "what drives X"** → use `feature_importance` tool (LightGBM). Shows top factors with percentages.
+6. **For anomaly detection** → use `detect_anomalies_ml` tool (IsolationForest, more accurate than Z-score).
+7. **If NO data tables exist** → Answer from context + knowledge search. You have enough information.
+8. **Execute** via SQLTools (only if tables exist).
+9. **On error** → use `introspect_schema` to inspect the actual schema → fix → `save_learning`.
+10. **On success** → provide **insights**, not just data. Offer `save_validated_query` if reusable.
 
 ## When to save_learning
 
@@ -575,7 +578,7 @@ def build_leader_instructions(user_id: str | None = None, project_slug: str | No
     # Company Brain context for Leader
     try:
         from app.brain import get_brain_context
-        brain_ctx = get_brain_context(for_agent="leader")
+        brain_ctx = get_brain_context(for_agent="leader", project_slug=project_slug or "")
         if brain_ctx:
             instructions += "\n\n" + brain_ctx
     except Exception:
@@ -881,7 +884,7 @@ def _build_self_learning_context(project_slug: str, actual_user_id: int | None =
     # ── 13. Company Brain ──
     try:
         from app.brain import get_brain_context
-        brain_ctx = get_brain_context(for_agent="analyst")
+        brain_ctx = get_brain_context(for_agent="analyst", project_slug=project_slug)
         if brain_ctx:
             lines.append(brain_ctx)
     except Exception:

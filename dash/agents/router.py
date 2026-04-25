@@ -65,6 +65,7 @@ def create_router_agent(projects: list[dict], session_id: str | None = None) -> 
     Returns:
         Agno Agent configured for routing (LITE_MODEL, no DB/knowledge/learning)
     """
+    project_slugs = [p["slug"] for p in projects]
     return Agent(
         id="router",
         name="Router",
@@ -73,7 +74,7 @@ def create_router_agent(projects: list[dict], session_id: str | None = None) -> 
         tools=[
             create_inspect_catalog_tool(projects),
             create_inspect_detail_tool(),
-            create_search_brain_tool(),
+            create_search_brain_tool(project_slugs=project_slugs),
             create_session_context_tool(session_id),
         ],
         markdown=False,
